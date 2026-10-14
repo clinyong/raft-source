@@ -318,7 +318,10 @@ export default defineConfig({
   // change targets.
   preview: {
     port: devPort,
-    allowedHosts: [".trycloudflare.com", ".loca.lt"],
+    // Same host allow-list as the dev server, and the same opt-in for tunnel hostnames. Without this
+    // merge a custom domain served through a tunnel is refused by Vite's host check even though the
+    // dev server accepts it — the static preview is what actually serves dist/ here.
+    allowedHosts: [".trycloudflare.com", ".loca.lt", ...extraAllowedHosts],
     proxy: {
       "/api": { target: serverTarget, changeOrigin: true, xfwd: true },
       "/internal": { target: serverTarget, changeOrigin: true, xfwd: true },
