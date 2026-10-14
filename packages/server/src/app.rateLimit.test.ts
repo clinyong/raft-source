@@ -1,12 +1,47 @@
 import assert from "node:assert/strict";
 import { asMachineId } from "@botiverse/raft-shared";
 import {
+  loginRateLimitConfig,
   rateLimitUserMachineOrIpKey,
   rateLimitUserOrIpKey,
   shouldSkipAttachmentRateLimit,
   shouldSkipAuthRateLimit,
   shouldSkipProductFeedbackRateLimit,
 } from "./app";
+
+test("the login rate limit is opt-in: unset means upstream behaviour, unchanged", () => {
+  assert.equal(loginRateLimitConfig({} as NodeJS.ProcessEnv), null);
+  assert.equal(loginRateLimitConfig({ RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "" } as NodeJS.ProcessEnv), null);
+  assert.equal(loginRateLimitConfig({ RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "   " } as NodeJS.ProcessEnv), null);
+});
+
+test("the login rate limit honours its settings, with a 15 minute default window", () => {
+  assert.deepEqual(loginRateLimitConfig({ RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "10" } as NodeJS.ProcessEnv), {
+    max: 10,
+    windowMs: 15 * 60 * 1000,
+  });
+  assert.deepEqual(
+    loginRateLimitConfig({
+      RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "3",
+      RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS: "60000",
+    } as NodeJS.ProcessEnv),
+    { max: 3, windowMs: 60000 },
+  );
+});
+
+test("a typo in the login rate limit FAILS CLOSED (strict default, not disabled)", () => {
+  assert.deepEqual(loginRateLimitConfig({ RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "ten" } as NodeJS.ProcessEnv), {
+    max: 10,
+    windowMs: 15 * 60 * 1000,
+  });
+  assert.deepEqual(
+    loginRateLimitConfig({
+      RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "5",
+      RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS: "soon",
+    } as NodeJS.ProcessEnv),
+    { max: 5, windowMs: 15 * 60 * 1000 },
+  );
+});
 
 test("rate limit keys preserve authenticated principal identity before IP fallback", () => {
   assert.equal(rateLimitUserOrIpKey({ userId: "user-1", ip: "2001:db8::1" }), "user-1");

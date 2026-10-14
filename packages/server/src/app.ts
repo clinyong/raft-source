@@ -120,6 +120,41 @@ export function shouldSkipAuthRateLimit(input: {
   return input.isTestEnv && input.skipInTestHarness;
 }
 
+/**
+ * Opt-in, stricter limiter for the password login endpoint.
+ *
+ * Why (leo-lab deployment, 2026-10-14): this instance used to sit behind Cloudflare Access, and that was what
+ * bounded login attempts. Access was removed so third-party native clients can reach the API, which leaves this
+ * app's own limiter as the only bound — 200 requests/minute on the whole `/api/auth` surface, i.e. ~288k attempts
+ * a day for one key. Unset means upstream behaviour, unchanged.
+ *
+ * A set-but-unparseable value FAILS CLOSED (a strict default) rather than silently disabling the limit: a typo in
+ * a security setting must not remove the protection (same rule as `registrationPolicy`).
+ */
+export function loginRateLimitConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): { max: number; windowMs: number } | null {
+  const raw = env.RAFT_AUTH_LOGIN_RATE_LIMIT_MAX?.trim();
+  if (!raw) return null;
+  const strictDefault = { max: 10, windowMs: 15 * 60 * 1000 };
+  const max = Number.parseInt(raw, 10);
+  if (!Number.isFinite(max) || max <= 0) {
+    console.warn(
+      `[auth-login-rate-limit] RAFT_AUTH_LOGIN_RATE_LIMIT_MAX is not a positive integer (got "${raw}") — using the strict default ${strictDefault.max} instead of disabling the limit`,
+    );
+    return strictDefault;
+  }
+  const rawWindow = env.RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS?.trim();
+  const windowMs = rawWindow ? Number.parseInt(rawWindow, 10) : strictDefault.windowMs;
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    console.warn(
+      `[auth-login-rate-limit] RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS is not a positive integer (got "${rawWindow}") — using ${strictDefault.windowMs} ms`,
+    );
+    return { max, windowMs: strictDefault.windowMs };
+  }
+  return { max, windowMs };
+}
+
 export type CreateAppOptions = Readonly<{
   testHarness?: {
     skipAuthRateLimit?: boolean;
@@ -353,6 +388,23 @@ export function createApp(options: CreateAppOptions = {}): Express {
     console.warn("[device-login-disabled] SLOCK_DEVICE_LOGIN_ENABLED is explicitly off — Computer attach + device authorize are disabled");
   }
   app.use("/api/auth", authLimiter, authRouter);
+  // Opt-in stricter bucket for the password login endpoint (leo-lab: Access removed 2026-10-14, see
+  // loginRateLimitConfig). Mounted BEFORE the generic /api/auth mount so it applies in addition to it.
+  const loginLimit = loginRateLimitConfig();
+  if (loginLimit) {
+    const loginLimiter = rateLimit({
+      windowMs: loginLimit.windowMs,
+      max: loginLimit.max,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: "Too many login attempts, please try again later" },
+      keyGenerator: rateLimitUserOrIpKey,
+      // Same reason as shouldSkipAuthRateLimit: the Playwright harness shares one API process and IP bucket.
+      skip: () => isTestEnv,
+    });
+    app.use("/api/auth/login", loginLimiter);
+    console.info(`[auth-login-rate-limit] ${loginLimit.max} requests per ${loginLimit.windowMs} ms per IP`);
+  }
   app.get("/.well-known/openid-configuration", authLimiter, oidcDiscoveryHandler);
   app.use("/api/oauth", authLimiter, express.urlencoded({ extended: false }), oauthRouter);
   // Server-scoped OIDC (task #150): clients that reject query components cannot
