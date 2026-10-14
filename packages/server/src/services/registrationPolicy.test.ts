@@ -1,33 +1,56 @@
 import assert from "node:assert/strict";
+
 import {
-  assertRegistrationEnabled,
   getRegistrationBlockedReason,
+  isRegistrationEnabled,
 } from "./registrationPolicy";
 
-test("registration policy allows staging", () => {
-  const previousDeploymentEnv = process.env.DEPLOYMENT_ENV;
-  process.env.DEPLOYMENT_ENV = "staging";
+// The deployment switch must be opt-in: upstream behaviour is the default, and only an explicit,
+// recognised value may change it. "Default behaviour unchanged" is the property that keeps this patch
+// cheap to carry across upstream releases, so it is asserted rather than assumed — including the
+// fail-closed case, where a typo in a deployment config must not silently reopen public sign-up.
 
-  assert.equal(getRegistrationBlockedReason(), null);
-  assert.doesNotThrow(() => assertRegistrationEnabled());
+const KEY = "RAFT_REGISTRATION_POLICY";
+const original = process.env[KEY];
 
-  if (previousDeploymentEnv === undefined) {
-    delete process.env.DEPLOYMENT_ENV;
+afterEach(() => {
+  if (original === undefined) {
+    delete process.env[KEY];
   } else {
-    process.env.DEPLOYMENT_ENV = previousDeploymentEnv;
+    process.env[KEY] = original;
   }
 });
 
-test("registration policy allows production", () => {
-  const previousDeploymentEnv = process.env.DEPLOYMENT_ENV;
-  process.env.DEPLOYMENT_ENV = "production";
+describe("registration policy", () => {
+  it("keeps upstream behaviour when the variable is unset", () => {
+    delete process.env[KEY];
+    assert.equal(getRegistrationBlockedReason(), null);
+    assert.equal(isRegistrationEnabled(), true);
+  });
 
-  assert.equal(getRegistrationBlockedReason(), null);
-  assert.doesNotThrow(() => assertRegistrationEnabled());
+  it("keeps upstream behaviour for an explicitly open policy", () => {
+    for (const value of ["open", "OPEN", "  open  "]) {
+      process.env[KEY] = value;
+      assert.equal(getRegistrationBlockedReason(), null, `value ${JSON.stringify(value)}`);
+      assert.equal(isRegistrationEnabled(), true, `value ${JSON.stringify(value)}`);
+    }
+  });
 
-  if (previousDeploymentEnv === undefined) {
-    delete process.env.DEPLOYMENT_ENV;
-  } else {
-    process.env.DEPLOYMENT_ENV = previousDeploymentEnv;
-  }
+  it("treats an empty value as unset", () => {
+    process.env[KEY] = "   ";
+    assert.equal(getRegistrationBlockedReason(), null);
+  });
+
+  it("blocks registration when closed", () => {
+    process.env[KEY] = "closed";
+    assert.match(getRegistrationBlockedReason() ?? "", /closed/i);
+    assert.equal(isRegistrationEnabled(), false);
+  });
+
+  it("fails closed on an unrecognised value instead of reopening", () => {
+    process.env[KEY] = "opne";
+    const reason = getRegistrationBlockedReason() ?? "";
+    assert.match(reason, /closed/i);
+    assert.equal(isRegistrationEnabled(), false);
+  });
 });
