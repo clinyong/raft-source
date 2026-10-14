@@ -59,6 +59,13 @@ COPY packages/trace-client/ packages/trace-client/
 COPY packages/server/ packages/server/
 COPY manual/ manual/
 
+# The production RisingWave bootstrap (packages/server/scripts/bootstrap-risingwave.ts) composes the
+# committed SQL artefacts from infra/risingwave/sql and the shared graph builder in scripts/dev, so the
+# image must carry both: that is what lets `docker compose run --rm risingwave-init` initialise a fresh
+# chain without a Node toolchain on the host.
+COPY scripts/ scripts/
+COPY infra/risingwave/sql/ infra/risingwave/sql/
+
 LABEL org.opencontainers.image.title="slock-server" \
   org.opencontainers.image.source="${RAFT_IMAGE_SOURCE}" \
   org.opencontainers.image.revision="${RAFT_RELEASE_SHA}" \
