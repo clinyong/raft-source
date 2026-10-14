@@ -53,6 +53,7 @@
     "translations:backfill": "node --import @oxc-node/core/register scripts/backfill-message-translations.ts",
     "machines:backfill-computer-versions": "node --import @oxc-node/core/register scripts/backfill-machine-computer-versions.ts",
     "risingwave:bootstrap-local": "node --import @oxc-node/core/register scripts/bootstrap-risingwave-local.ts",
+    "risingwave:bootstrap": "node --import @oxc-node/core/register scripts/bootstrap-risingwave.ts",
     "risingwave:verify-inbox-parity": "node --import @oxc-node/core/register scripts/verify-risingwave-inbox-parity.ts",
     "followed-threads:path-diff": "node --import @oxc-node/core/register scripts/followed-threads-path-diff.ts",
     "reconcile:slack-bridge-oauth-identity": "node --import @oxc-node/core/register scripts/reconcile-slack-bridge-oauth-identity.ts",
