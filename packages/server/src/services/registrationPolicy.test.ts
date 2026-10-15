@@ -54,3 +54,42 @@ describe("registration policy", () => {
     assert.equal(isRegistrationEnabled(), false);
   });
 });
+
+describe("invite-only mode (@Dassai 2026-10-15)", () => {
+  it("refuses a registration that redeems nothing", () => {
+    process.env[KEY] = "invite-only";
+    assert.match(String(getRegistrationBlockedReason()), /by invitation only/);
+    assert.equal(getRegistrationBlockedReason({ hasValidInvite: false }), getRegistrationBlockedReason());
+    // Public sign-up is still off: nothing about this mode makes an outsider able to register.
+    assert.equal(isRegistrationEnabled(), false);
+  });
+
+  it("allows exactly the registration that resolved a valid invite", () => {
+    process.env[KEY] = "invite-only";
+    assert.equal(getRegistrationBlockedReason({ hasValidInvite: true }), null);
+  });
+
+  it("keeps `closed` meaning 'no new accounts, period' — an invite does NOT open it", () => {
+    process.env[KEY] = "closed";
+    assert.notEqual(getRegistrationBlockedReason({ hasValidInvite: true }), null);
+    assert.notEqual(getRegistrationBlockedReason({ hasValidInvite: false }), null);
+    assert.equal(isRegistrationEnabled(), false);
+  });
+
+  it("keeps upstream behaviour untouched: open ignores the invite argument", () => {
+    for (const value of ["open", "OPEN", "  open  "]) {
+      process.env[KEY] = value;
+      assert.equal(getRegistrationBlockedReason({ hasValidInvite: false }), null, `value ${JSON.stringify(value)}`);
+      assert.equal(getRegistrationBlockedReason({ hasValidInvite: true }), null, `value ${JSON.stringify(value)}`);
+      assert.equal(isRegistrationEnabled(), true, `value ${JSON.stringify(value)}`);
+    }
+  });
+
+  it("still fails closed on a typo, including one that resembles the new mode", () => {
+    for (const value of ["invite_only", "inviteonly", "invite", "opne"]) {
+      process.env[KEY] = value;
+      assert.notEqual(getRegistrationBlockedReason({ hasValidInvite: true }), null, `value ${JSON.stringify(value)}`);
+      assert.equal(isRegistrationEnabled(), false, `value ${JSON.stringify(value)}`);
+    }
+  });
+});
