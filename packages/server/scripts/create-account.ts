@@ -142,7 +142,10 @@ function parseArgs(argv: string[]): ParsedArgs {
   const printPassword = args["--print-password"] === true;
   const passwordOut = typeof args["--password-out"] === "string" ? args["--password-out"] : null;
   const acceptTermsOnBehalf = args["--accept-terms-on-behalf"] === true;
-  if (generatePassword && !printPassword && !passwordOut && !process.stdout.isTTY) {
+  // A dry run writes nothing and prints no password, so it must not be forced to choose an output method: that
+  // requirement belongs to the run that actually creates the account.
+  const dryRun = args["--dry-run"] === true;
+  if (!dryRun && generatePassword && !printPassword && !passwordOut && !process.stdout.isTTY) {
     fail(
       "refusing to print a generated password to a non-interactive stdout: it would land in whatever you are redirecting to. " +
         "Add --print-password if that is really what you want, or --password-out <file> (written 0600). " +
