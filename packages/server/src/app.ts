@@ -128,29 +128,30 @@ export function shouldSkipAuthRateLimit(input: {
  * app's own limiter as the only bound — 200 requests/minute on the whole `/api/auth` surface, i.e. ~288k attempts
  * a day for one key. Unset means upstream behaviour, unchanged.
  *
- * A set-but-unparseable value FAILS CLOSED (a strict default) rather than silently disabling the limit: a typo in
- * a security setting must not remove the protection (same rule as `registrationPolicy`).
+ * A set-but-unparseable value is a CONFIGURATION ERROR and throws: the process refuses to start rather than
+ * quietly running a quota nobody chose (@Dassai 2026-10-15 — an explicit error, not a silent substitution of a
+ * different limit). The deploy step validates the candidate configuration with this same function BEFORE it
+ * stops the running instance, so a typo cannot take the service down either: the update is abandoned and the
+ * old instance keeps serving.
  */
 export function loginRateLimitConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): { max: number; windowMs: number } | null {
   const raw = env.RAFT_AUTH_LOGIN_RATE_LIMIT_MAX?.trim();
   if (!raw) return null;
-  const strictDefault = { max: 10, windowMs: 15 * 60 * 1000 };
   const max = Number.parseInt(raw, 10);
   if (!Number.isFinite(max) || max <= 0) {
-    console.warn(
-      `[auth-login-rate-limit] RAFT_AUTH_LOGIN_RATE_LIMIT_MAX is not a positive integer (got "${raw}") — using the strict default ${strictDefault.max} instead of disabling the limit`,
+    throw new Error(
+      `RAFT_AUTH_LOGIN_RATE_LIMIT_MAX must be a positive integer (got "${raw}"): refusing to start rather than run a limit nobody chose. Unset it to keep upstream behaviour.`,
     );
-    return strictDefault;
   }
+  const DEFAULT_WINDOW_MS = 15 * 60 * 1000;
   const rawWindow = env.RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS?.trim();
-  const windowMs = rawWindow ? Number.parseInt(rawWindow, 10) : strictDefault.windowMs;
+  const windowMs = rawWindow ? Number.parseInt(rawWindow, 10) : DEFAULT_WINDOW_MS;
   if (!Number.isFinite(windowMs) || windowMs <= 0) {
-    console.warn(
-      `[auth-login-rate-limit] RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS is not a positive integer (got "${rawWindow}") — using ${strictDefault.windowMs} ms`,
+    throw new Error(
+      `RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS must be a positive integer (got "${rawWindow}") — refusing to start.`,
     );
-    return { max, windowMs: strictDefault.windowMs };
   }
   return { max, windowMs };
 }

@@ -29,17 +29,19 @@ test("the login rate limit honours its settings, with a 15 minute default window
   );
 });
 
-test("a typo in the login rate limit FAILS CLOSED (strict default, not disabled)", () => {
-  assert.deepEqual(loginRateLimitConfig({ RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "ten" } as NodeJS.ProcessEnv), {
-    max: 10,
-    windowMs: 15 * 60 * 1000,
-  });
-  assert.deepEqual(
-    loginRateLimitConfig({
-      RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "5",
-      RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS: "soon",
-    } as NodeJS.ProcessEnv),
-    { max: 5, windowMs: 15 * 60 * 1000 },
+test("a bad login rate limit is a configuration ERROR: it throws instead of substituting another quota", () => {
+  // @Dassai 2026-10-15: an explicit error, never a silent swap to a different limit. The deploy step runs this
+  // same function against the candidate configuration before stopping the running instance, so a typo cannot
+  // take the service down either.
+  assert.throws(() => loginRateLimitConfig({ RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "ten" } as NodeJS.ProcessEnv), /must be a positive integer/);
+  assert.throws(() => loginRateLimitConfig({ RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "0" } as NodeJS.ProcessEnv), /must be a positive integer/);
+  assert.throws(
+    () =>
+      loginRateLimitConfig({
+        RAFT_AUTH_LOGIN_RATE_LIMIT_MAX: "5",
+        RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS: "soon",
+      } as NodeJS.ProcessEnv),
+    /RAFT_AUTH_LOGIN_RATE_LIMIT_WINDOW_MS must be a positive integer/,
   );
 });
 
