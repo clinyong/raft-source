@@ -35,7 +35,15 @@
  *     `--password-stdin` or let the tool generate one. A GENERATED password is never written to a
  *     non-interactive stdout by accident: when stdout is not a terminal you must ask for it explicitly with
  *     `--print-password`, or have it written to a 0600 file with `--password-out <file>` — otherwise the file
- *     you were logging to becomes the password's home (task #22 review point);
+ *     you were logging to becomes the password's home (task #22 review point). The file is created
+ *     exclusively ("wx": it must not already exist, and a symlink is not followed) or the run refuses;
+ *   - **the password is surfaced BEFORE anything is written to the database** (review point): otherwise a
+ *     failure between creating the account and joining the server would leave an account whose password nobody
+ *     has, and `--add-existing` cannot recover a password;
+ *   - `--accept-terms-on-behalf` is REQUIRED to create an account. The application records a terms/privacy
+ *     acceptance at creation time and there is no post-login acceptance gate, so an operator-made account must
+ *     carry a statement of who said yes. The tool refuses to invent one silently: the operator passes this flag
+ *     to assert that the person agreed, and the recorded evidence names the operator as the source;
  *   - `--verified` marks the mailbox verified. There is no mail transport on this instance, so a
  *     verification link cannot be delivered; the operator asserts the address instead. Without it the
  *     account exists but stays unverified, and several routes require verification;
@@ -57,6 +65,9 @@ import { CURRENT_LEGAL_ACCEPTANCE } from "@botiverse/raft-shared";
 
 type Mode = "create" | "add-existing";
 
+/** Parsed once in main(); the failure handler needs the normalized email from here rather than guessing at argv. */
+let parsedArgs: ParsedArgs | null = null;
+
 interface ParsedArgs {
   mode: Mode;
   email: string;
@@ -67,6 +78,7 @@ interface ParsedArgs {
   generatePassword: boolean;
   printPassword: boolean;
   passwordOut: string | null;
+  acceptTermsOnBehalf: boolean;
   verified: boolean;
   dryRun: boolean;
   agreementId: string | null;
@@ -97,7 +109,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
   const unknown = Object.keys(args).filter(
-    (k) => !["--create", "--add-existing", "--dry-run", "--email", "--name", "--server", "--role", "--password-stdin", "--generate-password", "--verified", "--agreement-id", "--print-password", "--password-out"].includes(k),
+    (k) => !["--create", "--add-existing", "--dry-run", "--email", "--name", "--server", "--role", "--password-stdin", "--generate-password", "--verified", "--agreement-id", "--print-password", "--password-out", "--accept-terms-on-behalf"].includes(k),
   );
   if (unknown.length > 0) fail(`unknown flag(s): ${unknown.join(", ")}\n\n${USAGE}`, 2);
 
@@ -129,6 +141,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   // surfaces it when the operator asked for it, or when a human is actually watching the terminal.
   const printPassword = args["--print-password"] === true;
   const passwordOut = typeof args["--password-out"] === "string" ? args["--password-out"] : null;
+  const acceptTermsOnBehalf = args["--accept-terms-on-behalf"] === true;
   if (generatePassword && !printPassword && !passwordOut && !process.stdout.isTTY) {
     fail(
       "refusing to print a generated password to a non-interactive stdout: it would land in whatever you are redirecting to. " +
@@ -137,6 +150,14 @@ function parseArgs(argv: string[]): ParsedArgs {
     );
   }
   if (passwordOut && mode !== "create") fail("--password-out only applies with --create", 2);
+  if (mode === "create" && !acceptTermsOnBehalf) {
+    fail(
+      "refusing to create an account without --accept-terms-on-behalf: the account records a terms/privacy acceptance " +
+        "and there is no post-login gate where the person could give it themselves. Pass the flag to assert that they agreed " +
+        "(the recorded evidence will name the operator as the source).",
+    );
+  }
+  if (mode === "add-existing" && acceptTermsOnBehalf) fail("--accept-terms-on-behalf only applies with --create", 2);
 
   return {
     mode,
@@ -148,6 +169,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     generatePassword,
     printPassword: args["--print-password"] === true,
     passwordOut: typeof args["--password-out"] === "string" ? args["--password-out"] : null,
+    acceptTermsOnBehalf: args["--accept-terms-on-behalf"] === true,
     verified: args["--verified"] === true,
     dryRun: args["--dry-run"] === true,
     agreementId: typeof args["--agreement-id"] === "string" ? args["--agreement-id"] : null,
@@ -170,9 +192,9 @@ function generatePassword(): string {
 }
 
 function buildLegalAcceptance() {
-  // The register route requires the current terms/privacy versions; this tool records the same values, with
-  // the operator asserting the friend accepts them (the friend has no way to click through before the account
-  // exists). Same helper, same versions — not a hand-written copy.
+  // Same versions the register route requires — not a hand-written copy. `acceptTerms: true` here is the
+  // operator's assertion (`--accept-terms-on-behalf`), and `legalMetadata.userAgent` below records that it came
+  // through this tool rather than through the person's own click.
   return {
     acceptTerms: true,
     termsVersion: CURRENT_LEGAL_ACCEPTANCE.termsVersion,
@@ -182,6 +204,7 @@ function buildLegalAcceptance() {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  parsedArgs = args;
   // A script has to open the connection the server opens at startup; without this every `getDb()` call throws
   // "Database not initialized" (found the first time this was run against the isolated database).
   const databaseUrl = process.env.DATABASE_URL;
@@ -205,7 +228,9 @@ async function main(): Promise<void> {
   }
 
   let agreement: { id: string } | null = null;
-  if (targetServer && args.mode === "add-existing") {
+  // Both modes can join a server, so both must resolve the agreement before any write (review point: the check
+  // used to run only for --add-existing, which silently ignored `--create … --server … --agreement-id`).
+  if (targetServer) {
     const active = await db.transaction((tx) => serverAgreementService.getActiveAgreement(targetServer!.id, tx));
     if (active) {
       if (!args.agreementId) {
@@ -239,6 +264,34 @@ async function main(): Promise<void> {
   if (agreement) console.log(`[create-account] the server has an active agreement; recording id=${agreement.id}`);
 
   let userId = existing?.id ?? null;
+
+  // Surface the password NOW, before anything is written (review point): a failure after the account row exists
+  // would otherwise leave an account whose password nobody has, and --add-existing cannot recover a password.
+  // For a file, create it exclusively so an existing file is never overwritten and a symlink is never followed.
+  if (args.mode === "create" && !args.dryRun && password !== null) {
+    if (args.passwordOut) {
+      const { writeFileSync } = await import("node:fs");
+      try {
+        writeFileSync(args.passwordOut, `${password}\n`, { mode: 0o600, flag: "wx" });
+      } catch (error) {
+        fail(
+          `could not create the password file ${args.passwordOut} (${(error as Error).message}); it must not already exist. Nothing was written to the database.`,
+        );
+      }
+      console.log(`[create-account] initial password written to ${args.passwordOut} (mode 0600, created exclusively) — hand it over, then delete the file`);
+    } else if (args.printPassword || process.stdout.isTTY || args.passwordStdin) {
+      if (args.generatePassword) {
+        console.log("[create-account] ---------------------------------------------------------------");
+        console.log("[create-account] hand over privately (NOT in a chat channel, NOT into a shared log):");
+        console.log(`[create-account]   address : ${normalizedEmail}`);
+        console.log(`[create-account]   password: ${password}`);
+        console.log("[create-account] the first login is where they set their handle; they should change this password in Settings afterwards.");
+        console.log("[create-account] ---------------------------------------------------------------");
+      }
+      // With --password-stdin there is nothing to surface: the operator already has it (review point — this
+      // branch used to fail at the end of a SUCCESSFUL creation).
+    }
+  }
 
   if (args.mode === "create") {
     if (args.dryRun) {
@@ -301,25 +354,6 @@ async function main(): Promise<void> {
     }
   }
 
-  if (args.mode === "create" && !args.dryRun) {
-    if (args.passwordOut) {
-      // 0600 and no copy in the run's output: whoever needs the password reads that file, and it never
-      // travels through a shell history or a log collector.
-      const { writeFileSync, chmodSync } = await import("node:fs");
-      writeFileSync(args.passwordOut, `${password}\n`, { mode: 0o600 });
-      chmodSync(args.passwordOut, 0o600);
-      console.log(`[create-account] initial password written to ${args.passwordOut} (mode 0600) — hand it over, then delete the file`);
-    } else if (args.printPassword || process.stdout.isTTY) {
-      console.log("[create-account] ---------------------------------------------------------------");
-      console.log(`[create-account] hand over privately (NOT in a chat channel, NOT into a shared log):`);
-      console.log(`[create-account]   address : ${normalizedEmail}`);
-      console.log(`[create-account]   password: ${password}`);
-      console.log("[create-account] the first login is where they set their handle; they should change this password in Settings afterwards.");
-      console.log("[create-account] ---------------------------------------------------------------");
-    } else {
-      fail("the account was created, but no way to surface the password was chosen: re-run with --print-password or --password-out");
-    }
-  }
   process.exit(0);
 }
 
@@ -329,7 +363,7 @@ main().catch(async (error: unknown) => {
   // Say exactly what state the database is in, and how to finish by hand: "it failed" is not enough when the
   // failure can happen after the account row exists (@Dassai 2026-10-15 — the account must be reportable and
   // completable with --add-existing, without turning this into a bigger tool).
-  const email = process.argv.find((a) => a.includes("@")) ?? "";
+  const email = parsedArgs?.email ?? "";
   if (email) {
     try {
       const db = getDb();
@@ -340,6 +374,9 @@ main().catch(async (error: unknown) => {
         console.error('[create-account] to finish the server join by hand, re-run with: --add-existing --email ' + normalized + ' --server <slug|uuid> [--role member|guest] [--agreement-id <id>]');
       } else {
         console.error(`[create-account] no account row exists for ${normalized}; nothing was created`);
+      }
+      if (parsedArgs?.passwordOut) {
+        console.error(`[create-account] note: a generated password was saved to ${parsedArgs.passwordOut} before the failure — delete that file if no account was created`);
       }
     } catch {
       console.error('[create-account] could not read the account state back; check the database by hand');
