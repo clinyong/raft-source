@@ -632,7 +632,17 @@ authRouter.get("/providers", async (req, res) => {
       enabled: await isSocialAuthProviderAvailable(provider, platform),
     })));
 
-  res.json({ providers });
+  res.json({
+    providers,
+    // The web needs to know at boot whether a new account can be created at all, so it never shows a sign-up
+    // form the server would refuse with 403. Same predicate as POST /register (getRegistrationBlockedReason),
+    // so the hidden form and the refused request cannot disagree. Already public information: the register
+    // route returns this reason in its 403 body.
+    registration: (() => {
+      const blockedReason = getRegistrationBlockedReason();
+      return blockedReason ? { open: false, reason: blockedReason } : { open: true };
+    })(),
+  });
 });
 
 authRouter.get("/identities", requireAuth, async (req, res) => {

@@ -830,10 +830,28 @@ export function AppShell() {
   const [publicViewDismissed, setPublicViewDismissed] = useState(false);
   const [devAutoLoginAttempted, setDevAutoLoginAttempted] = useState(false);
 
+  // Whether this deployment accepts NEW accounts. Fail-closed: until the server says `open`, no sign-up entry
+  // is offered, so a form that the server would refuse with 403 is never shown in the first place. The value
+  // comes from the same predicate the register route enforces (GET /api/auth/providers), so "the page hides
+  // it" and "the server refuses it" cannot drift apart into two different answers.
+  const [registrationOpen, setRegistrationOpen] = useState(false);
+
   // Read URL params once on mount, but inviteToken is stateful so it can be cleared
   const urlParamsRef = useMemo(() => getUrlParams(), []);
   const [inviteToken, setInviteToken] = useState<string | null>(urlParamsRef.inviteToken);
   const urlParams = useMemo(() => ({ ...urlParamsRef, inviteToken }), [urlParamsRef, inviteToken]);
+
+  // Ask the server once whether new accounts are accepted (see the state comment above). A failure keeps the
+  // closed default rather than guessing open.
+  useEffect(() => {
+    let cancelled = false;
+    api.get("/auth/providers")
+      .then((res) => {
+        if (!cancelled) setRegistrationOpen(res.data?.registration?.open === true);
+      })
+      .catch(() => { /* stay closed; the register route refuses anyway */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // Load user on mount
   useEffect(() => {
@@ -1068,8 +1086,10 @@ export function AppShell() {
   }, []);
   const inviteSwitchToRegister = useCallback(() => {
     setInviteToken(null);
-    setAuthView("register");
-  }, []);
+    // With registration closed, an invite flow must not offer a create-account form the server would refuse;
+    // the invite itself is accepted on the invite page, so landing on login keeps that path working.
+    setAuthView(registrationOpen ? "register" : "login");
+  }, [registrationOpen]);
   const dismissPublicView = useCallback(() => setPublicViewDismissed(true), []);
   const publicSignIn = useCallback(() => {
     setPublicViewDismissed(true);
@@ -1137,18 +1157,18 @@ export function AppShell() {
           slug={publicServerSlug}
           initialChannelId={publicChannelId}
           onSignIn={publicSignIn}
-          onRegister={publicRegister}
+          onRegister={registrationOpen ? publicRegister : undefined}
           onUnavailable={dismissPublicView}
         />
       );
-    } else if (authView === "register") {
+    } else if (authView === "register" && registrationOpen) {
       content = <RegisterPage onSwitchToLogin={showLogin} />;
     } else if (authView === "forgot-password") {
       content = <ForgotPasswordPage onBack={showLogin} />;
     } else {
       content = (
         <LoginPage
-          onSwitchToRegister={showRegister}
+          onSwitchToRegister={registrationOpen ? showRegister : undefined}
           onForgotPassword={showForgotPassword}
         />
       );
