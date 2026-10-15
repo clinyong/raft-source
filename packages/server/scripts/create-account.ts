@@ -44,7 +44,7 @@ import { createInterface } from "node:readline";
 
 import { eq } from "drizzle-orm";
 
-import { getDb } from "../src/db/index";
+import { closeDatabase, getDb, initDatabase } from "../src/db/index";
 import { users } from "../src/db/schema";
 import { normalizeEmail } from "../src/services/emailNormalization";
 import * as serverService from "../src/services/serverService";
@@ -163,6 +163,11 @@ function buildLegalAcceptance() {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  // A script has to open the connection the server opens at startup; without this every `getDb()` call throws
+  // "Database not initialized" (found the first time this was run against the isolated database).
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) fail("DATABASE_URL is not set — run this against the instance's database on purpose");
+  await initDatabase(databaseUrl);
   const db = getDb();
   const normalizedEmail = normalizeEmail(args.email);
 
@@ -238,6 +243,11 @@ async function main(): Promise<void> {
   }
 
   if (targetServer) {
+    // Test seam: prove the failure reporting for the one window that matters — the account exists and the join
+    // did not happen (@Dassai 2026-10-15 asked for exactly that evidence). Never set outside a drill.
+    if (process.env.RAFT_CREATE_ACCOUNT_TEST_FAIL_BEFORE_JOIN === "1") {
+      throw new Error("test seam: failing after the account was created and before the server join");
+    }
     const alreadyMember = userId ? await serverService.isMember(targetServer.id, userId) : false;
     if (args.dryRun) {
       console.log(`[create-account] WOULD add ${alreadyMember ? "(already a member — nothing to do)" : "as " + args.role} to server "${targetServer.name}" (${targetServer.slug})`);
@@ -277,8 +287,28 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-main().catch((error: unknown) => {
+main().catch(async (error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`[create-account] FAILED: ${message}`);
+  // Say exactly what state the database is in, and how to finish by hand: "it failed" is not enough when the
+  // failure can happen after the account row exists (@Dassai 2026-10-15 — the account must be reportable and
+  // completable with --add-existing, without turning this into a bigger tool).
+  const email = process.argv.find((a) => a.includes("@")) ?? "";
+  if (email) {
+    try {
+      const db = getDb();
+      const normalized = normalizeEmail(email);
+      const [row] = await db.select({ id: users.id, emailVerified: users.emailVerified }).from(users).where(eq(users.email, normalized));
+      if (row) {
+        console.error(`[create-account] the account EXISTS: id=${row.id} email=${normalized} verified=${row.emailVerified}`);
+        console.error('[create-account] to finish the server join by hand, re-run with: --add-existing --email ' + normalized + ' --server <slug|uuid> [--role member|guest] [--agreement-id <id>]');
+      } else {
+        console.error(`[create-account] no account row exists for ${normalized}; nothing was created`);
+      }
+    } catch {
+      console.error('[create-account] could not read the account state back; check the database by hand');
+    }
+    await closeDatabase().catch(() => undefined);
+  }
   process.exit(1);
 });
