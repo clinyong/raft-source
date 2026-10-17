@@ -337,19 +337,23 @@ export interface PiCompactionSettingsSnapshot {
   modelEntry: PiCompactionTokenSettings | null;
 }
 
+/**
+ * The settings surface the wiring implements against Pi. Two properties matter more than the shape:
+ *
+ * - `apply` writes ONE key -- the current model's own `compaction.modelOverrides` entry. The entry outranks
+ *   the ordinary settings in Pi's resolution order, so it is the smallest write that makes the policy's
+ *   numbers effective for this session, and it leaves both the ordinary fields (which other models inherit)
+ *   and the settings files untouched.
+ * - `restore` must be able to put the settings back EXACTLY as they were, including fields and entries that
+ *   were absent. An absent key cannot be re-created as absent by a merge, so the wiring restores by
+ *   re-deriving the settings from their source (`reload`) -- which is why restore is asynchronous -- and the
+ *   rollback is verified by reading the effective settings again.
+ */
 export interface PiCompactionSettingsSurface {
-  /** Snapshot the state before touching it. */
-  capture: () => PiCompactionSettingsSnapshot;
-  /** Apply the policy's numbers; a model entry is written only when one already existed (see decide()). */
-  apply: (effective: PiCompactionEffectiveSettings, options: { writeModelEntry: boolean }) => void;
-  /** What the session resolves for its model now. */
+  apply: (effective: PiCompactionTokenSettings) => void;
   readEffective: () => PiCompactionTokenSettings;
-  /** Put the captured state back, exactly. */
-  restore: (snapshot: PiCompactionSettingsSnapshot) => void;
+  restore: () => Promise<void>;
 }
-
-/** The numbers the policy applies; the full effective shape carries more. */
-export type PiCompactionEffectiveSettings = PiCompactionTokenSettings;
 
 export interface PiCompactionPolicyApplication {
   apply: PiCompactionPolicyResolution | null;
@@ -360,37 +364,43 @@ export interface PiCompactionPolicyApplication {
   capInstalledWithoutTrigger: boolean;
   /** null when nothing was applied; false when the read-back disagreed and both layers were rolled back. */
   settingsVerified: boolean | null;
+  /** null when no rollback happened; whether the rollback landed (verified by reading the settings back). */
+  rollbackVerified: boolean | null;
   readback: string;
 }
 
-export function decidePiCompactionPolicy(args: {
+export async function decidePiCompactionPolicy(args: {
   capResolution: PiCompactionPolicyResolution;
   sessionResolution: PiCompactionPolicyResolution;
   capOption: { summaryOutputCapTokens?: number };
   /** Omitted in unit tests and when nothing is applied. */
   settings?: PiCompactionSettingsSurface;
-}): PiCompactionPolicyApplication {
+}): Promise<PiCompactionPolicyApplication> {
   const decision = combinePiCompactionPolicyResolutions(args.capResolution, args.sessionResolution);
   const hadCeiling = typeof args.capOption.summaryOutputCapTokens === "number";
   let apply = decision.apply;
   let readback = decision.readback;
   let settingsVerified: boolean | null = null;
+  let rollbackVerified: boolean | null = null;
   if (apply && args.settings) {
     // Apply, then ask Pi what it will really use. The read-back is the contract: a policy whose numbers did
     // not take effect must not be reported as applied, so it is rolled back and both layers are cleared.
     //
-    // The rollback restores the captured state exactly -- the ordinary fields AND the model's own entry
-    // (including "there was none"). Restoring the *resolved* values instead would write the model's numbers
-    // into the ordinary fields and leave an entry behind where the agent had none, which freezes inheritance
-    // for that model: a rollback that changes other state is not a rollback.
-    const snapshot = args.settings.capture();
-    args.settings.apply(apply.effective!, { writeModelEntry: snapshot.modelEntry !== null });
+    // The rollback re-derives the settings from their source instead of replaying values, so a field or an
+    // entry that was ABSENT comes back absent -- a merge can never re-create absence, and restoring a resolved
+    // pair would leave the model with an entry it never had (freezing its inheritance) and put the model's
+    // numbers into the ordinary fields other models read. The rollback is then verified by reading the
+    // effective settings again, not assumed.
+    const before = args.settings.readEffective();
+    args.settings.apply(apply.effective!);
     const after = args.settings.readEffective();
     const wanted = apply.effective!;
     settingsVerified = after.reserveTokens === wanted.reserveTokens && after.keepRecentTokens === wanted.keepRecentTokens;
     if (!settingsVerified) {
-      args.settings.restore(snapshot);
-      readback = `compaction pilot: not applied (the applied settings did not take effect: read back reserve ${after.reserveTokens} / keep recent ${after.keepRecentTokens}, wanted ${wanted.reserveTokens} / ${wanted.keepRecentTokens})`;
+      await args.settings.restore();
+      const restored = args.settings.readEffective();
+      rollbackVerified = restored.reserveTokens === before.reserveTokens && restored.keepRecentTokens === before.keepRecentTokens;
+      readback = `compaction pilot: not applied (the applied settings did not take effect: read back reserve ${after.reserveTokens} / keep recent ${after.keepRecentTokens}, wanted ${wanted.reserveTokens} / ${wanted.keepRecentTokens}; rollback ${rollbackVerified ? "verified" : "NOT verified"})`;
       apply = null;
     }
   }
@@ -403,6 +413,7 @@ export function decidePiCompactionPolicy(args: {
     capCeilingActive,
     capInstalledWithoutTrigger: capCeilingActive && apply === null,
     settingsVerified,
+    rollbackVerified,
     readback: capCleared ? `${readback}; the ceiling was cleared with it` : readback,
   };
 }

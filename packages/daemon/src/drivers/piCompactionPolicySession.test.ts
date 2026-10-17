@@ -157,7 +157,8 @@ test("another model's own override is untouched by applying or rolling back the 
  * must survive is the STRUCTURE the session had -- the prior ordinary fields, and this model's override entry
  * present or absent exactly as before -- rather than only the pair that happened to be resolved.
  */
-async function createFixtureSessionWithReadbackFault(existing: boolean) {
+async function createFixtureSessionWithReadbackFault(options: { existing?: boolean; settings?: Record<string, unknown> } = {}) {
+  const existing = options.existing ?? false;
   const original = SettingsManager.prototype.getCompactionSettings;
   let faulted = false;
   const spy = vi.spyOn(SettingsManager.prototype, "getCompactionSettings").mockImplementation(function (
@@ -172,23 +173,18 @@ async function createFixtureSessionWithReadbackFault(existing: boolean) {
     return value;
   });
   try {
-    const session = await createFixtureSession({
-      // The fixture composes its own modelOverrides for the target model, so the entry set is built here:
-      // another model always, and the target model's own entry only in the "existing" branch.
-      selected: true,
-      existingModelOverride: false,
-      settings: {
-        compaction: {
-          enabled: true,
-          reserveTokens: 16_000,
-          keepRecentTokens: 7_000,
-          modelOverrides: {
-            "other/model": { reserveTokens: 9_000, keepRecentTokens: 2_000 },
-            ...(existing ? { "openai/model-window-probe": { reserveTokens: 10_000, keepRecentTokens: 3_000 } } : {}),
-          },
+    const settings = options.settings ?? {
+      compaction: {
+        enabled: true,
+        reserveTokens: 16_000,
+        keepRecentTokens: 7_000,
+        modelOverrides: {
+          "other/model": { reserveTokens: 9_000, keepRecentTokens: 2_000 },
+          ...(existing ? { "openai/model-window-probe": { reserveTokens: 10_000, keepRecentTokens: 3_000 } } : {}),
         },
       },
-    });
+    };
+    const session = await createFixtureSession({ selected: true, existingModelOverride: false, settings });
     return { session, faulted: () => faulted };
   } finally {
     spy.mockRestore();
@@ -196,7 +192,7 @@ async function createFixtureSessionWithReadbackFault(existing: boolean) {
 }
 
 test.each([false, true])("a failed verification restores the complete prior settings (existing override=%s)", async (existing) => {
-  const { session, faulted } = await createFixtureSessionWithReadbackFault(existing);
+  const { session, faulted } = await createFixtureSessionWithReadbackFault({ existing });
   try {
     expect(faulted()).toBe(true);
     const compaction = session.settingsManager.getSettings().compaction;
@@ -212,6 +208,67 @@ test.each([false, true])("a failed verification restores the complete prior sett
     // And inheritance still works: a later ordinary change reaches the model unless its own entry says otherwise.
     session.settingsManager.applyOverrides({ compaction: { reserveTokens: 17_000 } });
     expect(session.settingsManager.getCompactionSettings(session.model).reserveTokens).toBe(existing ? 10_000 : 17_000);
+  } finally {
+    session.dispose();
+  }
+});
+
+// --- @Kirin's r8 findings, as session cases -------------------------------------------------------------
+// Found by running his own preserved harness against the frozen revision: I reasoned about RESOLVED values
+// where Pi keeps RAW structure. A partial entry has to come back partial, and a field the file never declared
+// has to come back absent -- a merge cannot re-create absence, which is why the rollback re-derives the
+// settings instead of replaying numbers.
+
+test("an entry equal to the ordinary values still receives the selected policy", async () => {
+  // The entry equals the ordinary fields, so a value comparison sees "no override" while the file HAS one;
+  // the policy must still win, because the entry is what the model resolves.
+  const session = await createFixtureSession({
+    selected: true,
+    existingModelOverride: false,
+    settings: {
+      compaction: {
+        enabled: true, reserveTokens: 16_000, keepRecentTokens: 7_000,
+        modelOverrides: { "openai/model-window-probe": { reserveTokens: 16_000, keepRecentTokens: 7_000 } },
+      },
+    },
+  });
+  try {
+    expect(session.settingsManager.getCompactionSettings(session.model)).toEqual({
+      enabled: true, reserveTokens: 400_000, keepRecentTokens: 20_000,
+    });
+  } finally {
+    session.dispose();
+  }
+});
+
+test.each([{ reserveTokens: 10_000 }, { keepRecentTokens: 3_000 }])(
+  "a failed verification restores a partial model entry %j exactly", async (entry) => {
+    const { session, faulted } = await createFixtureSessionWithReadbackFault({
+      settings: {
+        compaction: {
+          enabled: true, reserveTokens: 16_000, keepRecentTokens: 7_000,
+          modelOverrides: { "openai/model-window-probe": entry },
+        },
+      },
+    });
+    try {
+      expect(faulted()).toBe(true);
+      const overrides = (session.settingsManager.getSettings().compaction?.modelOverrides ?? {}) as Record<string, unknown>;
+      expect(overrides["openai/model-window-probe"]).toEqual(entry);
+    } finally {
+      session.dispose();
+    }
+  },
+);
+
+test("a failed verification preserves ordinary token fields the file never declared", async () => {
+  const fileSettings = { compaction: { enabled: true } };
+  const { session, faulted } = await createFixtureSessionWithReadbackFault({ settings: fileSettings });
+  try {
+    expect(faulted()).toBe(true);
+    // No reserveTokens/keepRecentTokens key may be left behind: they were absent, and writing them would pin
+    // values the agent deliberately left to Pi's defaults.
+    expect(session.settingsManager.getSettings().compaction).toEqual({ enabled: true });
   } finally {
     session.dispose();
   }

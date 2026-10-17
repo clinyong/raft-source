@@ -45,7 +45,7 @@ const model = {
   maxTokens: 384_000,
 };
 
-test("the pilot policy resolves to a 60% trigger, 20k retained and the accepted 16,384 / 10,240 ceilings", () => {
+test("the pilot policy resolves to a 60% trigger, 20k retained and the accepted 16,384 / 10,240 ceilings", async () => {
   const resolution = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
   assert.equal(resolution.status, "applied");
   assert.deepEqual(resolution.effective, {
@@ -61,7 +61,7 @@ test("the pilot policy resolves to a 60% trigger, 20k retained and the accepted 
   assert.match(resolution.readback, /summary cap 16384 \(prefix 10240\)/);
 });
 
-test("the trigger is Pi's own: above 60% compacts, exactly 60% does not", () => {
+test("the trigger is Pi's own: above 60% compacts, exactly 60% does not", async () => {
   const { effective } = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
   const settings = {
     enabled: true,
@@ -109,7 +109,7 @@ test("the real SDK requests exactly the ceilings the policy promises", async () 
   assert.deepEqual(caps, [effective!.summaryOutputCapTokens, effective!.prefixOutputCapTokens]);
 });
 
-test("an agent without the policy behaves exactly as before (default/unselected control)", () => {
+test("an agent without the policy behaves exactly as before (default/unselected control)", async () => {
   const unset = resolvePiCompactionPolicy({ envVars: null, model: { contextWindow: 200_000 } });
   assert.equal(unset.status, "unset");
   assert.equal(unset.effective, null);
@@ -119,7 +119,7 @@ test("an agent without the policy behaves exactly as before (default/unselected 
   assert.equal(other.status, "unset");
 });
 
-test("a disabled policy is inert and still reports itself", () => {
+test("a disabled policy is inert and still reports itself", async () => {
   const resolution = resolvePiCompactionPolicy({
     envVars: env(JSON.stringify({ version: 1, enabled: false })),
     model: { contextWindow: 200_000 },
@@ -130,7 +130,7 @@ test("a disabled policy is inert and still reports itself", () => {
   assert.equal(resolution.readback, "compaction pilot: not applied (policy disabled)");
 });
 
-test("an unresolved model window applies nothing and says why", () => {
+test("an unresolved model window applies nothing and says why", async () => {
   for (const window of [undefined, null, 0, -1, Number.NaN]) {
     const resolution = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: window } });
     assert.equal(resolution.status, "unknown_model_window", `window=${String(window)}`);
@@ -141,13 +141,13 @@ test("an unresolved model window applies nothing and says why", () => {
   assert.equal(noModel.status, "unknown_model_window");
 });
 
-test("a window too small to express the trigger is refused instead of rounding to a no-op", () => {
+test("a window too small to express the trigger is refused instead of rounding to a no-op", async () => {
   const resolution = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1 } });
   assert.equal(resolution.status, "window_incompatible");
   assert.match(resolution.readback, /cannot express a 60% trigger/);
 });
 
-test("a window that cannot keep 20k recent tokens below its own trigger is refused", () => {
+test("a window that cannot keep 20k recent tokens below its own trigger is refused", async () => {
   // 0.6 x 32768 = 19,660: the trigger would sit BELOW the retained history, so "above the trigger" would be
   // almost entirely retained context and the policy would churn every turn on a model this small.
   const resolution = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 32_768 } });
@@ -156,7 +156,7 @@ test("a window that cannot keep 20k recent tokens below its own trigger is refus
   assert.match(resolution.readback, /triggers above 19660, less than twice the 20000 retained tokens/);
 });
 
-test("the same policy on a window that can host it still applies, on both sides of the line", () => {
+test("the same policy on a window that can host it still applies, on both sides of the line", async () => {
   const smaller = JSON.stringify({
     version: 1, enabled: true, triggerAboveRatio: 0.6, keepRecentTokens: 5_000, summaryOutputCapTokens: 16_384,
   });
@@ -173,7 +173,7 @@ test("the same policy on a window that can host it still applies, on both sides 
   assert.equal(justBelow.effective, null);
 });
 
-test("a policy that would silently change meaning is rejected, not coerced", () => {
+test("a policy that would silently change meaning is rejected, not coerced", async () => {
   const cases: Array<[string, string]> = [
     ["not json", "not valid JSON"],
     ["[]", "not a JSON object"],
@@ -197,7 +197,7 @@ test("a policy that would silently change meaning is rejected, not coerced", () 
   }
 });
 
-test("the window is re-resolved per call, so a model change re-derives the trigger and ceilings", () => {
+test("the window is re-resolved per call, so a model change re-derives the trigger and ceilings", async () => {
   const windows = [100_000, 200_000, 1_000_000];
   const seen = windows.map((contextWindow) =>
     resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow } }).effective!,
@@ -211,13 +211,13 @@ test("the window is re-resolved per call, so a model change re-derives the trigg
   assert.deepEqual(seen.map((e) => e.prefixOutputCapTokens), [10_240, 10_240, 10_240]);
 });
 
-test("no agent id is baked into the policy code — the pilot is whoever carries the env var", () => {
+test("no agent id is baked into the policy code — the pilot is whoever carries the env var", async () => {
   const source = readFileSync(new URL("./piCompactionPolicy.ts", import.meta.url), "utf8");
   assert.equal(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/.test(source), false, "policy code must not contain a UUID");
   assert.match(source, /PI_COMPACTION_POLICY_ENV_VAR = "RAFT_PI_COMPACTION_POLICY"/);
 });
 
-test("the two moments are reconciled: cap built before the model, settings applied after it", () => {
+test("the two moments are reconciled: cap built before the model, settings applied after it", async () => {
   const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
   const sessionSame = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
 
@@ -256,14 +256,14 @@ test("the two moments are reconciled: cap built before the model, settings appli
   assert.equal(bothUnset.readback, "compaction pilot: not applied (not configured)");
 });
 
-test("an inert final result clears the ceiling, and the readback describes the state that is left", () => {
+test("an inert final result clears the ceiling, and the readback describes the state that is left", async () => {
   const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
   const applied = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
   const incompatible = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 32_768 } });
 
   // Applied: the option keeps the policy ceiling, and nothing claims a clearance.
   const kept: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
-  const keptDecision = decidePiCompactionPolicy({ capResolution: cap, sessionResolution: applied, capOption: kept });
+  const keptDecision = await decidePiCompactionPolicy({ capResolution: cap, sessionResolution: applied, capOption: kept });
   assert.equal(kept.summaryOutputCapTokens, 16_384);
   assert.equal(keptDecision.capCeilingActive, true);
   assert.equal(keptDecision.capInstalledWithoutTrigger, false);
@@ -271,7 +271,7 @@ test("an inert final result clears the ceiling, and the readback describes the s
 
   // Inert: the ceiling goes with it, and BOTH the readback and the flags say so.
   const cleared: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
-  const clearedDecision = decidePiCompactionPolicy({ capResolution: cap, sessionResolution: incompatible, capOption: cleared });
+  const clearedDecision = await decidePiCompactionPolicy({ capResolution: cap, sessionResolution: incompatible, capOption: cleared });
   assert.equal(cleared.summaryOutputCapTokens, undefined);
   assert.equal(clearedDecision.apply, null);
   assert.equal(clearedDecision.capCeilingActive, false);
@@ -281,7 +281,7 @@ test("an inert final result clears the ceiling, and the readback describes the s
   assert.doesNotMatch(clearedDecision.readback, /stays in the extension/);
 });
 
-test("the ceiling really is late-bound: the adapter reads whatever the option holds at compaction time", () => {
+test("the ceiling really is late-bound: the adapter reads whatever the option holds at compaction time", async () => {
   // This is the mechanism r3 relies on. The factory is built once, during session creation, but the handler
   // reads the option per request -- so clearing it after an inert final resolution disables the cap layer.
   const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
@@ -313,88 +313,88 @@ test("the ceiling really is late-bound: the adapter reads whatever the option ho
   assert.equal(takePiCompactionSummaryOutputCap(sessionManager), null, "a cleared ceiling must not bind");
 });
 
-function settingsSurfaceFixture(initial: { ordinary: { reserveTokens: number; keepRecentTokens: number }; modelEntry: { reserveTokens: number; keepRecentTokens: number } | null }) {
-  let state = {
-    ordinary: { ...initial.ordinary },
-    entry: initial.modelEntry ? { ...initial.modelEntry } : null,
-  };
+/**
+ * Stands in for the wiring's settings surface. The contract under test: `apply` writes the model's own
+ * override entry, the effective settings resolve through it, and `restore` returns the surface to the state
+ * it started in -- including "no entry", which a merge cannot re-create.
+ */
+function policySettingsFixture(options: {
+  ordinary?: { reserveTokens?: number; keepRecentTokens?: number };
+  entry?: { reserveTokens?: number; keepRecentTokens?: number } | null;
+}) {
+  const ordinary = options.ordinary ?? {};
+  const initialEntry = options.entry === undefined ? null : options.entry;
+  let entry = initialEntry ? { ...initialEntry } : null;
   let fault = true;
+  const effective = () => ({
+    reserveTokens: entry?.reserveTokens ?? ordinary.reserveTokens ?? 16_384,
+    keepRecentTokens: entry?.keepRecentTokens ?? ordinary.keepRecentTokens ?? 20_000,
+  });
   return {
-    /** The state the surface ends in -- what the assertions read. */
-    state: () => state,
-    /** Stop perturbing the read-back (the surface then behaves). */
+    /** What the surface holds now: the entry, exactly as it is (partial entries included). */
+    state: () => ({ entry: entry ? { ...entry } : null, effective: effective() }),
     heal: () => { fault = false; },
     surface: {
-      capture: () => ({ ordinary: { ...state.ordinary }, modelEntry: state.entry ? { ...state.entry } : null }),
-      apply: (effective: { reserveTokens: number; keepRecentTokens: number }, options: { writeModelEntry: boolean }) => {
-        // Only the two token settings, exactly as the real surface writes them.
-        const tokens = { reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens };
-        state.ordinary = { ...tokens };
-        if (options.writeModelEntry) state.entry = { ...tokens };
+      apply: (values: { reserveTokens: number; keepRecentTokens: number }) => {
+        entry = { reserveTokens: values.reserveTokens, keepRecentTokens: values.keepRecentTokens };
       },
       readEffective: () => {
-        const resolved = state.entry ?? state.ordinary;
+        const resolved = effective();
         return fault ? { ...resolved, reserveTokens: resolved.reserveTokens - 1 } : { ...resolved };
       },
-      restore: (snapshot: { ordinary: { reserveTokens: number; keepRecentTokens: number }; modelEntry: { reserveTokens: number; keepRecentTokens: number } | null }) => {
-        state = { ordinary: { ...snapshot.ordinary }, entry: snapshot.modelEntry ? { ...snapshot.modelEntry } : null };
+      restore: async () => {
+        entry = initialEntry ? { ...initialEntry } : null;  // re-derived from source: absence comes back
       },
     },
   };
 }
 
-test("a failed verification restores the prior ordinary fields AND the model entry that existed", () => {
+test("a failed verification restores the prior entry, partial fields included", async () => {
   const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const session = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
-  const fixture = settingsSurfaceFixture({
+  const fixture = policySettingsFixture({
     ordinary: { reserveTokens: 16_000, keepRecentTokens: 7_000 },
-    modelEntry: { reserveTokens: 10_000, keepRecentTokens: 3_000 },
+    entry: { reserveTokens: 10_000 },  // partial on purpose: the missing field inherits
   });
-  const decision = decidePiCompactionPolicy({
+  const decision = await decidePiCompactionPolicy({
     capResolution: cap, sessionResolution: session, capOption: option, settings: fixture.surface,
   });
   assert.equal(decision.settingsVerified, false);
+  assert.equal(decision.rollbackVerified, true);
   assert.equal(decision.apply, null);
-  assert.equal(decision.capCeilingActive, false);
   assert.equal(option.summaryOutputCapTokens, undefined, "the ceiling goes when the settings roll back");
-  // Replaying the resolved pair (10,000/3,000) into both levels would have changed inheritance for other
-  // models; the ordinary fields must come back as 16,000/7,000 and the entry as its own prior pair.
-  assert.deepEqual(fixture.state().ordinary, { reserveTokens: 16_000, keepRecentTokens: 7_000 });
-  assert.deepEqual(fixture.state().entry, { reserveTokens: 10_000, keepRecentTokens: 3_000 });
-  assert.match(decision.readback, /did not take effect: read back reserve 399999/);
+  assert.deepEqual(fixture.state().entry, { reserveTokens: 10_000 }, "the partial entry must come back exactly");
+  assert.deepEqual(fixture.state().effective, { reserveTokens: 10_000, keepRecentTokens: 7_000 },
+    "and it must still inherit the ordinary field it did not set");
 });
 
-test("a failed verification with no prior model entry leaves no entry behind", () => {
+test("a failed verification with no prior entry leaves no entry behind", async () => {
   const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const session = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
-  const fixture = settingsSurfaceFixture({
-    ordinary: { reserveTokens: 16_000, keepRecentTokens: 7_000 },
-    modelEntry: null,
-  });
-  const decision = decidePiCompactionPolicy({
+  const fixture = policySettingsFixture({ ordinary: {}, entry: null });  // nothing declared at all
+  const decision = await decidePiCompactionPolicy({
     capResolution: cap, sessionResolution: session, capOption: option, settings: fixture.surface,
   });
-  assert.equal(decision.settingsVerified, false);
-  assert.deepEqual(fixture.state().ordinary, { reserveTokens: 16_000, keepRecentTokens: 7_000 });
+  assert.equal(decision.rollbackVerified, true);
   assert.equal(fixture.state().entry, null, "no entry may be created by a rollback: it would freeze inheritance");
+  assert.deepEqual(fixture.state().effective, { reserveTokens: 16_384, keepRecentTokens: 20_000 },
+    "and with the file silent, Pi's own defaults are back");
 });
 
-test("a surface that behaves is verified, applied and left alone", () => {
+test("a surface that behaves is verified, applied and left alone", async () => {
   const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const session = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
-  const fixture = settingsSurfaceFixture({
-    ordinary: { reserveTokens: 16_384, keepRecentTokens: 20_000 },
-    modelEntry: null,
-  });
+  const fixture = policySettingsFixture({ ordinary: { reserveTokens: 16_384, keepRecentTokens: 20_000 }, entry: null });
   fixture.heal();
-  const decision = decidePiCompactionPolicy({
+  const decision = await decidePiCompactionPolicy({
     capResolution: cap, sessionResolution: session, capOption: option, settings: fixture.surface,
   });
   assert.equal(decision.settingsVerified, true);
+  assert.equal(decision.rollbackVerified, null, "no rollback happened, so nothing to verify");
   assert.equal(decision.apply?.status, "applied");
-  assert.deepEqual(fixture.state().ordinary, { reserveTokens: 400_000, keepRecentTokens: 20_000 });
+  assert.deepEqual(fixture.state().entry, { reserveTokens: 400_000, keepRecentTokens: 20_000 });
   assert.equal(option.summaryOutputCapTokens, 16_384);
 });
