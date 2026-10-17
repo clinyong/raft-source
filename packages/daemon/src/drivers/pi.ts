@@ -74,6 +74,7 @@ import {
   type PiCompactionEffectiveSettings,
   type PiCompactionPolicyEffective,
   type PiCompactionPolicyResolution,
+  type PiCompactionSettingsSnapshot,
 } from "./piCompactionPolicy";
 import {
   createProviderHttpClient,
@@ -1656,7 +1657,7 @@ export async function createPiAgentSessionForContext(
         const current = services.settingsManager.getCompactionSettings(model);
         return { reserveTokens: current.reserveTokens, keepRecentTokens: current.keepRecentTokens };
       },
-      restore: (snapshot) => {
+      restore: (snapshot: PiCompactionSettingsSnapshot) => {
         // Put back exactly what was captured: the ordinary fields, and this model's own entry if it had one.
         // Two separate writes on purpose -- the entry must not land in the ordinary fields.
         applyPiDaemonSettingsOverrides(services.settingsManager, snapshot.ordinary);

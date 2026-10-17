@@ -160,7 +160,10 @@ test("another model's own override is untouched by applying or rolling back the 
 async function createFixtureSessionWithReadbackFault(existing: boolean) {
   const original = SettingsManager.prototype.getCompactionSettings;
   let faulted = false;
-  const spy = vi.spyOn(SettingsManager.prototype, "getCompactionSettings").mockImplementation(function (this: SettingsManager, model: never) {
+  const spy = vi.spyOn(SettingsManager.prototype, "getCompactionSettings").mockImplementation(function (
+    this: SettingsManager,
+    model?: { id: string; provider: string },
+  ) {
     const value = original.call(this, model);
     if (!faulted && (model as { id?: string } | undefined)?.id === "model-window-probe" && value.reserveTokens === 400_000) {
       faulted = true;
@@ -197,12 +200,13 @@ test.each([false, true])("a failed verification restores the complete prior sett
   try {
     expect(faulted()).toBe(true);
     const compaction = session.settingsManager.getSettings().compaction;
+    const overrides = (compaction?.modelOverrides ?? {}) as Record<string, { reserveTokens: number; keepRecentTokens: number }>;
     // Ordinary fields back to the file's values, and the other model's entry untouched.
-    expect(compaction.reserveTokens).toBe(16_000);
-    expect(compaction.keepRecentTokens).toBe(7_000);
-    expect(compaction.modelOverrides["other/model"]).toEqual({ reserveTokens: 9_000, keepRecentTokens: 2_000 });
+    expect(compaction?.reserveTokens).toBe(16_000);
+    expect(compaction?.keepRecentTokens).toBe(7_000);
+    expect(overrides["other/model"]).toEqual({ reserveTokens: 9_000, keepRecentTokens: 2_000 });
     // The target model's entry is present exactly when it was before -- no entry is created by a rollback.
-    expect(compaction.modelOverrides["openai/model-window-probe"] ?? null).toEqual(
+    expect(overrides["openai/model-window-probe"] ?? null).toEqual(
       existing ? { reserveTokens: 10_000, keepRecentTokens: 3_000 } : null,
     );
     // And inheritance still works: a later ordinary change reaches the model unless its own entry says otherwise.
