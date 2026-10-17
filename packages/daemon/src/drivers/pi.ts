@@ -1718,6 +1718,11 @@ export async function createPiAgentSessionForContext(
  */
 let piPromptsInFlight = 0;
 
+/** One start admission: held from the synchronous decision until the run is
+ * observed as live, and released by identity so an older attempt cannot free a
+ * newer one. */
+type PiStartAdmission = { session: AgentSession; settled: Promise<void>; release: () => void };
+
 /** Test-only: read the process-wide in-flight prompt count. */
 export function __piPromptsInFlightForTest(): number {
   return piPromptsInFlight;
@@ -1736,6 +1741,23 @@ export class PiSdkRuntimeSession implements RuntimeSession {
   private cancellationSource: "requested_stop" | "dispose" | null = null;
   private exitInfo: RuntimeExitInfo | null = null;
   private activeProviderRequest: PiProviderRequestState | null = null;
+  /** Resolved when this runtime closes, so an unbounded wait can stop early
+   * instead of waiting on SDK work that may never settle. */
+  private resolveClose!: () => void;
+  private readonly closeSignal = new Promise<void>((resolve) => {
+    this.resolveClose = resolve;
+  });
+  /**
+   * The one start this runtime has admitted and not yet observed as a live run.
+   * Sibling deliveries wait on it instead of starting a second turn: the SDK
+   * admits a prompt asynchronously, so `isStreaming` still reads false for one
+   * or more ticks after `prompt()` is called. It is released as soon as the run
+   * is observed (or the attempt fails), so a model turn is never serialized
+   * behind the gate. Every dispatch that can call `prompt()` takes it, including
+   * the initial prompt, and a release is bound to one exact admission so an
+   * older attempt can never release a newer one.
+   */
+  private startAdmission: PiStartAdmission | null = null;
 
   constructor(
     private readonly ctx: SpawnContext,
@@ -1836,6 +1858,14 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       this.observeToolExecutionEvent(event);
       this.recordCompactionLifecycle(event);
       if (
+        event.type === "turn_start"
+        || (event.type === "message_start" && (event.message as { role?: unknown }).role === "assistant")
+      ) {
+        // The admitted start is a live run now: releases a sibling waiting on
+        // the gate, which then steers rather than starting a second turn.
+        this.releaseStartAdmissionFor(session);
+      }
+      if (
         event.type === "message_start" &&
         (event.message as { role?: unknown }).role === "assistant"
       ) {
@@ -1875,19 +1905,48 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     if (!session) return { ok: false, reason: "closed" };
 
     if (input.mode === "busy") {
+      // "Busy" is a cached belief about the runtime, not a fact about it. A
+      // compaction that finishes outside any agent run (the SDK's manual /
+      // extension entry point) leaves the session settled while the caller
+      // still believes a turn is in flight; a steering message written then is
+      // drained by nothing, so the input waits forever (2026-10-17: an agent
+      // logged three unconsumed deliveries after a manual compaction). The
+      // runtime's own state decides the lane, read inside the deferred call
+      // because that is when the call happens; FIFO setImmediate ordering still
+      // keeps the initial prompt ahead of a readiness-debt steer.
+      let requestMethod: "turn/start" | "turn/steer" = "turn/steer";
       this.deferSdkCall(
-        () => session.steer(input.text),
+        async () => {
+          const live = this.session;
+          if (!live) return;
+          await this.dispatchDelivery(live, input.text, (method) => {
+            requestMethod = method;
+          }, "busy");
+        },
         "steer_request",
-        { requestMethod: () => "turn/steer", text: input.text },
+        { requestMethod: () => requestMethod, text: input.text },
       );
+      // `acceptedAs` names the lane the caller asked for; the lane actually used
+      // is `requestMethod`, resolved when the deferred call runs.
       return { ok: true, acceptedAs: "steer" };
     }
 
-    if (session.isStreaming) {
-      this.launchPromptAfterStreaming(input.text);
-      return { ok: true, acceptedAs: "prompt" };
-    }
-    this.launchPrompt(input.text, true);
+    // Idle delivery goes through the same ordered decision as a busy write: it
+    // starts the run when the runtime is settled, joins a live run instead of
+    // racing it, and waits for a start that is already being admitted rather
+    // than replacing it (2026-10-17 review).
+    let requestMethod: "turn/start" | "turn/steer" = "turn/start";
+    this.deferSdkCall(
+      async () => {
+        const live = this.session;
+        if (!live) return;
+        await this.dispatchDelivery(live, input.text, (method) => {
+          requestMethod = method;
+        }, "idle");
+      },
+      "prompt_request",
+      { requestMethod: () => requestMethod, text: input.text },
+    );
     return { ok: true, acceptedAs: "prompt" };
   }
 
@@ -1942,7 +2001,12 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     this.emitRuntimeEvent({ kind: "session_init", sessionId } satisfies ParsedEvent);
   }
 
-  private launchPrompt(text: string, delivery = false): void {
+  /**
+   * The initial prompt. It is the one start reserved synchronously, so a
+   * readiness message that arrives before this prompt is admitted waits on it
+   * instead of starting a turn ahead of the task (2026-10-17 review).
+   */
+  private launchPrompt(text: string): void {
     const session = this.session;
     if (!session) {
       this.emitRuntimeEvent({
@@ -1951,36 +2015,31 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       } satisfies ParsedEvent, "session_start");
       return;
     }
-    this.deferSdkCall(
-      () => {
-        this.toolExecutionObserver?.beginRuntimeTurn();
-        return session.prompt(text);
-      },
-      "prompt_request",
-      delivery ? { requestMethod: () => "turn/start", text } : undefined,
-    );
-  }
-
-  private launchPromptAfterStreaming(text: string): void {
-    let requestMethod: "turn/start" | "turn/steer" = "turn/start";
+    const releaseAdmission = this.beginStartAdmission(session);
+    if (!releaseAdmission) {
+      // Defensive: a start is already in flight for this session, so this
+      // delivery must join it rather than replace it.
+      this.deferSdkCall(
+        async () => {
+          const live = this.session;
+          if (!live) return;
+          await this.dispatchDelivery(live, text, () => {}, "idle");
+        },
+        "prompt_request",
+      );
+      return;
+    }
     this.deferSdkCall(
       async () => {
-        const session = this.session;
-        if (!session) return;
-        const ready = await this.waitForStreamingToClear(session);
-        if (this.didClose || this.session !== session) {
-          return;
-        }
-        if (ready) {
+        try {
+          this.ctx.assertLaunchCurrent?.();
           this.toolExecutionObserver?.beginRuntimeTurn();
           await session.prompt(text);
-        } else {
-          requestMethod = "turn/steer";
-          await session.steer(text);
+        } finally {
+          releaseAdmission();
         }
       },
       "prompt_request",
-      { requestMethod: () => requestMethod, text },
     );
   }
 
@@ -2215,7 +2274,51 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     }
   }
 
+  /**
+   * Take the runtime's single start admission and return its release function.
+   * The release is bound to this exact admission, so an older attempt's
+   * `finally` can never release a newer one for the same session. It is
+   * idempotent and safe to call from both the observation path and a `finally`.
+   */
+  private beginStartAdmission(session: AgentSession): (() => void) | null {
+    // Never replace an admission that is still in flight: a later entry waits
+    // on the existing token and decides again, which is the whole point.
+    if (this.startAdmission) return null;
+    let release!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const admission: PiStartAdmission = { session, settled, release };
+    this.startAdmission = admission;
+    return () => this.releaseStartAdmission(admission);
+  }
+
+  private releaseStartAdmission(admission: PiStartAdmission): void {
+    if (this.startAdmission !== admission) return;
+    this.startAdmission = null;
+    admission.release();
+  }
+
+  /** The run for the current admission on this session is observable now. */
+  private releaseStartAdmissionFor(session: AgentSession): void {
+    const admission = this.startAdmission;
+    if (!admission || admission.session !== session) return;
+    this.releaseStartAdmission(admission);
+  }
+
+  /** The runtime is going away: wake every waiter so it can exit on didClose. */
+  private releaseAnyStartAdmission(): void {
+    const admission = this.startAdmission;
+    if (!admission) return;
+    this.releaseStartAdmission(admission);
+  }
+
   private async disposeSession(): Promise<void> {
+    // `this.session` is nulled below, so the close path can no longer match an
+    // admission to a session; wake its waiters here, and stop any compaction
+    // wait that is still running.
+    this.releaseAnyStartAdmission();
+    this.resolveClose();
     const unsubscribe = this.unsubscribe;
     this.unsubscribe = null;
     try {
@@ -2232,9 +2335,117 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     }
   }
 
+  /**
+   * Decide the lane for one delivery from the runtime's own state and dispatch
+   * it. Used by the busy lane, where the caller's mode is only a cached belief:
+   * a settled runtime must get a prompt (this is the fix for the compaction
+   * stranding), a live run gets a steer, and a compaction in progress is waited
+   * out and then re-decided, because a sibling may have started the run.
+   */
+  private async dispatchDelivery(
+    session: AgentSession,
+    text: string,
+    setRequestMethod: (method: "turn/start" | "turn/steer") => void,
+    mode: "busy" | "idle",
+  ): Promise<void> {
+    let waitedForStreaming = false;
+    // Whether the run was live when this delivery arrived — not later. An idle
+    // delivery that arrives settled must join the run that a sibling start
+    // produces, rather than entering the "defer until streaming clears" path
+    // that belongs to a delivery which arrived mid-run.
+    const arrivedStreaming = session.isStreaming;
+    for (;;) {
+      if (this.didClose || this.session !== session) return;
+      if (session.isStreaming) {
+        if (mode === "idle" && arrivedStreaming && !waitedForStreaming) {
+          // An idle delivery for a runtime that still reports a live run: wait
+          // for the boundary, and steer as the fallback when it does not come
+          // (the pre-existing idle-delivery contract).
+          waitedForStreaming = true;
+          const cleared = await this.waitForStreamingToClear(session);
+          if (this.didClose || this.session !== session) return;
+          if (cleared) continue;
+        }
+        await this.dispatchSteer(session, text, setRequestMethod);
+        return;
+      }
+      if (session.isIdle === false) {
+        // Compaction is running. It can outlive this runtime, and an SDK abort
+        // does not promise that compaction settles, so wait on the boundary but
+        // stop as soon as the runtime closes. The SDK promise stays observed by
+        // the race: a rejection fails this delivery through the driver's
+        // delivery_error path instead of being swallowed, and the loop cannot
+        // spin on a wait that rejects immediately.
+        await Promise.race([session.waitForIdle(), this.closeSignal]);
+        continue;
+      }
+      if (session.isIdle !== true && mode === "busy") {
+        // The runtime cannot say whether it is settled: keep the historic busy
+        // lane rather than inventing a decision from an unreadable state.
+        await this.dispatchSteer(session, text, setRequestMethod);
+        return;
+      }
+      // Settled either because the runtime says so, or because an idle delivery
+      // is the caller's own assertion and the runtime cannot report the
+      // predicate — that was the pre-existing idle behaviour.
+      const admission = this.startAdmission;
+      if (admission) {
+        // A start is being admitted right now. Wait for it to become a live run
+        // (or to fail) and decide again: never replace, never race it.
+        await admission.settled;
+        continue;
+      }
+      if (await this.dispatchStart(session, text, setRequestMethod)) return;
+    }
+  }
+
+  /** Fence, then queue into the live run. A revoked launch writes nothing. */
+  private async dispatchSteer(
+    session: AgentSession,
+    text: string,
+    setRequestMethod: (method: "turn/start" | "turn/steer") => void,
+  ): Promise<void> {
+    setRequestMethod("turn/steer");
+    this.ctx.assertLaunchCurrent?.();
+    await session.steer(text);
+  }
+
+  /**
+   * Take the single start admission and admit the run. The admission is held
+   * from this synchronous decision until the run is observed as live (or the
+   * attempt fails), which is what keeps two deliveries from starting two turns
+   * while the SDK is still admitting the first. Returns false when another start
+   * already owns the admission, so the caller decides again instead of
+   * replacing it.
+   */
+  private async dispatchStart(
+    session: AgentSession,
+    text: string,
+    setRequestMethod: (method: "turn/start" | "turn/steer") => void,
+  ): Promise<boolean> {
+    const releaseAdmission = this.beginStartAdmission(session);
+    if (!releaseAdmission) return false;
+    setRequestMethod("turn/start");
+    try {
+      // Fence immediately before dispatch: the launch can be revoked while this
+      // delivery waited for a compaction boundary.
+      this.ctx.assertLaunchCurrent?.();
+      this.toolExecutionObserver?.beginRuntimeTurn();
+      await session.prompt(text);
+    } finally {
+      releaseAdmission();
+    }
+    return true;
+  }
+
   private emitExitAndClose(code: number | null, signal: NodeJS.Signals | null): void {
     if (this.didClose) return;
     this.didClose = true;
+    // A delivery waiting on the admission gate or on a compaction boundary must
+    // not wait on a runtime that is gone; its loop head sees didClose and
+    // returns without writing.
+    this.releaseAnyStartAdmission();
+    this.resolveClose();
     const info: RuntimeExitInfo = {
       code,
       signal,
