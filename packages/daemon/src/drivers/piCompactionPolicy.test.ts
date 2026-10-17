@@ -4,6 +4,7 @@ import { compact, shouldCompact } from "@earendil-works/pi-coding-agent";
 import { capPiCompactionSummaryOutput } from "./piCompactionFit";
 import {
   PI_COMPACTION_POLICY_ENV_VAR,
+  combinePiCompactionPolicyResolutions,
   resolvePiCompactionPolicy,
 } from "./piCompactionPolicy";
 
@@ -137,8 +138,34 @@ test("an unresolved model window applies nothing and says why", () => {
 
 test("a window too small to express the trigger is refused instead of rounding to a no-op", () => {
   const resolution = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1 } });
-  assert.equal(resolution.status, "unknown_model_window");
+  assert.equal(resolution.status, "window_incompatible");
   assert.match(resolution.readback, /cannot express a 60% trigger/);
+});
+
+test("a window that cannot keep 20k recent tokens below its own trigger is refused", () => {
+  // 0.6 x 32768 = 19,660: the trigger would sit BELOW the retained history, so "above the trigger" would be
+  // almost entirely retained context and the policy would churn every turn on a model this small.
+  const resolution = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 32_768 } });
+  assert.equal(resolution.status, "window_incompatible");
+  assert.equal(resolution.effective, null);
+  assert.match(resolution.readback, /triggers above 19660, less than twice the 20000 retained tokens/);
+});
+
+test("the same policy on a window that can host it still applies, on both sides of the line", () => {
+  const smaller = JSON.stringify({
+    version: 1, enabled: true, triggerAboveRatio: 0.6, keepRecentTokens: 5_000, summaryOutputCapTokens: 16_384,
+  });
+  const fits = resolvePiCompactionPolicy({ envVars: env(smaller), model: { contextWindow: 32_768 } });
+  assert.equal(fits.status, "applied");
+  assert.equal(fits.effective?.triggerAboveTokens, 19_660);
+  assert.equal(fits.effective?.keepRecentTokens, 5_000);
+  // 20,000 retained needs a trigger of at least 40,000, i.e. a window of at least 66,667.
+  const boundary = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 66_667 } });
+  assert.equal(boundary.status, "applied");
+  assert.equal(boundary.effective?.triggerAboveTokens, 40_000);
+  const justBelow = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 66_666 } });
+  assert.equal(justBelow.status, "window_incompatible");
+  assert.equal(justBelow.effective, null);
 });
 
 test("a policy that would silently change meaning is rejected, not coerced", () => {
@@ -166,12 +193,12 @@ test("a policy that would silently change meaning is rejected, not coerced", () 
 });
 
 test("the window is re-resolved per call, so a model change re-derives the trigger and ceilings", () => {
-  const windows = [32_768, 200_000, 1_000_000];
+  const windows = [100_000, 200_000, 1_000_000];
   const seen = windows.map((contextWindow) =>
     resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow } }).effective!,
   );
-  assert.deepEqual(seen.map((e) => e.triggerAboveTokens), [19_660, 120_000, 600_000]);
-  assert.deepEqual(seen.map((e) => e.reserveTokens), [13_108, 80_000, 400_000]);
+  assert.deepEqual(seen.map((e) => e.triggerAboveTokens), [60_000, 120_000, 600_000]);
+  assert.deepEqual(seen.map((e) => e.reserveTokens), [40_000, 80_000, 400_000]);
   // The retained history and the output ceilings are window-independent: a bigger window must not
   // quietly raise them, and a smaller one must not quietly lower them.
   assert.deepEqual(seen.map((e) => e.keepRecentTokens), [20_000, 20_000, 20_000]);
@@ -183,4 +210,49 @@ test("no agent id is baked into the policy code — the pilot is whoever carries
   const source = readFileSync(new URL("./piCompactionPolicy.ts", import.meta.url), "utf8");
   assert.equal(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/.test(source), false, "policy code must not contain a UUID");
   assert.match(source, /PI_COMPACTION_POLICY_ENV_VAR = "RAFT_PI_COMPACTION_POLICY"/);
+});
+
+test("the two moments are reconciled: cap built before the model, settings applied after it", () => {
+  const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
+  const sessionSame = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
+
+  // Both agree: the settings follow the authoritative window, no mismatch reported.
+  const agreeing = combinePiCompactionPolicyResolutions(cap, sessionSame);
+  assert.equal(agreeing.apply?.status, "applied");
+  assert.equal(agreeing.windowMismatch, null);
+  assert.equal(agreeing.capInstalledWithoutTrigger, false);
+  assert.equal(agreeing.readback, sessionSame.readback);
+
+  // The window moved in between: the settings still follow the FINAL window (the ceiling does not depend on
+  // it), and the change is reported rather than hidden.
+  const sessionChanged = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 400_000 } });
+  const changed = combinePiCompactionPolicyResolutions(cap, sessionChanged);
+  assert.equal(changed.apply?.effective?.modelWindowTokens, 400_000);
+  assert.equal(changed.apply?.effective?.triggerAboveTokens, 240_000);
+  assert.deepEqual(changed.windowMismatch, { capWindowTokens: 200_000, sessionWindowTokens: 400_000 });
+  assert.match(changed.readback, /window changed between the cap build and the final resolution: 200000 -> 400000/);
+
+  // No cap ceiling to install: nothing is applied at all, because an earlier trigger with an unbounded
+  // summary request is exactly the combination the policy exists to prevent.
+  const capInert = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: undefined });
+  const noCap = combinePiCompactionPolicyResolutions(capInert, sessionSame);
+  assert.equal(noCap.apply, null);
+  assert.equal(noCap.capInstalledWithoutTrigger, false);
+  assert.match(noCap.readback, /the summary cap could not be built for this session: no resolved model window/);
+
+  // The session cannot host it: nothing is applied, and the reporting says the ceiling is still installed
+  // (the adapter only lowers an oversized request, so that direction is bounded).
+  const sessionInert = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 32_768 } });
+  const noTrigger = combinePiCompactionPolicyResolutions(cap, sessionInert);
+  assert.equal(noTrigger.apply, null);
+  assert.equal(noTrigger.capInstalledWithoutTrigger, true);
+  assert.match(noTrigger.readback, /less than twice the 20000 retained tokens/);
+  assert.match(noTrigger.readback, /the ceiling stays in the extension/);
+
+  // Two unset policies: nothing to report beyond the ordinary case.
+  const unset = resolvePiCompactionPolicy({ envVars: null, model: { contextWindow: 200_000 } });
+  const bothUnset = combinePiCompactionPolicyResolutions(unset, unset);
+  assert.equal(bothUnset.apply, null);
+  assert.equal(bothUnset.capInstalledWithoutTrigger, false);
+  assert.equal(bothUnset.readback, "compaction pilot: not applied (not configured)");
 });

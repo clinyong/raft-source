@@ -76,7 +76,9 @@ export type PiCompactionPolicyStatus =
   /** Configured but unusable (schema, types, ranges): never applied, reason recorded. */
   | "invalid"
   /** Configured, but the resolved model reports no usable window: nothing is applied. */
-  | "unknown_model_window";
+  | "unknown_model_window"
+  /** Configured and the window is known, but it cannot host this policy: nothing is applied. */
+  | "window_incompatible";
 
 export interface PiCompactionPolicyResolution {
   status: PiCompactionPolicyStatus;
@@ -212,7 +214,19 @@ export function resolvePiCompactionPolicy(options: {
   // A trigger that cannot fire (0 tokens) or a reserve that covers the whole window
   // would leave Pi compacting at every turn or never: refuse instead of guessing.
   if (triggerAboveTokens < 1 || reserveTokens < 1) {
-    return inert("unknown_model_window", policy, `model window ${window} cannot express a ${policy.triggerAboveRatio * 100}% trigger`);
+    return inert("window_incompatible", policy, `model window ${window} cannot express a ${policy.triggerAboveRatio * 100}% trigger`);
+  }
+  // Pi keeps `keepRecentTokens` verbatim and summarizes ONLY what is older than that. If the retention does
+  // not leave the trigger room for a summary at least as large as itself, "above the trigger" is already
+  // almost all retained history and the policy degenerates into per-turn churn on a smaller model. Half the
+  // trigger is the line: at compaction time at least as much history is summarized as is kept.
+  const minimumTriggerTokens = policy.keepRecentTokens * 2;
+  if (triggerAboveTokens < minimumTriggerTokens) {
+    return inert(
+      "window_incompatible",
+      policy,
+      `window ${window} triggers above ${triggerAboveTokens}, less than twice the ${policy.keepRecentTokens} retained tokens`,
+    );
   }
   const prefixOutputCapTokens = Math.floor(PI_COMPACTION_PREFIX_SHARE_OF_RESERVE * Math.floor(
     policy.summaryOutputCapTokens / PI_COMPACTION_HISTORY_SHARE_OF_RESERVE,
@@ -238,5 +252,61 @@ export function resolvePiCompactionPolicy(options: {
       `keep recent ${policy.keepRecentTokens}`,
       `summary cap ${policy.summaryOutputCapTokens} (prefix ${prefixOutputCapTokens})`,
     ].join("; "),
+  };
+}
+
+/**
+ * One policy, two moments: the cap extension must be built during session creation (before the model is
+ * resolved, so its ceiling comes from a resolution against the model known then), while the trigger and the
+ * retained-history settings are applied afterwards, when the session's real model is known. This function is
+ * what reconciles the two, and it is where the "no half-applied policy" rule lives:
+ *
+ * - both applied  -> the settings use the FINAL window (the authoritative one), and a cap built from an
+ *                    earlier window does not invalidate it: the ceiling is a window-independent policy value.
+ *                    A window difference is reported, not hidden.
+ * - cap not built -> the policy is not applied at all. An earlier trigger with an unbounded summary request
+ *                    is exactly the combination the policy exists to prevent.
+ * - settings cannot host it -> same: nothing is applied. The ceiling may still be present in the extension;
+ *                    the adapter only ever LOWERS an oversized request, so this direction is bounded, and it
+ *                    is reported rather than passed off as an applied policy.
+ */
+export function combinePiCompactionPolicyResolutions(
+  capResolution: PiCompactionPolicyResolution,
+  sessionResolution: PiCompactionPolicyResolution,
+): {
+  apply: PiCompactionPolicyResolution | null;
+  /** True when the extension carries the ceiling but the session settings were left alone. */
+  capInstalledWithoutTrigger: boolean;
+  windowMismatch: { capWindowTokens: number | null; sessionWindowTokens: number | null } | null;
+  readback: string;
+} {
+  if (sessionResolution.status === "applied") {
+    if (capResolution.status !== "applied") {
+      return {
+        apply: null,
+        capInstalledWithoutTrigger: false,
+        windowMismatch: null,
+        readback: `compaction pilot: not applied (the summary cap could not be built for this session: ${capResolution.reason ?? capResolution.status})`,
+      };
+    }
+    const capWindowTokens = capResolution.effective?.modelWindowTokens ?? null;
+    const sessionWindowTokens = sessionResolution.effective?.modelWindowTokens ?? null;
+    const windowMismatch = capWindowTokens === sessionWindowTokens ? null : { capWindowTokens, sessionWindowTokens };
+    return {
+      apply: sessionResolution,
+      capInstalledWithoutTrigger: false,
+      windowMismatch,
+      readback: windowMismatch
+        ? `${sessionResolution.readback} (window changed between the cap build and the final resolution: ${String(capWindowTokens)} -> ${String(sessionWindowTokens)}; the ceiling does not depend on it)`
+        : sessionResolution.readback,
+    };
+  }
+  return {
+    apply: null,
+    capInstalledWithoutTrigger: capResolution.status === "applied",
+    windowMismatch: null,
+    readback: capResolution.status === "applied"
+      ? `${sessionResolution.readback}; the ceiling stays in the extension but the policy was not applied to settings`
+      : sessionResolution.readback,
   };
 }
