@@ -142,12 +142,12 @@ test("a split turn whose model limit already holds history down still gets its p
   const preparation = prepared({ reserveTokens: 400_000, keepRecentTokens: 20_000 }, true);
   const application = capPiCompactionSummaryOutput(preparation, midModel);
   assert.deepEqual(application?.changed, ["prefix"]);
-  assert.equal(application?.prefixOutputCapTokens, 7_680);
-  assert.deepEqual(await requestCaps(preparation, midModel), [12_288, 7_680]);
+  assert.equal(application?.prefixOutputCapTokens, 10_240);
+  assert.deepEqual(await requestCaps(preparation, midModel), [12_288, 10_240]);
   // Telemetry reports only the budget that changed, so the record cannot claim a history cap that did nothing.
   const attrs = piCompactionFitTelemetryAttrs(undefined, application);
   assert.equal(attrs.compaction_summary_output_cap_tokens, undefined);
-  assert.equal(attrs.compaction_summary_output_prefix_cap_tokens, 7_680);
+  assert.equal(attrs.compaction_summary_output_prefix_cap_tokens, 10_240);
 });
 
 test("an existing smaller summary budget stays smaller, and re-applying the cap is a no-op", () => {

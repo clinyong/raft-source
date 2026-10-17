@@ -155,8 +155,9 @@ export function capPiCompactionSummaryOutput(
   const ceiling = (share: number, reserveTokens: number) =>
     Math.min(Math.floor(share * reserveTokens), modelOutput ?? Number.POSITIVE_INFINITY);
   // Pi's own shares: the history request gets floor(0.8 x reserve), a split turn's prefix floor(0.5 x reserve).
-  const policyCeiling = modelOutput === null ? historyOutputCap : Math.min(historyOutputCap, modelOutput);
-  const reserveForCap = Math.floor(policyCeiling / SUMMARY_OUTPUT_SHARE_OF_RESERVE);
+  // The reserve is derived from the POLICY cap alone (never the model-clamped one) and never raised: deriving
+  // it from the model limit would move the reserve for a small model and shrink a prefix that already fit.
+  const reserveForCap = Math.min(reserve, Math.floor(historyOutputCap / SUMMARY_OUTPUT_SHARE_OF_RESERVE));
   const historyBefore = ceiling(SUMMARY_OUTPUT_SHARE_OF_RESERVE, reserve);
   const historyAfter = ceiling(SUMMARY_OUTPUT_SHARE_OF_RESERVE, reserveForCap);
   const prefixBefore = preparation?.isSplitTurn === true ? ceiling(TURN_PREFIX_SHARE_OF_RESERVE, reserve) : null;
