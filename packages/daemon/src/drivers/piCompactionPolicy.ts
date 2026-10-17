@@ -324,14 +324,32 @@ export function combinePiCompactionPolicyResolutions(
  *   next to the clearance, from the state after it, is what keeps "no ceiling" from being reported as
  *   "ceiling installed" (a review finding on r3, whose reporting described the pre-decision state).
  */
-export interface PiCompactionSettingsSurface {
-  /** Effective compaction settings for the session's model, read back through Pi (model overrides included). */
-  read: () => { reserveTokens: number; keepRecentTokens: number };
-  /** Apply the policy's trigger and retention through Pi's settings, for this model. */
-  apply: (effective: PiCompactionPolicyEffective) => void;
-  /** Put back the values the session had before the policy touched them. */
-  restore: (values: { reserveTokens: number; keepRecentTokens: number }) => void;
+export interface PiCompactionTokenSettings {
+  reserveTokens: number;
+  keepRecentTokens: number;
 }
+
+/** What the policy is about to change, captured so a rollback can be exact. */
+export interface PiCompactionSettingsSnapshot {
+  /** The ordinary settings (or Pi's defaults): what a model WITHOUT its own entry resolves. */
+  ordinary: PiCompactionTokenSettings;
+  /** The model's own override entry, when the agent has one -- the only case that needs one written. */
+  modelEntry: PiCompactionTokenSettings | null;
+}
+
+export interface PiCompactionSettingsSurface {
+  /** Snapshot the state before touching it. */
+  capture: () => PiCompactionSettingsSnapshot;
+  /** Apply the policy's numbers; a model entry is written only when one already existed (see decide()). */
+  apply: (effective: PiCompactionEffectiveSettings, options: { writeModelEntry: boolean }) => void;
+  /** What the session resolves for its model now. */
+  readEffective: () => PiCompactionTokenSettings;
+  /** Put the captured state back, exactly. */
+  restore: (snapshot: PiCompactionSettingsSnapshot) => void;
+}
+
+/** The numbers the policy applies; the full effective shape carries more. */
+export type PiCompactionEffectiveSettings = PiCompactionTokenSettings;
 
 export interface PiCompactionPolicyApplication {
   apply: PiCompactionPolicyResolution | null;
@@ -360,13 +378,18 @@ export function decidePiCompactionPolicy(args: {
   if (apply && args.settings) {
     // Apply, then ask Pi what it will really use. The read-back is the contract: a policy whose numbers did
     // not take effect must not be reported as applied, so it is rolled back and both layers are cleared.
-    const before = args.settings.read();
-    args.settings.apply(apply.effective!);
-    const after = args.settings.read();
+    //
+    // The rollback restores the captured state exactly -- the ordinary fields AND the model's own entry
+    // (including "there was none"). Restoring the *resolved* values instead would write the model's numbers
+    // into the ordinary fields and leave an entry behind where the agent had none, which freezes inheritance
+    // for that model: a rollback that changes other state is not a rollback.
+    const snapshot = args.settings.capture();
+    args.settings.apply(apply.effective!, { writeModelEntry: snapshot.modelEntry !== null });
+    const after = args.settings.readEffective();
     const wanted = apply.effective!;
     settingsVerified = after.reserveTokens === wanted.reserveTokens && after.keepRecentTokens === wanted.keepRecentTokens;
     if (!settingsVerified) {
-      args.settings.restore(before);
+      args.settings.restore(snapshot);
       readback = `compaction pilot: not applied (the applied settings did not take effect: read back reserve ${after.reserveTokens} / keep recent ${after.keepRecentTokens}, wanted ${wanted.reserveTokens} / ${wanted.keepRecentTokens})`;
       apply = null;
     }

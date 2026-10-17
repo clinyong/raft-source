@@ -71,6 +71,7 @@ import {
 import {
   decidePiCompactionPolicy,
   resolvePiCompactionPolicy,
+  type PiCompactionEffectiveSettings,
   type PiCompactionPolicyEffective,
   type PiCompactionPolicyResolution,
 } from "./piCompactionPolicy";
@@ -700,19 +701,20 @@ function applyPiDaemonSettingsOverrides(
   settingsManager: SettingsManager,
   effective: PiCompactionTokenSettings | null = null,
   model: { provider: string; id: string } | null = null,
+  writeModelEntry = false,
 ): void {
   // The policy only ever ADDS two supported compaction settings (Pi's own `reserveTokens` and
   // `keepRecentTokens`); an inert policy leaves the override exactly as it was. The summary-output
   // ceilings are not settings -- they travel through the cap extension, which is why the pilot's
   // contract names both layers.
   //
-  // When a model is known the same two numbers are also written as that model's in-memory
-  // `compaction.modelOverrides` entry, because Pi resolves a token setting as
-  // "model override -> ordinary setting -> built-in default" (`settings-manager`: getCompactionTokenSetting).
-  // Without it, an agent whose settings file already carries an override for its model would keep its old
-  // numbers while this code reported the policy applied. Nothing is written to any file: the entry lives in
-  // this session's settings object only.
-  const modelKey = effective && model ? `${model.provider}/${model.id}` : null;
+  // When a model is known AND the agent already has its own in-memory `compaction.modelOverrides` entry for
+  // that model, the same two numbers are written there too: Pi resolves a token setting as
+  // "model override -> ordinary setting -> built-in default" (`settings-manager`: getCompactionTokenSetting),
+  // so without it an agent that had tuned its model would keep the old numbers while this code reported the
+  // policy applied. No entry is created where the agent had none -- that would freeze the model's inheritance
+  // of the ordinary settings -- and nothing is written to any file.
+  const modelKey = effective && model && writeModelEntry ? `${model.provider}/${model.id}` : null;
   settingsManager.applyOverrides({
     compaction: {
       enabled: PI_SDK_COMPACTION_ENABLED,
@@ -722,6 +724,23 @@ function applyPiDaemonSettingsOverrides(
       ...(modelKey && effective
         ? { modelOverrides: { [modelKey]: { reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens } } }
         : {}),
+    },
+  });
+}
+
+/**
+ * Write ONLY this model's override entry. Reusing the ordinary-field writer here was a live bug: it put the
+ * entry's numbers into the ordinary settings as well, so a rollback of a session that HAD an entry left the
+ * ordinary fields changed for every model that inherits them.
+ */
+function setPiModelOverrideEntry(
+  settingsManager: SettingsManager,
+  model: { provider: string; id: string },
+  tokens: PiCompactionTokenSettings,
+): void {
+  settingsManager.applyOverrides({
+    compaction: {
+      modelOverrides: { [`${model.provider}/${model.id}`]: { reserveTokens: tokens.reserveTokens, keepRecentTokens: tokens.keepRecentTokens } },
     },
   });
 }
@@ -1617,16 +1636,31 @@ export async function createPiAgentSessionForContext(
     // describes the result -- so neither the readback nor the telemetry can claim anything the session will
     // not actually do (a per-model settings entry used to shadow the applied numbers).
     const settingsSurface = {
-      read: () => {
+      // Captured through the token getters WITHOUT a model, and through the ordinary-vs-model comparison for
+      // the entry: that keeps the snapshot independent of the resolution the verification reads.
+      capture: () => {
+        const ordinary = {
+          reserveTokens: services.settingsManager.getCompactionReserveTokens(),
+          keepRecentTokens: services.settingsManager.getCompactionKeepRecentTokens(),
+        };
+        const withModel = services.settingsManager.getCompactionSettings(model);
+        const modelEntry = withModel.reserveTokens !== ordinary.reserveTokens
+          || withModel.keepRecentTokens !== ordinary.keepRecentTokens
+          ? { reserveTokens: withModel.reserveTokens, keepRecentTokens: withModel.keepRecentTokens }
+          : null;
+        return { ordinary, modelEntry };
+      },
+      apply: (effective: PiCompactionEffectiveSettings, options: { writeModelEntry: boolean }) =>
+        applyPiDaemonSettingsOverrides(services.settingsManager, effective, model ?? null, options.writeModelEntry),
+      readEffective: () => {
         const current = services.settingsManager.getCompactionSettings(model);
         return { reserveTokens: current.reserveTokens, keepRecentTokens: current.keepRecentTokens };
       },
-      apply: (effective: PiCompactionPolicyEffective) =>
-        applyPiDaemonSettingsOverrides(services.settingsManager, effective, model ?? null),
-      // (`restore` and `apply` share the token-settings shape; the model key is derived from the session.)
-      restore: (values: { reserveTokens: number; keepRecentTokens: number }) => {
-        // Put back what the session had, including the model-level entry this code just wrote.
-        applyPiDaemonSettingsOverrides(services.settingsManager, values, model ?? null);
+      restore: (snapshot) => {
+        // Put back exactly what was captured: the ordinary fields, and this model's own entry if it had one.
+        // Two separate writes on purpose -- the entry must not land in the ordinary fields.
+        applyPiDaemonSettingsOverrides(services.settingsManager, snapshot.ordinary);
+        if (snapshot.modelEntry && model) setPiModelOverrideEntry(services.settingsManager, model, snapshot.modelEntry);
       },
     };
     const policyDecision = decidePiCompactionPolicy({

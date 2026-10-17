@@ -1,7 +1,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { ModelRegistry, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { buildBuiltInAgentDir, buildBuiltInSessionDir, createPiAgentSessionForContext } from "./pi";
 import { PI_COMPACTION_POLICY_ENV_VAR } from "./piCompactionPolicy";
 
@@ -147,6 +147,67 @@ test("another model's own override is untouched by applying or rolling back the 
     const other = session.settingsManager.getCompactionSettings({ provider: "openai", id: "another-model" } as never);
     expect(other.reserveTokens).toBe(5_000);
     expect(other.keepRecentTokens).toBe(1_000);
+  } finally {
+    session.dispose();
+  }
+});
+
+/**
+ * The fault @Kirin injects: the read-back is perturbed once, after the policy's own write has landed. What
+ * must survive is the STRUCTURE the session had -- the prior ordinary fields, and this model's override entry
+ * present or absent exactly as before -- rather than only the pair that happened to be resolved.
+ */
+async function createFixtureSessionWithReadbackFault(existing: boolean) {
+  const original = SettingsManager.prototype.getCompactionSettings;
+  let faulted = false;
+  const spy = vi.spyOn(SettingsManager.prototype, "getCompactionSettings").mockImplementation(function (this: SettingsManager, model: never) {
+    const value = original.call(this, model);
+    if (!faulted && (model as { id?: string } | undefined)?.id === "model-window-probe" && value.reserveTokens === 400_000) {
+      faulted = true;
+      return { ...value, reserveTokens: 399_999 };
+    }
+    return value;
+  });
+  try {
+    const session = await createFixtureSession({
+      // The fixture composes its own modelOverrides for the target model, so the entry set is built here:
+      // another model always, and the target model's own entry only in the "existing" branch.
+      selected: true,
+      existingModelOverride: false,
+      settings: {
+        compaction: {
+          enabled: true,
+          reserveTokens: 16_000,
+          keepRecentTokens: 7_000,
+          modelOverrides: {
+            "other/model": { reserveTokens: 9_000, keepRecentTokens: 2_000 },
+            ...(existing ? { "openai/model-window-probe": { reserveTokens: 10_000, keepRecentTokens: 3_000 } } : {}),
+          },
+        },
+      },
+    });
+    return { session, faulted: () => faulted };
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+test.each([false, true])("a failed verification restores the complete prior settings (existing override=%s)", async (existing) => {
+  const { session, faulted } = await createFixtureSessionWithReadbackFault(existing);
+  try {
+    expect(faulted()).toBe(true);
+    const compaction = session.settingsManager.getSettings().compaction;
+    // Ordinary fields back to the file's values, and the other model's entry untouched.
+    expect(compaction.reserveTokens).toBe(16_000);
+    expect(compaction.keepRecentTokens).toBe(7_000);
+    expect(compaction.modelOverrides["other/model"]).toEqual({ reserveTokens: 9_000, keepRecentTokens: 2_000 });
+    // The target model's entry is present exactly when it was before -- no entry is created by a rollback.
+    expect(compaction.modelOverrides["openai/model-window-probe"] ?? null).toEqual(
+      existing ? { reserveTokens: 10_000, keepRecentTokens: 3_000 } : null,
+    );
+    // And inheritance still works: a later ordinary change reaches the model unless its own entry says otherwise.
+    session.settingsManager.applyOverrides({ compaction: { reserveTokens: 17_000 } });
+    expect(session.settingsManager.getCompactionSettings(session.model).reserveTokens).toBe(existing ? 10_000 : 17_000);
   } finally {
     session.dispose();
   }

@@ -313,44 +313,88 @@ test("the ceiling really is late-bound: the adapter reads whatever the option ho
   assert.equal(takePiCompactionSummaryOutputCap(sessionManager), null, "a cleared ceiling must not bind");
 });
 
-test("a policy whose numbers do not take effect is rolled back, not reported as applied", () => {
+function settingsSurfaceFixture(initial: { ordinary: { reserveTokens: number; keepRecentTokens: number }; modelEntry: { reserveTokens: number; keepRecentTokens: number } | null }) {
+  let state = {
+    ordinary: { ...initial.ordinary },
+    entry: initial.modelEntry ? { ...initial.modelEntry } : null,
+  };
+  let fault = true;
+  return {
+    /** The state the surface ends in -- what the assertions read. */
+    state: () => state,
+    /** Stop perturbing the read-back (the surface then behaves). */
+    heal: () => { fault = false; },
+    surface: {
+      capture: () => ({ ordinary: { ...state.ordinary }, modelEntry: state.entry ? { ...state.entry } : null }),
+      apply: (effective: { reserveTokens: number; keepRecentTokens: number }, options: { writeModelEntry: boolean }) => {
+        // Only the two token settings, exactly as the real surface writes them.
+        const tokens = { reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens };
+        state.ordinary = { ...tokens };
+        if (options.writeModelEntry) state.entry = { ...tokens };
+      },
+      readEffective: () => {
+        const resolved = state.entry ?? state.ordinary;
+        return fault ? { ...resolved, reserveTokens: resolved.reserveTokens - 1 } : { ...resolved };
+      },
+      restore: (snapshot: { ordinary: { reserveTokens: number; keepRecentTokens: number }; modelEntry: { reserveTokens: number; keepRecentTokens: number } | null }) => {
+        state = { ordinary: { ...snapshot.ordinary }, entry: snapshot.modelEntry ? { ...snapshot.modelEntry } : null };
+      },
+    },
+  };
+}
+
+test("a failed verification restores the prior ordinary fields AND the model entry that existed", () => {
   const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const session = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
-  const calls: string[] = [];
-  // Stands in for a settings surface that silently keeps other values (an unmodelled precedence).
-  const lyingSurface = {
-    read: () => { calls.push("read"); return { reserveTokens: 10_000, keepRecentTokens: 3_000 }; },
-    apply: () => { calls.push("apply"); },
-    restore: () => { calls.push("restore"); },
-  };
+  const fixture = settingsSurfaceFixture({
+    ordinary: { reserveTokens: 16_000, keepRecentTokens: 7_000 },
+    modelEntry: { reserveTokens: 10_000, keepRecentTokens: 3_000 },
+  });
   const decision = decidePiCompactionPolicy({
-    capResolution: cap,
-    sessionResolution: session,
-    capOption: option,
-    settings: lyingSurface,
+    capResolution: cap, sessionResolution: session, capOption: option, settings: fixture.surface,
   });
   assert.equal(decision.settingsVerified, false);
   assert.equal(decision.apply, null);
   assert.equal(decision.capCeilingActive, false);
   assert.equal(option.summaryOutputCapTokens, undefined, "the ceiling goes when the settings roll back");
-  assert.match(decision.readback, /did not take effect: read back reserve 10000 \/ keep recent 3000, wanted 400000 \/ 20000/);
-  assert.deepEqual(calls, ["read", "apply", "read", "restore"]);
+  // Replaying the resolved pair (10,000/3,000) into both levels would have changed inheritance for other
+  // models; the ordinary fields must come back as 16,000/7,000 and the entry as its own prior pair.
+  assert.deepEqual(fixture.state().ordinary, { reserveTokens: 16_000, keepRecentTokens: 7_000 });
+  assert.deepEqual(fixture.state().entry, { reserveTokens: 10_000, keepRecentTokens: 3_000 });
+  assert.match(decision.readback, /did not take effect: read back reserve 399999/);
 });
 
-test("a surface that behaves is verified and left applied", () => {
+test("a failed verification with no prior model entry leaves no entry behind", () => {
   const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const session = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
   const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
-  let current = { reserveTokens: 16_384, keepRecentTokens: 20_000 };
-  const surface = {
-    read: () => current,
-    apply: (effective: { reserveTokens: number; keepRecentTokens: number }) => { current = { reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens }; },
-    restore: (values: { reserveTokens: number; keepRecentTokens: number }) => { current = values; },
-  };
-  const decision = decidePiCompactionPolicy({ capResolution: cap, sessionResolution: session, capOption: option, settings: surface });
+  const fixture = settingsSurfaceFixture({
+    ordinary: { reserveTokens: 16_000, keepRecentTokens: 7_000 },
+    modelEntry: null,
+  });
+  const decision = decidePiCompactionPolicy({
+    capResolution: cap, sessionResolution: session, capOption: option, settings: fixture.surface,
+  });
+  assert.equal(decision.settingsVerified, false);
+  assert.deepEqual(fixture.state().ordinary, { reserveTokens: 16_000, keepRecentTokens: 7_000 });
+  assert.equal(fixture.state().entry, null, "no entry may be created by a rollback: it would freeze inheritance");
+});
+
+test("a surface that behaves is verified, applied and left alone", () => {
+  const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
+  const session = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
+  const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
+  const fixture = settingsSurfaceFixture({
+    ordinary: { reserveTokens: 16_384, keepRecentTokens: 20_000 },
+    modelEntry: null,
+  });
+  fixture.heal();
+  const decision = decidePiCompactionPolicy({
+    capResolution: cap, sessionResolution: session, capOption: option, settings: fixture.surface,
+  });
   assert.equal(decision.settingsVerified, true);
   assert.equal(decision.apply?.status, "applied");
-  assert.equal(current.reserveTokens, 400_000); // 1M window: trigger above 600,000, reserve 400,000
+  assert.deepEqual(fixture.state().ordinary, { reserveTokens: 400_000, keepRecentTokens: 20_000 });
   assert.equal(option.summaryOutputCapTokens, 16_384);
 });
