@@ -61,6 +61,19 @@ const OVERFLOW_WINDOW_FACTOR = 0.8;
 const SUMMARY_PROMPT_TOKENS = 2_000;
 /** Below this there is no useful room to summarize anything; leave it to Pi. */
 const MIN_BUDGET_TOKENS = 2_000;
+/**
+ * Cap on the output budget of ONE prepared summary request.
+ *
+ * Why (@Kirin's pilot, 2026-10-17): with a 600K history and `reserveTokens: 400_000`, Pi asks the model for
+ * up to `min(floor(0.8 x 400_000), model.maxTokens)` = 320,000 output tokens for the summary alone. That cap
+ * is what `piCompactionFitBudget` must subtract from the input budget, so an oversized summary makes Raft
+ * trim history not to fit the model but to fit a summary nobody needs that long. 16,384 is the history cap
+ * the pilot wants; 10,240 is what a split turn's prefix then gets (Pi halves it).
+ */
+export const PI_SUMMARY_OUTPUT_CAP_TOKENS = 16_384;
+/** Pi hands the summarizer `min(floor(share x reserveTokens), model.maxTokens)` (compaction.js). Invert it to
+ *  express a cap on that output as the `reserveTokens` Pi reads, and mirror it here if Pi ever changes it. */
+const SUMMARY_OUTPUT_SHARE_OF_RESERVE = 0.8;
 /** Non-CJK characters per token. Lower than the usual 4 so code is not underestimated. */
 const CHARS_PER_TOKEN = 3.5;
 /** Strings up to this long are never cut. */
@@ -100,6 +113,33 @@ export function piCompactionFitBudget(
   const output = Math.min(Math.floor(0.8 * reserve), typeof model?.maxTokens === "number" && model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);
   const budget = Math.floor(window * SAFETY_FACTOR) - output - SUMMARY_PROMPT_TOKENS - estimatePromptTokens(preparation.previousSummary ?? "");
   return budget >= MIN_BUDGET_TOKENS ? budget : null;
+}
+
+/**
+ * Cap the output budget of the prepared summary request, by lowering the `reserveTokens` Pi reads.
+ *
+ * Must run BEFORE `fitPiCompactionPreparation`: the fit subtracts Pi's output budget from the input budget,
+ * so capping afterwards would leave history trimmed for an output the model is never asked for. The trigger
+ * is unaffected — `shouldCompact` reads the live settings, not this preparation copy.
+ *
+ * Returns the applied cap, or `null` when the existing reserve already implies a smaller summary budget (an
+ * existing smaller budget stays smaller) or when the preparation carries no usable reserve. Re-applying it is
+ * a no-op, and nothing is mutated in place: the preparation gets a fresh `settings` object, so the value the
+ * manager handed out stays as it was.
+ */
+export function capPiCompactionSummaryOutput(
+  preparation: CompactionPreparationLike,
+  historyOutputCap = PI_SUMMARY_OUTPUT_CAP_TOKENS,
+): number | null {
+  const settings = preparation?.settings as { reserveTokens?: unknown } | undefined;
+  const reserve = typeof settings?.reserveTokens === "number" && Number.isFinite(settings.reserveTokens)
+    ? settings.reserveTokens
+    : null;
+  if (reserve === null) return null;
+  const reserveForCap = Math.floor(historyOutputCap / SUMMARY_OUTPUT_SHARE_OF_RESERVE);
+  if (reserve <= reserveForCap) return null;
+  preparation.settings = { ...preparation.settings, reserveTokens: reserveForCap };
+  return historyOutputCap;
 }
 
 function truncateText(text: string, keepChars: number, note: (cut: number) => string): { text: string; cut: number } {
@@ -251,13 +291,29 @@ export function takePiCompactionFit(sessionManager: object | undefined): PiCompa
   return fit;
 }
 
-/** Inline Pi extension: trims an oversized compaction request before Pi's own summarizer runs. */
+/** The summary-output cap applied to the last prepared request per session, read once by the same telemetry.
+ *  Kept separate from `lastFits` so "the cap applied, nothing was trimmed" stays distinguishable from
+ *  "the request was trimmed": the existing `compaction_fit_applied` means trimmed, and must keep meaning that. */
+const lastSummaryOutputCaps = new WeakMap<object, number>();
+
+export function takePiCompactionSummaryOutputCap(sessionManager: object | undefined): number | null {
+  if (!sessionManager) return null;
+  const cap = lastSummaryOutputCaps.get(sessionManager);
+  lastSummaryOutputCaps.delete(sessionManager);
+  return cap ?? null;
+}
+
+/** Inline Pi extension: caps the summary output, then trims the request before Pi's own summarizer runs. */
 export function createPiCompactionFitExtension(): ExtensionFactory {
   return (pi) => {
     pi.on("session_before_compact", (event, ctx) => {
       const sessionManager = ctx.sessionManager as object;
       lastFits.delete(sessionManager);
-      const fit = fitPiCompactionPreparation(event.preparation as unknown as CompactionPreparationLike, ctx.model, event.reason);
+      lastSummaryOutputCaps.delete(sessionManager);
+      const preparation = event.preparation as unknown as CompactionPreparationLike;
+      const summaryOutputCapTokens = capPiCompactionSummaryOutput(preparation);
+      if (summaryOutputCapTokens !== null) lastSummaryOutputCaps.set(sessionManager, summaryOutputCapTokens);
+      const fit = fitPiCompactionPreparation(preparation, ctx.model, event.reason);
       if (fit) lastFits.set(sessionManager, fit);
       return undefined;
     });
@@ -265,17 +321,24 @@ export function createPiCompactionFitExtension(): ExtensionFactory {
 }
 
 /** Present only when Raft trimmed the request, so the share of lossy compactions is applied / all recovery events. */
-export function piCompactionFitTelemetryAttrs(fit: PiCompactionFit | undefined): Record<string, string | number | boolean> {
-  if (!fit) return {};
-  return {
-    compaction_fit_applied: true,
-    compaction_fit_trigger: fit.trigger,
-    compaction_fit_budget_tokens: fit.budgetTokens,
-    compaction_fit_tokens_before: fit.tokensBefore,
-    compaction_fit_tokens_after: fit.tokensAfter,
-    compaction_fit_dropped_messages: fit.droppedMessages,
-    compaction_fit_dropped_tokens: fit.droppedTokens,
-    compaction_fit_truncated_messages: fit.truncatedMessages,
-    compaction_fit_truncated_chars: fit.truncatedChars,
-  };
+export function piCompactionFitTelemetryAttrs(
+  fit: PiCompactionFit | undefined,
+  summaryOutputCapTokens: number | null = null,
+): Record<string, string | number | boolean> {
+  const attrs: Record<string, string | number | boolean> = {};
+  if (fit) {
+    attrs.compaction_fit_applied = true;
+    attrs.compaction_fit_trigger = fit.trigger;
+    attrs.compaction_fit_budget_tokens = fit.budgetTokens;
+    attrs.compaction_fit_tokens_before = fit.tokensBefore;
+    attrs.compaction_fit_tokens_after = fit.tokensAfter;
+    attrs.compaction_fit_dropped_messages = fit.droppedMessages;
+    attrs.compaction_fit_dropped_tokens = fit.droppedTokens;
+    attrs.compaction_fit_truncated_messages = fit.truncatedMessages;
+    attrs.compaction_fit_truncated_chars = fit.truncatedChars;
+  }
+  // Recorded independently of a trim, so a pilot can tell "cap applied, nothing trimmed" from "cap applied,
+  // still trimmed". Absent means the cap was not the binding constraint for this request.
+  if (summaryOutputCapTokens !== null) attrs.compaction_summary_output_cap_tokens = summaryOutputCapTokens;
+  return attrs;
 }
