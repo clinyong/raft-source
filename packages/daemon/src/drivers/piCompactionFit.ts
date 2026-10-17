@@ -138,14 +138,20 @@ export function capPiCompactionSummaryOutput(
     ? settings.reserveTokens
     : null;
   if (reserve === null) return null;
-  // The model's own output limit wins over the requested cap, and it is what the request will actually be
-  // capped at: report THAT, so telemetry says what binds rather than what we asked for.
   const modelOutput = typeof model?.maxTokens === "number" && model.maxTokens > 0 ? model.maxTokens : null;
-  const effectiveCap = modelOutput === null ? historyOutputCap : Math.min(historyOutputCap, modelOutput);
-  const reserveForCap = Math.floor(effectiveCap / SUMMARY_OUTPUT_SHARE_OF_RESERVE);
-  if (reserve <= reserveForCap) return null;
+  // What Pi would ask for before the cap, and what it would ask for with it. Both use Pi's own
+  // `min(floor(0.8 x reserve), model.maxTokens)`.
+  const outputFor = (reserveTokens: number) =>
+    Math.min(Math.floor(SUMMARY_OUTPUT_SHARE_OF_RESERVE * reserveTokens), modelOutput ?? Number.POSITIVE_INFINITY);
+  const before = outputFor(reserve);
+  const policyCeiling = modelOutput === null ? historyOutputCap : Math.min(historyOutputCap, modelOutput);
+  const reserveForCap = Math.floor(policyCeiling / SUMMARY_OUTPUT_SHARE_OF_RESERVE);
+  const after = outputFor(reserveForCap);
+  // Nothing to do when the request does not actually get smaller — e.g. the model's own output limit is
+  // already below the cap. Reporting a cap in that case would claim a constraint that is not binding.
+  if (after >= before) return null;
   preparation.settings = { ...preparation.settings, reserveTokens: reserveForCap };
-  return effectiveCap;
+  return after;
 }
 
 function truncateText(text: string, keepChars: number, note: (cut: number) => string): { text: string; cut: number } {
@@ -309,15 +315,26 @@ export function takePiCompactionSummaryOutputCap(sessionManager: object | undefi
   return cap ?? null;
 }
 
-/** Inline Pi extension: caps the summary output, then trims the request before Pi's own summarizer runs. */
-export function createPiCompactionFitExtension(): ExtensionFactory {
+/**
+ * Inline Pi extension: caps the summary output (only when asked to), then trims the request before Pi's own
+ * summarizer runs.
+ *
+ * The cap is OFF unless `summaryOutputCapTokens` is given: it is a pilot policy for selected agents, while
+ * the history fitting it shares the handler with stays active everywhere. Production must keep passing no
+ * option until the pilot wiring itself is reviewed.
+ */
+export function createPiCompactionFitExtension(
+  options: { summaryOutputCapTokens?: number } = {},
+): ExtensionFactory {
   return (pi) => {
     pi.on("session_before_compact", (event, ctx) => {
       const sessionManager = ctx.sessionManager as object;
       lastFits.delete(sessionManager);
       lastSummaryOutputCaps.delete(sessionManager);
       const preparation = event.preparation as unknown as CompactionPreparationLike;
-      const summaryOutputCapTokens = capPiCompactionSummaryOutput(preparation, ctx.model);
+      const summaryOutputCapTokens = typeof options.summaryOutputCapTokens === "number"
+        ? capPiCompactionSummaryOutput(preparation, ctx.model, options.summaryOutputCapTokens)
+        : null;
       if (summaryOutputCapTokens !== null) lastSummaryOutputCaps.set(sessionManager, summaryOutputCapTokens);
       const fit = fitPiCompactionPreparation(preparation, ctx.model, event.reason);
       if (fit) lastFits.set(sessionManager, fit);
