@@ -107,7 +107,9 @@ test("the prepared summary is capped without touching the threshold, retention o
   assert.equal(shouldCompact(600_001, 1_000_000, settings), true);
 
   const budgetBefore = piCompactionFitBudget(preparation, model, "threshold");
-  assert.equal(capPiCompactionSummaryOutput(preparation, model), PI_SUMMARY_OUTPUT_CAP_TOKENS);
+  const application = capPiCompactionSummaryOutput(preparation, model);
+  assert.deepEqual(application?.changed, ["history"]);
+  assert.equal(application?.historyOutputCapTokens, PI_SUMMARY_OUTPUT_CAP_TOKENS);
 
   assert.deepEqual(await requestCaps(preparation), [PI_SUMMARY_OUTPUT_CAP_TOKENS]);
   // Retention and the live settings object are untouched; the preparation got a copy.
@@ -126,8 +128,26 @@ test("the prepared summary is capped without touching the threshold, retention o
 
 test("a split turn gets two bounded requests: the cap for history, half of it for the prefix", async () => {
   const preparation = prepared({ reserveTokens: 400_000, keepRecentTokens: 20_000 }, true);
-  assert.equal(capPiCompactionSummaryOutput(preparation, model), PI_SUMMARY_OUTPUT_CAP_TOKENS);
+  const application = capPiCompactionSummaryOutput(preparation, model);
+  assert.deepEqual(application?.changed, ["history", "prefix"]);
+  assert.equal(application?.prefixOutputCapTokens, 10_240);
   assert.deepEqual(await requestCaps(preparation), [PI_SUMMARY_OUTPUT_CAP_TOKENS, 10_240]);
+});
+
+test("a split turn whose model limit already holds history down still gets its prefix lowered", async () => {
+  // @Kirin's review case: maxTokens 12,288 means the history request is already at the model limit, so
+  // comparing history alone would skip the cap — but Pi lets the prefix be half the RESERVE, which is 12,288
+  // here and above the agreed 10,240 bound.
+  const midModel = { ...model, id: "summary-cap-prefix", maxTokens: 12_288 };
+  const preparation = prepared({ reserveTokens: 400_000, keepRecentTokens: 20_000 }, true);
+  const application = capPiCompactionSummaryOutput(preparation, midModel);
+  assert.deepEqual(application?.changed, ["prefix"]);
+  assert.equal(application?.prefixOutputCapTokens, 7_680);
+  assert.deepEqual(await requestCaps(preparation, midModel), [12_288, 7_680]);
+  // Telemetry reports only the budget that changed, so the record cannot claim a history cap that did nothing.
+  const attrs = piCompactionFitTelemetryAttrs(undefined, application);
+  assert.equal(attrs.compaction_summary_output_cap_tokens, undefined);
+  assert.equal(attrs.compaction_summary_output_prefix_cap_tokens, 7_680);
 });
 
 test("an existing smaller summary budget stays smaller, and re-applying the cap is a no-op", () => {
@@ -136,7 +156,7 @@ test("an existing smaller summary budget stays smaller, and re-applying the cap 
   assert.equal(preparation.settings.reserveTokens, 16_384);
 
   const larger = prepared({ reserveTokens: 400_000, keepRecentTokens: 20_000 });
-  assert.equal(capPiCompactionSummaryOutput(larger, model), PI_SUMMARY_OUTPUT_CAP_TOKENS);
+  assert.deepEqual(capPiCompactionSummaryOutput(larger, model)?.changed, ["history"]);
   const once = larger.settings.reserveTokens;
   assert.equal(capPiCompactionSummaryOutput(larger, model), null);
   assert.equal(larger.settings.reserveTokens, once);
@@ -155,7 +175,8 @@ test("a model whose own limit is already below the cap is left alone and reporte
 test("a model between the cap and the uncapped request reports the effective budget", async () => {
   const midModel = { ...model, id: "summary-cap-mid", maxTokens: 24_000 };
   const preparation = prepared({ reserveTokens: 400_000, keepRecentTokens: 20_000 });
-  assert.equal(capPiCompactionSummaryOutput(preparation, midModel), PI_SUMMARY_OUTPUT_CAP_TOKENS);
+  const application = capPiCompactionSummaryOutput(preparation, midModel);
+  assert.equal(application?.historyOutputCapTokens, PI_SUMMARY_OUTPUT_CAP_TOKENS);
   assert.deepEqual(await requestCaps(preparation, midModel), [PI_SUMMARY_OUTPUT_CAP_TOKENS]);
 });
 
@@ -188,7 +209,7 @@ test("opted in, the extension caps before fitting and records it separately from
   );
 
   assert.equal(preparation.settings.reserveTokens, Math.floor(PI_SUMMARY_OUTPUT_CAP_TOKENS / 0.8));
-  assert.equal(takePiCompactionSummaryOutputCap(sessionManager), PI_SUMMARY_OUTPUT_CAP_TOKENS);
+  assert.equal(takePiCompactionSummaryOutputCap(sessionManager)?.historyOutputCapTokens, PI_SUMMARY_OUTPUT_CAP_TOKENS);
   assert.equal(takePiCompactionFit(sessionManager), undefined, "nothing was trimmed, so there is no fit");
   const attrs = piCompactionFitTelemetryAttrs(takePiCompactionFit(sessionManager), takePiCompactionSummaryOutputCap(sessionManager));
   // Both reads are take-once: the second read of each returns nothing, so the values above are asserted first.
@@ -207,12 +228,14 @@ test("telemetry carries the cap next to a trim, and stays silent about a trim th
     truncatedMessages: 0,
     truncatedChars: 0,
   };
-  const both = piCompactionFitTelemetryAttrs(fit, PI_SUMMARY_OUTPUT_CAP_TOKENS);
+  const cap = { historyOutputCapTokens: PI_SUMMARY_OUTPUT_CAP_TOKENS, prefixOutputCapTokens: 10_240, changed: ["history" as const] };
+  const both = piCompactionFitTelemetryAttrs(fit, cap);
   assert.equal(both.compaction_fit_applied, true);
   assert.equal(both.compaction_summary_output_cap_tokens, PI_SUMMARY_OUTPUT_CAP_TOKENS);
-  const capOnly = piCompactionFitTelemetryAttrs(undefined, PI_SUMMARY_OUTPUT_CAP_TOKENS);
+  const capOnly = piCompactionFitTelemetryAttrs(undefined, cap);
   assert.equal(capOnly.compaction_fit_applied, undefined);
   assert.equal(capOnly.compaction_summary_output_cap_tokens, PI_SUMMARY_OUTPUT_CAP_TOKENS);
+  assert.equal(capOnly.compaction_summary_output_prefix_cap_tokens, undefined);
   const neither = piCompactionFitTelemetryAttrs(undefined, null);
   assert.deepEqual(neither, {});
 });

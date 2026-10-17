@@ -66,6 +66,7 @@ import {
   takePiCompactionFit,
   takePiCompactionSummaryOutputCap,
   type PiCompactionFit,
+  type PiSummaryOutputCapApplication,
 } from "./piCompactionFit";
 import {
   createProviderHttpClient,
@@ -187,8 +188,8 @@ export interface PiCompactionInputEvidence {
   configuredContextLimit: number | null;
   /** What Raft trimmed so the summary request fit (piCompactionFit.ts); absent when nothing was trimmed. */
   fit?: PiCompactionFit;
-  /** The summary-output cap applied to this request's prepared summary, when it was the binding constraint. */
-  summaryOutputCapTokens?: number;
+  /** The summary-output cap application for this request, when it was a binding constraint. */
+  summaryOutputCap?: PiSummaryOutputCapApplication;
 }
 
 function projectPiCompactionEnd(
@@ -272,7 +273,7 @@ export function projectPiCompactionInputTelemetry(
       : reason === "overflow"
         ? "upper_bound_overflow"
         : "nonempty",
-    ...piCompactionFitTelemetryAttrs(evidence.fit, evidence.summaryOutputCapTokens ?? null),
+    ...piCompactionFitTelemetryAttrs(evidence.fit, evidence.summaryOutputCap ?? null),
   };
 }
 
@@ -287,13 +288,13 @@ function piCompactionInputEvidence(session: AgentSession): PiCompactionInputEvid
     );
   }
   const fit = takePiCompactionFit(session.sessionManager);
-  const summaryOutputCapTokens = takePiCompactionSummaryOutputCap(session.sessionManager);
+  const summaryOutputCap = takePiCompactionSummaryOutputCap(session.sessionManager);
   return {
     messageCount: messages.length + (session.systemPrompt ? 1 : 0),
     inputTextLength,
     configuredContextLimit: session.model?.contextWindow ?? null,
     ...(fit ? { fit } : {}),
-    ...(summaryOutputCapTokens !== null ? { summaryOutputCapTokens } : {}),
+    ...(summaryOutputCap !== null ? { summaryOutputCap } : {}),
   };
 }
 

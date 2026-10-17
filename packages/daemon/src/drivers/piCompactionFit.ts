@@ -36,6 +36,8 @@ type CompactionPreparationLike = {
   tokensBefore: number;
   previousSummary?: string;
   settings: { reserveTokens: number };
+  /** Pi splits the request at a turn boundary; only then is there a second (prefix) summary request. */
+  isSplitTurn?: boolean;
 };
 
 type ModelLike = { contextWindow?: number; maxTokens?: number } | undefined;
@@ -74,6 +76,8 @@ export const PI_SUMMARY_OUTPUT_CAP_TOKENS = 16_384;
 /** Pi hands the summarizer `min(floor(share x reserveTokens), model.maxTokens)` (compaction.js). Invert it to
  *  express a cap on that output as the `reserveTokens` Pi reads, and mirror it here if Pi ever changes it. */
 const SUMMARY_OUTPUT_SHARE_OF_RESERVE = 0.8;
+/** Pi asks a split turn's prefix summary for at most floor(0.5 x reserve) output tokens. */
+const TURN_PREFIX_SHARE_OF_RESERVE = 0.5;
 /** Non-CJK characters per token. Lower than the usual 4 so code is not underestimated. */
 const CHARS_PER_TOKEN = 3.5;
 /** Strings up to this long are never cut. */
@@ -128,30 +132,44 @@ export function piCompactionFitBudget(
  * and nothing is mutated in place: the preparation gets a fresh `settings` object, so the value the manager
  * handed out stays as it was.
  */
+export interface PiSummaryOutputCapApplication {
+  /** The effective ceiling on the history summary request after capping. */
+  historyOutputCapTokens: number;
+  /** The effective ceiling on a split turn's prefix request after capping. */
+  prefixOutputCapTokens: number;
+  /** Which of the two requests actually got smaller — telemetry reports only those. */
+  changed: Array<"history" | "prefix">;
+}
+
 export function capPiCompactionSummaryOutput(
   preparation: CompactionPreparationLike,
   model?: ModelLike,
   historyOutputCap = PI_SUMMARY_OUTPUT_CAP_TOKENS,
-): number | null {
+): PiSummaryOutputCapApplication | null {
   const settings = preparation?.settings as { reserveTokens?: unknown } | undefined;
   const reserve = typeof settings?.reserveTokens === "number" && Number.isFinite(settings.reserveTokens)
     ? settings.reserveTokens
     : null;
   if (reserve === null) return null;
   const modelOutput = typeof model?.maxTokens === "number" && model.maxTokens > 0 ? model.maxTokens : null;
-  // What Pi would ask for before the cap, and what it would ask for with it. Both use Pi's own
-  // `min(floor(0.8 x reserve), model.maxTokens)`.
-  const outputFor = (reserveTokens: number) =>
-    Math.min(Math.floor(SUMMARY_OUTPUT_SHARE_OF_RESERVE * reserveTokens), modelOutput ?? Number.POSITIVE_INFINITY);
-  const before = outputFor(reserve);
+  const ceiling = (share: number, reserveTokens: number) =>
+    Math.min(Math.floor(share * reserveTokens), modelOutput ?? Number.POSITIVE_INFINITY);
+  // Pi's own shares: the history request gets floor(0.8 x reserve), a split turn's prefix floor(0.5 x reserve).
   const policyCeiling = modelOutput === null ? historyOutputCap : Math.min(historyOutputCap, modelOutput);
   const reserveForCap = Math.floor(policyCeiling / SUMMARY_OUTPUT_SHARE_OF_RESERVE);
-  const after = outputFor(reserveForCap);
-  // Nothing to do when the request does not actually get smaller — e.g. the model's own output limit is
-  // already below the cap. Reporting a cap in that case would claim a constraint that is not binding.
-  if (after >= before) return null;
+  const historyBefore = ceiling(SUMMARY_OUTPUT_SHARE_OF_RESERVE, reserve);
+  const historyAfter = ceiling(SUMMARY_OUTPUT_SHARE_OF_RESERVE, reserveForCap);
+  const prefixBefore = preparation?.isSplitTurn === true ? ceiling(TURN_PREFIX_SHARE_OF_RESERVE, reserve) : null;
+  const prefixAfter = preparation?.isSplitTurn === true ? ceiling(TURN_PREFIX_SHARE_OF_RESERVE, reserveForCap) : null;
+  // A cap that lowers neither request is not a binding constraint: apply nothing and report nothing. The
+  // prefix matters here precisely because the model limit can already hold history down while the prefix —
+  // which Pi allows to be half the reserve — still needs reducing.
+  const changed: Array<"history" | "prefix"> = [];
+  if (historyAfter < historyBefore) changed.push("history");
+  if (prefixBefore !== null && prefixAfter !== null && prefixAfter < prefixBefore) changed.push("prefix");
+  if (changed.length === 0) return null;
   preparation.settings = { ...preparation.settings, reserveTokens: reserveForCap };
-  return after;
+  return { historyOutputCapTokens: historyAfter, prefixOutputCapTokens: prefixAfter ?? historyAfter, changed };
 }
 
 function truncateText(text: string, keepChars: number, note: (cut: number) => string): { text: string; cut: number } {
@@ -306,9 +324,11 @@ export function takePiCompactionFit(sessionManager: object | undefined): PiCompa
 /** The summary-output cap applied to the last prepared request per session, read once by the same telemetry.
  *  Kept separate from `lastFits` so "the cap applied, nothing was trimmed" stays distinguishable from
  *  "the request was trimmed": the existing `compaction_fit_applied` means trimmed, and must keep meaning that. */
-const lastSummaryOutputCaps = new WeakMap<object, number>();
+const lastSummaryOutputCaps = new WeakMap<object, PiSummaryOutputCapApplication>();
 
-export function takePiCompactionSummaryOutputCap(sessionManager: object | undefined): number | null {
+export function takePiCompactionSummaryOutputCap(
+  sessionManager: object | undefined,
+): PiSummaryOutputCapApplication | null {
   if (!sessionManager) return null;
   const cap = lastSummaryOutputCaps.get(sessionManager);
   lastSummaryOutputCaps.delete(sessionManager);
@@ -332,10 +352,10 @@ export function createPiCompactionFitExtension(
       lastFits.delete(sessionManager);
       lastSummaryOutputCaps.delete(sessionManager);
       const preparation = event.preparation as unknown as CompactionPreparationLike;
-      const summaryOutputCapTokens = typeof options.summaryOutputCapTokens === "number"
+      const summaryOutputCap = typeof options.summaryOutputCapTokens === "number"
         ? capPiCompactionSummaryOutput(preparation, ctx.model, options.summaryOutputCapTokens)
         : null;
-      if (summaryOutputCapTokens !== null) lastSummaryOutputCaps.set(sessionManager, summaryOutputCapTokens);
+      if (summaryOutputCap !== null) lastSummaryOutputCaps.set(sessionManager, summaryOutputCap);
       const fit = fitPiCompactionPreparation(preparation, ctx.model, event.reason);
       if (fit) lastFits.set(sessionManager, fit);
       return undefined;
@@ -346,7 +366,7 @@ export function createPiCompactionFitExtension(
 /** Present only when Raft trimmed the request, so the share of lossy compactions is applied / all recovery events. */
 export function piCompactionFitTelemetryAttrs(
   fit: PiCompactionFit | undefined,
-  summaryOutputCapTokens: number | null = null,
+  summaryOutputCap: PiSummaryOutputCapApplication | null = null,
 ): Record<string, string | number | boolean> {
   const attrs: Record<string, string | number | boolean> = {};
   if (fit) {
@@ -361,7 +381,15 @@ export function piCompactionFitTelemetryAttrs(
     attrs.compaction_fit_truncated_chars = fit.truncatedChars;
   }
   // Recorded independently of a trim, so a pilot can tell "cap applied, nothing trimmed" from "cap applied,
-  // still trimmed". Absent means the cap was not the binding constraint for this request.
-  if (summaryOutputCapTokens !== null) attrs.compaction_summary_output_cap_tokens = summaryOutputCapTokens;
+  // still trimmed" — and per budget, because a split turn's prefix can be the one that needed reducing.
+  // Absent means the cap was not a binding constraint for this request.
+  if (summaryOutputCap) {
+    if (summaryOutputCap.changed.includes("history")) {
+      attrs.compaction_summary_output_cap_tokens = summaryOutputCap.historyOutputCapTokens;
+    }
+    if (summaryOutputCap.changed.includes("prefix")) {
+      attrs.compaction_summary_output_prefix_cap_tokens = summaryOutputCap.prefixOutputCapTokens;
+    }
+  }
   return attrs;
 }
