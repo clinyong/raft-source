@@ -69,6 +69,10 @@ import {
   type PiSummaryOutputCapApplication,
 } from "./piCompactionFit";
 import {
+  resolvePiCompactionPolicy,
+  type PiCompactionPolicyResolution,
+} from "./piCompactionPolicy";
+import {
   createProviderHttpClient,
   type ProviderHttpClient,
 } from "../daemonFetch";
@@ -687,8 +691,23 @@ export function detectPiModelsFromRegistry(modelRegistry: PiModelRegistryLike): 
   return models.length > 0 ? { models } : null;
 }
 
-function applyPiDaemonSettingsOverrides(settingsManager: SettingsManager): void {
-  settingsManager.applyOverrides({ compaction: { enabled: PI_SDK_COMPACTION_ENABLED } });
+function applyPiDaemonSettingsOverrides(
+  settingsManager: SettingsManager,
+  policy: PiCompactionPolicyResolution | null = null,
+): void {
+  // The policy only ever ADDS two supported compaction settings (Pi's own `reserveTokens` and
+  // `keepRecentTokens`); an inert policy leaves the override exactly as it was. The summary-output
+  // ceilings are not settings -- they travel through the cap extension, which is why the pilot's
+  // contract names both layers.
+  const effective = policy?.effective ?? null;
+  settingsManager.applyOverrides({
+    compaction: {
+      enabled: PI_SDK_COMPACTION_ENABLED,
+      ...(effective
+        ? { reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens }
+        : {}),
+    },
+  });
 }
 
 function logPiServiceDiagnostics(context: string, services: AgentSessionServices): void {
@@ -1486,6 +1505,25 @@ export async function createPiAgentSessionForContext(
           managedProviderConnection,
           launchRuntimeFields.envVars,
         );
+        // The compaction policy needs the window of the model this runtime will actually use, and the
+        // summary-cap extension is built while `createAgentSessionServices` loads its extensions -- before
+        // the model can be resolved again below. So the gateway model is registered and the model resolved
+        // here, and the SAME registry is reused for the authoritative resolution after services (which is
+        // why there is no second registration): a runtime-registered provider is an extension provider,
+        // and the refresh services performs keeps those (the SDK registers extension providers the same
+        // way and refreshes immediately afterwards).
+        const modelRegistry = new ModelRegistry(modelRuntime);
+        configureBuiltInGatewayCustomModel(modelRegistry, runtimeConfig, managedProviderConnection);
+        const policyModel = resolvePiModelFromRegistry(
+          launchRuntimeFields.model,
+          modelRegistry,
+          runtimeConfig,
+          managedProviderConnection,
+        );
+        const compactionPolicy = resolvePiCompactionPolicy({
+          envVars: launchRuntimeFields.envVars,
+          model: policyModel,
+        });
         const services = await createAgentSessionServices({
           cwd: ctx.workingDirectory,
           agentDir,
@@ -1494,11 +1532,17 @@ export async function createPiAgentSessionForContext(
           resourceLoaderOptions: {
             additionalExtensionPaths: localExtensionPaths,
             // Keeps an oversized compaction request inside the model limit (task #10).
-            extensionFactories: [createPiCompactionFitExtension()],
+            // The cap is opt-in per agent (compaction pilot): `undefined` for every agent whose policy is
+            // inert, which is the behaviour this extension shipped with.
+            extensionFactories: [
+              createPiCompactionFitExtension({
+                summaryOutputCapTokens: compactionPolicy.effective?.summaryOutputCapTokens,
+              }),
+            ],
             systemPromptOverride: () => ctx.standingPrompt,
           },
         });
-        return { services, providerHttpClient: sessionProviderHttpClient };
+        return { services, providerHttpClient: sessionProviderHttpClient, modelRegistry, compactionPolicy };
       } catch (error) {
         sessionProviderHttpClient.dispose();
         throw error;
@@ -1506,9 +1550,14 @@ export async function createPiAgentSessionForContext(
     }, { removeFirst: providerEnvScope });
     const { services } = sessionServices;
     providerHttpClient = sessionServices.providerHttpClient;
-    const modelRegistry = new ModelRegistry(services.modelRuntime);
-    configureBuiltInGatewayCustomModel(modelRegistry, runtimeConfig, managedProviderConnection);
-    applyPiDaemonSettingsOverrides(services.settingsManager);
+    // Reused from the probe above, so the gateway model is registered exactly once.
+    const modelRegistry = sessionServices.modelRegistry;
+    const compactionPolicy = sessionServices.compactionPolicy;
+    applyPiDaemonSettingsOverrides(services.settingsManager, compactionPolicy);
+    if (compactionPolicy.status !== "unset") {
+      // Readback for the operator: what this agent got, or why it got nothing.
+      console.info("[%s] create_session %s", logPrefix, compactionPolicy.readback);
+    }
     logPiServiceDiagnostics("create_session", services);
     addPiServiceTraceEvent(traceSpan, `${traceEventPrefix}.services_ready`, services, {
       agent_dir_source: opts.agentDirSource ?? (spawnEnv.PI_CODING_AGENT_DIR ? "spawn_env" : "default"),
@@ -1537,6 +1586,42 @@ export async function createPiAgentSessionForContext(
       resolved_model_present: Boolean(model),
       ...launchTraceEvidenceAttrs,
     });
+    // The policy was derived from the window resolved before services; this is the window the session really
+    // uses. They agree in the managed flow (nothing between the two resolutions registers models in the
+    // runtime), and a disagreement is surfaced instead of quietly keeping a policy derived from a different
+    // window -- the cap extension was already built by then, so the honest report is a mismatch, not a
+    // half-applied policy.
+    if (compactionPolicy.status === "applied") {
+      const resolvedWindowTokens =
+        typeof model?.contextWindow === "number" && model.contextWindow > 0 ? model.contextWindow : null;
+      const policyWindowTokens = compactionPolicy.effective?.modelWindowTokens ?? null;
+      if (resolvedWindowTokens !== policyWindowTokens) {
+        console.warn(
+          "[%s] create_session compaction policy window mismatch policy=%s resolved=%s",
+          logPrefix,
+          String(policyWindowTokens),
+          String(resolvedWindowTokens),
+        );
+      }
+      traceSpan?.addEvent(`${traceEventPrefix}.compaction_policy`, {
+        status: compactionPolicy.status,
+        model_window_tokens: policyWindowTokens,
+        resolved_window_tokens: resolvedWindowTokens,
+        window_matches_resolution: resolvedWindowTokens === policyWindowTokens,
+        trigger_above_tokens: compactionPolicy.effective?.triggerAboveTokens ?? null,
+        reserve_tokens: compactionPolicy.effective?.reserveTokens ?? null,
+        keep_recent_tokens: compactionPolicy.effective?.keepRecentTokens ?? null,
+        summary_output_cap_tokens: compactionPolicy.effective?.summaryOutputCapTokens ?? null,
+        prefix_output_cap_tokens: compactionPolicy.effective?.prefixOutputCapTokens ?? null,
+        ...launchTraceEvidenceAttrs,
+      });
+    } else if (compactionPolicy.status !== "unset") {
+      traceSpan?.addEvent(`${traceEventPrefix}.compaction_policy`, {
+        status: compactionPolicy.status,
+        reason: compactionPolicy.reason,
+        ...launchTraceEvidenceAttrs,
+      });
+    }
     console.info(
       "[%s] create_session services_ready agentDir=%s available=%d requested=%s resolved=%s",
       logPrefix,
