@@ -179,3 +179,29 @@ test("telemetry carries the cap next to a trim, and stays silent about a trim th
   const neither = piCompactionFitTelemetryAttrs(undefined, null);
   assert.deepEqual(neither, {});
 });
+
+test("a model whose own output limit is smaller reports that limit, not the requested cap", async () => {
+  const smallModel = { ...model, id: "summary-cap-small", maxTokens: 8_192 };
+  const preparation = prepared({ reserveTokens: 400_000, keepRecentTokens: 20_000 });
+  // The effective cap is the model's own limit; that is what telemetry must show.
+  assert.equal(capPiCompactionSummaryOutput(preparation, smallModel), 8_192);
+  assert.equal(preparation.settings.reserveTokens, Math.floor(8_192 / 0.8));
+  const caps: number[] = [];
+  const stream = async (_m: unknown, _c: unknown, options: { maxTokens: number }) => {
+    caps.push(options.maxTokens);
+    return {
+      result: async () => ({
+        role: "assistant",
+        content: [{ type: "text", text: "Deterministic task checkpoint." }],
+        api: "openai-completions",
+        provider: "offline",
+        model: smallModel.id,
+        stopReason: "stop",
+        timestamp: 1,
+        usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      }),
+    };
+  };
+  await compact(preparation as never, smallModel as never, undefined, undefined, undefined, undefined, undefined, stream as never);
+  assert.deepEqual(caps, [8_192]);
+});

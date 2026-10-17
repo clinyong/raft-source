@@ -122,13 +122,15 @@ export function piCompactionFitBudget(
  * so capping afterwards would leave history trimmed for an output the model is never asked for. The trigger
  * is unaffected — `shouldCompact` reads the live settings, not this preparation copy.
  *
- * Returns the applied cap, or `null` when the existing reserve already implies a smaller summary budget (an
- * existing smaller budget stays smaller) or when the preparation carries no usable reserve. Re-applying it is
- * a no-op, and nothing is mutated in place: the preparation gets a fresh `settings` object, so the value the
- * manager handed out stays as it was.
+ * Returns the **effective** cap — `min(requested cap, model.maxTokens)`, i.e. the smallest thing the request
+ * can be asked for — or `null` when the existing reserve already implies a smaller summary budget (an existing
+ * smaller budget stays smaller) or when the preparation carries no usable reserve. Re-applying it is a no-op,
+ * and nothing is mutated in place: the preparation gets a fresh `settings` object, so the value the manager
+ * handed out stays as it was.
  */
 export function capPiCompactionSummaryOutput(
   preparation: CompactionPreparationLike,
+  model?: ModelLike,
   historyOutputCap = PI_SUMMARY_OUTPUT_CAP_TOKENS,
 ): number | null {
   const settings = preparation?.settings as { reserveTokens?: unknown } | undefined;
@@ -136,10 +138,14 @@ export function capPiCompactionSummaryOutput(
     ? settings.reserveTokens
     : null;
   if (reserve === null) return null;
-  const reserveForCap = Math.floor(historyOutputCap / SUMMARY_OUTPUT_SHARE_OF_RESERVE);
+  // The model's own output limit wins over the requested cap, and it is what the request will actually be
+  // capped at: report THAT, so telemetry says what binds rather than what we asked for.
+  const modelOutput = typeof model?.maxTokens === "number" && model.maxTokens > 0 ? model.maxTokens : null;
+  const effectiveCap = modelOutput === null ? historyOutputCap : Math.min(historyOutputCap, modelOutput);
+  const reserveForCap = Math.floor(effectiveCap / SUMMARY_OUTPUT_SHARE_OF_RESERVE);
   if (reserve <= reserveForCap) return null;
   preparation.settings = { ...preparation.settings, reserveTokens: reserveForCap };
-  return historyOutputCap;
+  return effectiveCap;
 }
 
 function truncateText(text: string, keepChars: number, note: (cut: number) => string): { text: string; cut: number } {
@@ -311,7 +317,7 @@ export function createPiCompactionFitExtension(): ExtensionFactory {
       lastFits.delete(sessionManager);
       lastSummaryOutputCaps.delete(sessionManager);
       const preparation = event.preparation as unknown as CompactionPreparationLike;
-      const summaryOutputCapTokens = capPiCompactionSummaryOutput(preparation);
+      const summaryOutputCapTokens = capPiCompactionSummaryOutput(preparation, ctx.model);
       if (summaryOutputCapTokens !== null) lastSummaryOutputCaps.set(sessionManager, summaryOutputCapTokens);
       const fit = fitPiCompactionPreparation(preparation, ctx.model, event.reason);
       if (fit) lastFits.set(sessionManager, fit);
