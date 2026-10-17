@@ -8,8 +8,8 @@ import {
 } from "./piCompactionFit";
 import {
   PI_COMPACTION_POLICY_ENV_VAR,
-  applyPiCompactionPolicyDecision,
   combinePiCompactionPolicyResolutions,
+  decidePiCompactionPolicy,
   resolvePiCompactionPolicy,
 } from "./piCompactionPolicy";
 
@@ -225,7 +225,6 @@ test("the two moments are reconciled: cap built before the model, settings appli
   const agreeing = combinePiCompactionPolicyResolutions(cap, sessionSame);
   assert.equal(agreeing.apply?.status, "applied");
   assert.equal(agreeing.windowMismatch, null);
-  assert.equal(agreeing.capInstalledWithoutTrigger, false);
   assert.equal(agreeing.readback, sessionSame.readback);
 
   // The window moved in between: the settings still follow the FINAL window (the ceiling does not depend on
@@ -242,43 +241,44 @@ test("the two moments are reconciled: cap built before the model, settings appli
   const capInert = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: undefined });
   const noCap = combinePiCompactionPolicyResolutions(capInert, sessionSame);
   assert.equal(noCap.apply, null);
-  assert.equal(noCap.capInstalledWithoutTrigger, false);
   assert.match(noCap.readback, /the summary cap could not be built for this session: no resolved model window/);
 
-  // The session cannot host it: nothing is applied, and the reporting says the ceiling is still installed
-  // (the adapter only lowers an oversized request, so that direction is bounded).
+  // The session cannot host it: nothing is applied.
   const sessionInert = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 32_768 } });
   const noTrigger = combinePiCompactionPolicyResolutions(cap, sessionInert);
   assert.equal(noTrigger.apply, null);
-  assert.equal(noTrigger.capInstalledWithoutTrigger, true);
   assert.match(noTrigger.readback, /less than twice the 20000 retained tokens/);
-  assert.match(noTrigger.readback, /the ceiling stays in the extension/);
 
   // Two unset policies: nothing to report beyond the ordinary case.
   const unset = resolvePiCompactionPolicy({ envVars: null, model: { contextWindow: 200_000 } });
   const bothUnset = combinePiCompactionPolicyResolutions(unset, unset);
   assert.equal(bothUnset.apply, null);
-  assert.equal(bothUnset.capInstalledWithoutTrigger, false);
   assert.equal(bothUnset.readback, "compaction pilot: not applied (not configured)");
 });
 
-test("an inert final result clears the ceiling, so neither layer survives on its own", () => {
+test("an inert final result clears the ceiling, and the readback describes the state that is left", () => {
   const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
   const applied = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
-
-  // Applied: the option keeps the policy ceiling.
-  const option: { summaryOutputCapTokens?: number } = {
-    summaryOutputCapTokens: cap.effective?.summaryOutputCapTokens,
-  };
-  applyPiCompactionPolicyDecision(option, combinePiCompactionPolicyResolutions(cap, applied));
-  assert.equal(option.summaryOutputCapTokens, 16_384);
-
-  // Inert (here: the final model cannot host the policy): the ceiling goes with it.
   const incompatible = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 32_768 } });
-  const decision = combinePiCompactionPolicyResolutions(cap, incompatible);
-  assert.equal(decision.apply, null);
-  applyPiCompactionPolicyDecision(option, decision);
-  assert.equal(option.summaryOutputCapTokens, undefined);
+
+  // Applied: the option keeps the policy ceiling, and nothing claims a clearance.
+  const kept: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
+  const keptDecision = decidePiCompactionPolicy({ capResolution: cap, sessionResolution: applied, capOption: kept });
+  assert.equal(kept.summaryOutputCapTokens, 16_384);
+  assert.equal(keptDecision.capCeilingActive, true);
+  assert.equal(keptDecision.capInstalledWithoutTrigger, false);
+  assert.equal(keptDecision.readback, applied.readback);
+
+  // Inert: the ceiling goes with it, and BOTH the readback and the flags say so.
+  const cleared: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
+  const clearedDecision = decidePiCompactionPolicy({ capResolution: cap, sessionResolution: incompatible, capOption: cleared });
+  assert.equal(cleared.summaryOutputCapTokens, undefined);
+  assert.equal(clearedDecision.apply, null);
+  assert.equal(clearedDecision.capCeilingActive, false);
+  assert.equal(clearedDecision.capInstalledWithoutTrigger, false);
+  assert.match(clearedDecision.readback, /less than twice the 20000 retained tokens/);
+  assert.match(clearedDecision.readback, /the ceiling was cleared with it/);
+  assert.doesNotMatch(clearedDecision.readback, /stays in the extension/);
 });
 
 test("the ceiling really is late-bound: the adapter reads whatever the option holds at compaction time", () => {

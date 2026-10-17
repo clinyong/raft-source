@@ -69,8 +69,7 @@ import {
   type PiSummaryOutputCapApplication,
 } from "./piCompactionFit";
 import {
-  applyPiCompactionPolicyDecision,
-  combinePiCompactionPolicyResolutions,
+  decidePiCompactionPolicy,
   resolvePiCompactionPolicy,
   type PiCompactionPolicyResolution,
 } from "./piCompactionPolicy";
@@ -1594,9 +1593,13 @@ export async function createPiAgentSessionForContext(
       envVars: launchRuntimeFields.envVars,
       model,
     });
-    const policyDecision = combinePiCompactionPolicyResolutions(capPolicy, sessionPolicy);
-    // Both layers, or neither: an inert final result also clears the ceiling the extension was built with.
-    applyPiCompactionPolicyDecision(capOption, policyDecision);
+    // Settles both layers and describes the result in one step, so the readback and the telemetry cannot
+    // claim a ceiling that the decision just cleared.
+    const policyDecision = decidePiCompactionPolicy({
+      capResolution: capPolicy,
+      sessionResolution: sessionPolicy,
+      capOption,
+    });
     applyPiDaemonSettingsOverrides(services.settingsManager, policyDecision.apply);
     if (sessionPolicy.status !== "unset" || capPolicy.status !== "unset") {
       // Readback for the operator: what this agent got, or why it got nothing.
@@ -1611,11 +1614,9 @@ export async function createPiAgentSessionForContext(
       );
     }
     if (policyDecision.capInstalledWithoutTrigger) {
-      console.warn(
-        "[%s] create_session compaction policy ceiling installed without its trigger: %s",
-        logPrefix,
-        String(sessionPolicy.reason),
-      );
+      // Cannot happen once the decision has settled the state; kept as an explicit alarm rather than an
+      // assertion so a future change that reintroduces a half-applied policy is visible in logs.
+      console.warn("[%s] create_session compaction policy ceiling without its trigger", logPrefix);
     }
     if (sessionPolicy.status !== "unset" || capPolicy.status !== "unset") {
       traceSpan?.addEvent(`${traceEventPrefix}.compaction_policy`, {
@@ -1630,7 +1631,7 @@ export async function createPiAgentSessionForContext(
           typeof model?.contextWindow === "number" && model.contextWindow > 0 ? model.contextWindow : null,
         window_matches_resolution: policyDecision.windowMismatch === null,
         cap_installed_without_trigger: policyDecision.capInstalledWithoutTrigger,
-        cap_ceiling_active: typeof capOption.summaryOutputCapTokens === "number",
+        cap_ceiling_active: policyDecision.capCeilingActive,
         trigger_above_tokens: policyDecision.apply?.effective?.triggerAboveTokens ?? null,
         reserve_tokens: policyDecision.apply?.effective?.reserveTokens ?? null,
         keep_recent_tokens: policyDecision.apply?.effective?.keepRecentTokens ?? null,

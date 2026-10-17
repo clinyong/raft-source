@@ -276,8 +276,6 @@ export function combinePiCompactionPolicyResolutions(
   sessionResolution: PiCompactionPolicyResolution,
 ): {
   apply: PiCompactionPolicyResolution | null;
-  /** True when the extension carries the ceiling but the session settings were left alone. */
-  capInstalledWithoutTrigger: boolean;
   windowMismatch: { capWindowTokens: number | null; sessionWindowTokens: number | null } | null;
   readback: string;
 } {
@@ -285,7 +283,6 @@ export function combinePiCompactionPolicyResolutions(
     if (capResolution.status !== "applied") {
       return {
         apply: null,
-        capInstalledWithoutTrigger: false,
         windowMismatch: null,
         readback: `compaction pilot: not applied (the summary cap could not be built for this session: ${capResolution.reason ?? capResolution.status})`,
       };
@@ -295,7 +292,6 @@ export function combinePiCompactionPolicyResolutions(
     const windowMismatch = capWindowTokens === sessionWindowTokens ? null : { capWindowTokens, sessionWindowTokens };
     return {
       apply: sessionResolution,
-      capInstalledWithoutTrigger: false,
       windowMismatch,
       readback: windowMismatch
         ? `${sessionResolution.readback} (window changed between the cap build and the final resolution: ${String(capWindowTokens)} -> ${String(sessionWindowTokens)}; the ceiling does not depend on it)`
@@ -304,24 +300,49 @@ export function combinePiCompactionPolicyResolutions(
   }
   return {
     apply: null,
-    capInstalledWithoutTrigger: capResolution.status === "applied",
     windowMismatch: null,
-    readback: capResolution.status === "applied"
-      ? `${sessionResolution.readback}; the ceiling stays in the extension but the policy was not applied to settings`
-      : sessionResolution.readback,
+    readback: sessionResolution.readback,
   };
 }
 
 /**
- * An inert final result must disable BOTH policy layers. The cap extension is built during session creation
- * -- before the session's model is known -- but the adapter reads its ceiling at handler time (inside
- * `session_before_compact`), so the ceiling installed for a session whose policy turned out inert is cleared
- * here. Without this, a session could carry a summary bound while its trigger was never applied: an effect
- * the operator never asked for, in the one direction this policy must not drift.
+ * The single entry point the wiring calls: it settles the state and THEN describes it.
+ *
+ * Two things could otherwise drift apart, and both have:
+ *
+ * - An inert final result must disable BOTH policy layers. The cap extension is built during session
+ *   creation -- before the session's model is known -- but the adapter reads its ceiling at handler time
+ *   (inside `session_before_compact`), so the ceiling installed for a session whose policy turned out inert
+ *   is cleared here: a session must never carry a summary bound whose trigger was never applied.
+ * - The readback and the telemetry flags must describe the session as it will actually run. Deriving them
+ *   next to the clearance, from the state after it, is what keeps "no ceiling" from being reported as
+ *   "ceiling installed" (a review finding on r3, whose reporting described the pre-decision state).
  */
-export function applyPiCompactionPolicyDecision(
-  capOption: { summaryOutputCapTokens?: number },
-  decision: { apply: PiCompactionPolicyResolution | null },
-): void {
-  if (decision.apply === null) capOption.summaryOutputCapTokens = undefined;
+export function decidePiCompactionPolicy(args: {
+  capResolution: PiCompactionPolicyResolution;
+  sessionResolution: PiCompactionPolicyResolution;
+  capOption: { summaryOutputCapTokens?: number };
+}): {
+  apply: PiCompactionPolicyResolution | null;
+  windowMismatch: { capWindowTokens: number | null; sessionWindowTokens: number | null } | null;
+  /** Read after the clearance, so it is the state the session runs with. */
+  capCeilingActive: boolean;
+  /** Invariant, always false once the decision is applied: a ceiling without its trigger. */
+  capInstalledWithoutTrigger: boolean;
+  readback: string;
+} {
+  const decision = combinePiCompactionPolicyResolutions(args.capResolution, args.sessionResolution);
+  const hadCeiling = typeof args.capOption.summaryOutputCapTokens === "number";
+  if (decision.apply === null) args.capOption.summaryOutputCapTokens = undefined;
+  const capCeilingActive = typeof args.capOption.summaryOutputCapTokens === "number";
+  const capCleared = hadCeiling && !capCeilingActive;
+  return {
+    apply: decision.apply,
+    windowMismatch: decision.windowMismatch,
+    capCeilingActive,
+    capInstalledWithoutTrigger: capCeilingActive && decision.apply === null,
+    readback: capCleared
+      ? `${decision.readback}; the ceiling was cleared with it`
+      : decision.readback,
+  };
 }
