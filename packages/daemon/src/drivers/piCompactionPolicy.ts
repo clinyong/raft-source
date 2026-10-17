@@ -216,10 +216,11 @@ export function resolvePiCompactionPolicy(options: {
   if (triggerAboveTokens < 1 || reserveTokens < 1) {
     return inert("window_incompatible", policy, `model window ${window} cannot express a ${policy.triggerAboveRatio * 100}% trigger`);
   }
-  // Pi keeps `keepRecentTokens` verbatim and summarizes ONLY what is older than that. If the retention does
-  // not leave the trigger room for a summary at least as large as itself, "above the trigger" is already
-  // almost all retained history and the policy degenerates into per-turn churn on a smaller model. Half the
-  // trigger is the line: at compaction time at least as much history is summarized as is kept.
+  // CONSERVATIVE PILOT CHOICE, not an SDK requirement: Pi itself would accept a retention at or above the
+  // trigger. `keepRecentTokens` is kept verbatim and only older context is summarized, so such a model would
+  // compact with almost nothing to summarize -- churn rather than a summary. The pilot therefore refuses the
+  // combination with 2:1 in mind: at compaction time at least as much history is summarized as is kept. A
+  // window that cannot host these numbers is a smaller model, and the policy is meant for the larger ones.
   const minimumTriggerTokens = policy.keepRecentTokens * 2;
   if (triggerAboveTokens < minimumTriggerTokens) {
     return inert(
@@ -266,9 +267,9 @@ export function resolvePiCompactionPolicy(options: {
  *                    A window difference is reported, not hidden.
  * - cap not built -> the policy is not applied at all. An earlier trigger with an unbounded summary request
  *                    is exactly the combination the policy exists to prevent.
- * - settings cannot host it -> same: nothing is applied. The ceiling may still be present in the extension;
- *                    the adapter only ever LOWERS an oversized request, so this direction is bounded, and it
- *                    is reported rather than passed off as an applied policy.
+ * - settings cannot host it -> same: nothing is applied, and the ceiling is cleared from the extension (see
+ *                    `applyPiCompactionPolicyDecision`), so an inert result disables BOTH layers rather than
+ *                    leaving a bound the policy never asked for.
  */
 export function combinePiCompactionPolicyResolutions(
   capResolution: PiCompactionPolicyResolution,
@@ -309,4 +310,18 @@ export function combinePiCompactionPolicyResolutions(
       ? `${sessionResolution.readback}; the ceiling stays in the extension but the policy was not applied to settings`
       : sessionResolution.readback,
   };
+}
+
+/**
+ * An inert final result must disable BOTH policy layers. The cap extension is built during session creation
+ * -- before the session's model is known -- but the adapter reads its ceiling at handler time (inside
+ * `session_before_compact`), so the ceiling installed for a session whose policy turned out inert is cleared
+ * here. Without this, a session could carry a summary bound while its trigger was never applied: an effect
+ * the operator never asked for, in the one direction this policy must not drift.
+ */
+export function applyPiCompactionPolicyDecision(
+  capOption: { summaryOutputCapTokens?: number },
+  decision: { apply: PiCompactionPolicyResolution | null },
+): void {
+  if (decision.apply === null) capOption.summaryOutputCapTokens = undefined;
 }

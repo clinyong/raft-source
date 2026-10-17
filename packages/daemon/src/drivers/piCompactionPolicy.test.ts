@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { compact, shouldCompact } from "@earendil-works/pi-coding-agent";
-import { capPiCompactionSummaryOutput } from "./piCompactionFit";
+import {
+  capPiCompactionSummaryOutput,
+  createPiCompactionFitExtension,
+  takePiCompactionSummaryOutputCap,
+} from "./piCompactionFit";
 import {
   PI_COMPACTION_POLICY_ENV_VAR,
+  applyPiCompactionPolicyDecision,
   combinePiCompactionPolicyResolutions,
   resolvePiCompactionPolicy,
 } from "./piCompactionPolicy";
@@ -255,4 +260,55 @@ test("the two moments are reconciled: cap built before the model, settings appli
   assert.equal(bothUnset.apply, null);
   assert.equal(bothUnset.capInstalledWithoutTrigger, false);
   assert.equal(bothUnset.readback, "compaction pilot: not applied (not configured)");
+});
+
+test("an inert final result clears the ceiling, so neither layer survives on its own", () => {
+  const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
+  const applied = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 200_000 } });
+
+  // Applied: the option keeps the policy ceiling.
+  const option: { summaryOutputCapTokens?: number } = {
+    summaryOutputCapTokens: cap.effective?.summaryOutputCapTokens,
+  };
+  applyPiCompactionPolicyDecision(option, combinePiCompactionPolicyResolutions(cap, applied));
+  assert.equal(option.summaryOutputCapTokens, 16_384);
+
+  // Inert (here: the final model cannot host the policy): the ceiling goes with it.
+  const incompatible = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 32_768 } });
+  const decision = combinePiCompactionPolicyResolutions(cap, incompatible);
+  assert.equal(decision.apply, null);
+  applyPiCompactionPolicyDecision(option, decision);
+  assert.equal(option.summaryOutputCapTokens, undefined);
+});
+
+test("the ceiling really is late-bound: the adapter reads whatever the option holds at compaction time", () => {
+  // This is the mechanism r3 relies on. The factory is built once, during session creation, but the handler
+  // reads the option per request -- so clearing it after an inert final resolution disables the cap layer.
+  const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
+  const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  (createPiCompactionFitExtension(option) as (pi: unknown) => unknown)({
+    on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+      if (name === "session_before_compact") handlers.push(handler);
+    },
+  });
+  assert.equal(handlers.length, 1);
+  const sessionManager = {};
+  const preparation = {
+    settings: { reserveTokens: 80_000, keepRecentTokens: 20_000 },
+    firstKeptEntryId: "retained",
+    messagesToSummarize: [{ role: "user", content: "Authorized task and current progress", timestamp: 1 }],
+    turnPrefixMessages: [],
+    isSplitTurn: false,
+    tokensBefore: 600_001,
+    previousSummary: undefined,
+    fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+  };
+  const ctx = { sessionManager, model: { ...model, maxTokens: 384_000 } };
+
+  handlers[0]!({ preparation, reason: "threshold" }, ctx);
+  assert.equal(takePiCompactionSummaryOutputCap(sessionManager)?.historyOutputCapTokens, 16_384);
+
+  option.summaryOutputCapTokens = undefined;
+  handlers[0]!({ preparation, reason: "threshold" }, ctx);
+  assert.equal(takePiCompactionSummaryOutputCap(sessionManager), null, "a cleared ceiling must not bind");
 });

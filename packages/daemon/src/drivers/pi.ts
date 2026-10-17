@@ -69,6 +69,7 @@ import {
   type PiSummaryOutputCapApplication,
 } from "./piCompactionFit";
 import {
+  applyPiCompactionPolicyDecision,
   combinePiCompactionPolicyResolutions,
   resolvePiCompactionPolicy,
   type PiCompactionPolicyResolution,
@@ -1527,6 +1528,11 @@ export async function createPiAgentSessionForContext(
           envVars: launchRuntimeFields.envVars,
           model: policyModel,
         });
+        // Late-bound on purpose: the adapter reads this at handler time, so the final resolution below can
+        // still clear it when the policy turns out not to apply to this session (see r2's combiner).
+        const capOption: { summaryOutputCapTokens?: number } = {
+          summaryOutputCapTokens: capPolicy.effective?.summaryOutputCapTokens,
+        };
         const services = await createAgentSessionServices({
           cwd: ctx.workingDirectory,
           agentDir,
@@ -1537,15 +1543,11 @@ export async function createPiAgentSessionForContext(
             // Keeps an oversized compaction request inside the model limit (task #10).
             // The cap is opt-in per agent (compaction pilot): `undefined` for every agent whose policy is
             // inert, which is the behaviour this extension shipped with.
-            extensionFactories: [
-              createPiCompactionFitExtension({
-                summaryOutputCapTokens: capPolicy.effective?.summaryOutputCapTokens,
-              }),
-            ],
+            extensionFactories: [createPiCompactionFitExtension(capOption)],
             systemPromptOverride: () => ctx.standingPrompt,
           },
         });
-        return { services, providerHttpClient: sessionProviderHttpClient, modelRegistry, capPolicy };
+        return { services, providerHttpClient: sessionProviderHttpClient, modelRegistry, capPolicy, capOption };
       } catch (error) {
         sessionProviderHttpClient.dispose();
         throw error;
@@ -1556,6 +1558,7 @@ export async function createPiAgentSessionForContext(
     // Reused from the probe above, so the gateway model is registered exactly once.
     const modelRegistry = sessionServices.modelRegistry;
     const capPolicy = sessionServices.capPolicy;
+    const capOption = sessionServices.capOption;
     logPiServiceDiagnostics("create_session", services);
     addPiServiceTraceEvent(traceSpan, `${traceEventPrefix}.services_ready`, services, {
       agent_dir_source: opts.agentDirSource ?? (spawnEnv.PI_CODING_AGENT_DIR ? "spawn_env" : "default"),
@@ -1592,6 +1595,8 @@ export async function createPiAgentSessionForContext(
       model,
     });
     const policyDecision = combinePiCompactionPolicyResolutions(capPolicy, sessionPolicy);
+    // Both layers, or neither: an inert final result also clears the ceiling the extension was built with.
+    applyPiCompactionPolicyDecision(capOption, policyDecision);
     applyPiDaemonSettingsOverrides(services.settingsManager, policyDecision.apply);
     if (sessionPolicy.status !== "unset" || capPolicy.status !== "unset") {
       // Readback for the operator: what this agent got, or why it got nothing.
@@ -1625,6 +1630,7 @@ export async function createPiAgentSessionForContext(
           typeof model?.contextWindow === "number" && model.contextWindow > 0 ? model.contextWindow : null,
         window_matches_resolution: policyDecision.windowMismatch === null,
         cap_installed_without_trigger: policyDecision.capInstalledWithoutTrigger,
+        cap_ceiling_active: typeof capOption.summaryOutputCapTokens === "number",
         trigger_above_tokens: policyDecision.apply?.effective?.triggerAboveTokens ?? null,
         reserve_tokens: policyDecision.apply?.effective?.reserveTokens ?? null,
         keep_recent_tokens: policyDecision.apply?.effective?.keepRecentTokens ?? null,
