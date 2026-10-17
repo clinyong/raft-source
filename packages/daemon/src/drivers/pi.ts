@@ -71,6 +71,7 @@ import {
 import {
   decidePiCompactionPolicy,
   resolvePiCompactionPolicy,
+  type PiCompactionPolicyEffective,
   type PiCompactionPolicyResolution,
 } from "./piCompactionPolicy";
 import {
@@ -692,20 +693,34 @@ export function detectPiModelsFromRegistry(modelRegistry: PiModelRegistryLike): 
   return models.length > 0 ? { models } : null;
 }
 
+/** The two compaction token settings the policy writes; the effective shape carries more than that. */
+type PiCompactionTokenSettings = { reserveTokens: number; keepRecentTokens: number };
+
 function applyPiDaemonSettingsOverrides(
   settingsManager: SettingsManager,
-  policy: PiCompactionPolicyResolution | null = null,
+  effective: PiCompactionTokenSettings | null = null,
+  model: { provider: string; id: string } | null = null,
 ): void {
   // The policy only ever ADDS two supported compaction settings (Pi's own `reserveTokens` and
   // `keepRecentTokens`); an inert policy leaves the override exactly as it was. The summary-output
   // ceilings are not settings -- they travel through the cap extension, which is why the pilot's
   // contract names both layers.
-  const effective = policy?.effective ?? null;
+  //
+  // When a model is known the same two numbers are also written as that model's in-memory
+  // `compaction.modelOverrides` entry, because Pi resolves a token setting as
+  // "model override -> ordinary setting -> built-in default" (`settings-manager`: getCompactionTokenSetting).
+  // Without it, an agent whose settings file already carries an override for its model would keep its old
+  // numbers while this code reported the policy applied. Nothing is written to any file: the entry lives in
+  // this session's settings object only.
+  const modelKey = effective && model ? `${model.provider}/${model.id}` : null;
   settingsManager.applyOverrides({
     compaction: {
       enabled: PI_SDK_COMPACTION_ENABLED,
       ...(effective
         ? { reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens }
+        : {}),
+      ...(modelKey && effective
+        ? { modelOverrides: { [modelKey]: { reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens } } }
         : {}),
     },
   });
@@ -1593,17 +1608,38 @@ export async function createPiAgentSessionForContext(
       envVars: launchRuntimeFields.envVars,
       model,
     });
-    // Settles both layers and describes the result in one step, so the readback and the telemetry cannot
-    // claim a ceiling that the decision just cleared.
+    // Settles both layers, applies them through Pi's own settings, verifies the read-back, and only then
+    // describes the result -- so neither the readback nor the telemetry can claim anything the session will
+    // not actually do (a per-model settings entry used to shadow the applied numbers).
+    const settingsSurface = {
+      read: () => {
+        const current = services.settingsManager.getCompactionSettings(model);
+        return { reserveTokens: current.reserveTokens, keepRecentTokens: current.keepRecentTokens };
+      },
+      apply: (effective: PiCompactionPolicyEffective) =>
+        applyPiDaemonSettingsOverrides(services.settingsManager, effective, model ?? null),
+      // (`restore` and `apply` share the token-settings shape; the model key is derived from the session.)
+      restore: (values: { reserveTokens: number; keepRecentTokens: number }) => {
+        // Put back what the session had, including the model-level entry this code just wrote.
+        applyPiDaemonSettingsOverrides(services.settingsManager, values, model ?? null);
+      },
+    };
     const policyDecision = decidePiCompactionPolicy({
       capResolution: capPolicy,
       sessionResolution: sessionPolicy,
       capOption,
+      settings: settingsSurface,
     });
-    applyPiDaemonSettingsOverrides(services.settingsManager, policyDecision.apply);
     if (sessionPolicy.status !== "unset" || capPolicy.status !== "unset") {
       // Readback for the operator: what this agent got, or why it got nothing.
       console.info("[%s] create_session %s", logPrefix, policyDecision.readback);
+    }
+    if (policyDecision.settingsVerified === false) {
+      console.warn(
+        "[%s] create_session compaction policy rolled back: %s",
+        logPrefix,
+        policyDecision.readback,
+      );
     }
     if (policyDecision.windowMismatch) {
       console.warn(
@@ -1632,6 +1668,7 @@ export async function createPiAgentSessionForContext(
         window_matches_resolution: policyDecision.windowMismatch === null,
         cap_installed_without_trigger: policyDecision.capInstalledWithoutTrigger,
         cap_ceiling_active: policyDecision.capCeilingActive,
+        settings_verified: policyDecision.settingsVerified,
         trigger_above_tokens: policyDecision.apply?.effective?.triggerAboveTokens ?? null,
         reserve_tokens: policyDecision.apply?.effective?.reserveTokens ?? null,
         keep_recent_tokens: policyDecision.apply?.effective?.keepRecentTokens ?? null,

@@ -7,6 +7,12 @@
  * Unset, disabled, malformed or unresolved-window policies resolve to "inert" and
  * leave the runtime exactly as it behaves today.
  *
+ * A session may carry its own `compaction.modelOverrides` entry for its model. In Pi's resolution order
+ * (model override -> ordinary setting -> built-in default) that entry outranks the ordinary fields, so the
+ * wiring writes BOTH when it applies the policy and verifies by reading the effective settings back; an
+ * apply whose numbers do not take effect is rolled back and both layers are cleared rather than reported.
+ * The settings files are never written -- everything here is in memory for this session.
+ *
  * The policy drives two layers that only make sense together:
  *
  *   1. WHEN Pi compacts. `shouldCompact(contextTokens, contextWindow, settings)`
@@ -318,31 +324,62 @@ export function combinePiCompactionPolicyResolutions(
  *   next to the clearance, from the state after it, is what keeps "no ceiling" from being reported as
  *   "ceiling installed" (a review finding on r3, whose reporting described the pre-decision state).
  */
-export function decidePiCompactionPolicy(args: {
-  capResolution: PiCompactionPolicyResolution;
-  sessionResolution: PiCompactionPolicyResolution;
-  capOption: { summaryOutputCapTokens?: number };
-}): {
+export interface PiCompactionSettingsSurface {
+  /** Effective compaction settings for the session's model, read back through Pi (model overrides included). */
+  read: () => { reserveTokens: number; keepRecentTokens: number };
+  /** Apply the policy's trigger and retention through Pi's settings, for this model. */
+  apply: (effective: PiCompactionPolicyEffective) => void;
+  /** Put back the values the session had before the policy touched them. */
+  restore: (values: { reserveTokens: number; keepRecentTokens: number }) => void;
+}
+
+export interface PiCompactionPolicyApplication {
   apply: PiCompactionPolicyResolution | null;
   windowMismatch: { capWindowTokens: number | null; sessionWindowTokens: number | null } | null;
   /** Read after the clearance, so it is the state the session runs with. */
   capCeilingActive: boolean;
   /** Invariant, always false once the decision is applied: a ceiling without its trigger. */
   capInstalledWithoutTrigger: boolean;
+  /** null when nothing was applied; false when the read-back disagreed and both layers were rolled back. */
+  settingsVerified: boolean | null;
   readback: string;
-} {
+}
+
+export function decidePiCompactionPolicy(args: {
+  capResolution: PiCompactionPolicyResolution;
+  sessionResolution: PiCompactionPolicyResolution;
+  capOption: { summaryOutputCapTokens?: number };
+  /** Omitted in unit tests and when nothing is applied. */
+  settings?: PiCompactionSettingsSurface;
+}): PiCompactionPolicyApplication {
   const decision = combinePiCompactionPolicyResolutions(args.capResolution, args.sessionResolution);
   const hadCeiling = typeof args.capOption.summaryOutputCapTokens === "number";
-  if (decision.apply === null) args.capOption.summaryOutputCapTokens = undefined;
+  let apply = decision.apply;
+  let readback = decision.readback;
+  let settingsVerified: boolean | null = null;
+  if (apply && args.settings) {
+    // Apply, then ask Pi what it will really use. The read-back is the contract: a policy whose numbers did
+    // not take effect must not be reported as applied, so it is rolled back and both layers are cleared.
+    const before = args.settings.read();
+    args.settings.apply(apply.effective!);
+    const after = args.settings.read();
+    const wanted = apply.effective!;
+    settingsVerified = after.reserveTokens === wanted.reserveTokens && after.keepRecentTokens === wanted.keepRecentTokens;
+    if (!settingsVerified) {
+      args.settings.restore(before);
+      readback = `compaction pilot: not applied (the applied settings did not take effect: read back reserve ${after.reserveTokens} / keep recent ${after.keepRecentTokens}, wanted ${wanted.reserveTokens} / ${wanted.keepRecentTokens})`;
+      apply = null;
+    }
+  }
+  if (apply === null) args.capOption.summaryOutputCapTokens = undefined;
   const capCeilingActive = typeof args.capOption.summaryOutputCapTokens === "number";
   const capCleared = hadCeiling && !capCeilingActive;
   return {
-    apply: decision.apply,
+    apply,
     windowMismatch: decision.windowMismatch,
     capCeilingActive,
-    capInstalledWithoutTrigger: capCeilingActive && decision.apply === null,
-    readback: capCleared
-      ? `${decision.readback}; the ceiling was cleared with it`
-      : decision.readback,
+    capInstalledWithoutTrigger: capCeilingActive && apply === null,
+    settingsVerified,
+    readback: capCleared ? `${readback}; the ceiling was cleared with it` : readback,
   };
 }

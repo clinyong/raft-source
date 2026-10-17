@@ -312,3 +312,45 @@ test("the ceiling really is late-bound: the adapter reads whatever the option ho
   handlers[0]!({ preparation, reason: "threshold" }, ctx);
   assert.equal(takePiCompactionSummaryOutputCap(sessionManager), null, "a cleared ceiling must not bind");
 });
+
+test("a policy whose numbers do not take effect is rolled back, not reported as applied", () => {
+  const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
+  const session = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
+  const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
+  const calls: string[] = [];
+  // Stands in for a settings surface that silently keeps other values (an unmodelled precedence).
+  const lyingSurface = {
+    read: () => { calls.push("read"); return { reserveTokens: 10_000, keepRecentTokens: 3_000 }; },
+    apply: () => { calls.push("apply"); },
+    restore: () => { calls.push("restore"); },
+  };
+  const decision = decidePiCompactionPolicy({
+    capResolution: cap,
+    sessionResolution: session,
+    capOption: option,
+    settings: lyingSurface,
+  });
+  assert.equal(decision.settingsVerified, false);
+  assert.equal(decision.apply, null);
+  assert.equal(decision.capCeilingActive, false);
+  assert.equal(option.summaryOutputCapTokens, undefined, "the ceiling goes when the settings roll back");
+  assert.match(decision.readback, /did not take effect: read back reserve 10000 \/ keep recent 3000, wanted 400000 \/ 20000/);
+  assert.deepEqual(calls, ["read", "apply", "read", "restore"]);
+});
+
+test("a surface that behaves is verified and left applied", () => {
+  const cap = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
+  const session = resolvePiCompactionPolicy({ envVars: env(PILOT_POLICY), model: { contextWindow: 1_000_000 } });
+  const option: { summaryOutputCapTokens?: number } = { summaryOutputCapTokens: 16_384 };
+  let current = { reserveTokens: 16_384, keepRecentTokens: 20_000 };
+  const surface = {
+    read: () => current,
+    apply: (effective: { reserveTokens: number; keepRecentTokens: number }) => { current = { reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens }; },
+    restore: (values: { reserveTokens: number; keepRecentTokens: number }) => { current = values; },
+  };
+  const decision = decidePiCompactionPolicy({ capResolution: cap, sessionResolution: session, capOption: option, settings: surface });
+  assert.equal(decision.settingsVerified, true);
+  assert.equal(decision.apply?.status, "applied");
+  assert.equal(current.reserveTokens, 400_000); // 1M window: trigger above 600,000, reserve 400,000
+  assert.equal(option.summaryOutputCapTokens, 16_384);
+});
