@@ -65,6 +65,7 @@ import { useComputerUpgradeReconnect } from "../../hooks/useComputerUpgradeRecon
 import { useServerPermissions } from "../../hooks/useServerPermissions";
 import CreateChannelDialog from "../channel/CreateChannelDialog";
 import CreateJointChannelDialog from "../channel/CreateJointChannelDialog";
+import JointInviteInbox from "../channel/JointInviteInbox";
 import ChannelPinMenuItem from "../channel/ChannelPinMenuItem";
 import { ChannelKindIcon } from "../channel/channelKindIcon";
 import InviteHumanDialog from "../member/InviteHumanDialog";
@@ -3922,6 +3923,9 @@ export default function Sidebar({ mobileInline, bottomSlot }: SidebarProps) {
                 <SavedNavCount total={savedTotal} />
               </SidebarItem>
 
+              {/* Invites are email-only and this instance has no mail transport, so the invited side
+                  must see them here or not at all (renders nothing when there is nothing to accept). */}
+              <JointInviteInbox />
 
               {(() => {
                 // Stryker disable all: sidebar drag/drop render composition is covered by source contracts and browser/manual preview; command-runner DOM mutation tests cannot perform dnd-kit drags.
