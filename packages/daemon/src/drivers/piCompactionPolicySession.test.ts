@@ -23,16 +23,22 @@ const POLICY = JSON.stringify({
   summaryOutputCapTokens: 16_384,
 });
 
-async function createFixtureSession(options: { selected: boolean; existingModelOverride: boolean; contextWindow?: number }) {
+async function createFixtureSession(options: {
+  selected: boolean;
+  existingModelOverride: boolean;
+  contextWindow?: number;
+  /** Extra settings-file content (e.g. compaction disabled, or an override for another model). */
+  settings?: Record<string, unknown>;
+}) {
   const root = mkdtempSync(path.join(os.tmpdir(), "policy-session-fixture-"));
   const workspace = path.join(root, "workspace");
   mkdirSync(workspace);
-  if (options.existingModelOverride) {
+  const settings = options.existingModelOverride
+    ? { ...options.settings, compaction: { ...(options.settings?.compaction as object ?? {}), modelOverrides: { "openai/model-window-probe": { reserveTokens: 10_000, keepRecentTokens: 3_000 } } } }
+    : options.settings;
+  if (settings) {
     mkdirSync(path.join(workspace, ".pi"));
-    writeFileSync(
-      path.join(workspace, ".pi/settings.json"),
-      JSON.stringify({ compaction: { modelOverrides: { "openai/model-window-probe": { reserveTokens: 10_000, keepRecentTokens: 3_000 } } } }),
-    );
+    writeFileSync(path.join(workspace, ".pi/settings.json"), JSON.stringify(settings));
   }
   const original = ModelRegistry.prototype.find;
   const spy = vi.spyOn(ModelRegistry.prototype, "find").mockImplementation(function (this: ModelRegistry, provider: string, id: string) {
@@ -112,6 +118,35 @@ test("an unselected session without an override keeps the stock reserve (control
     expect(session.settingsManager.getCompactionSettings(session.model)).toEqual({
       enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000,
     });
+  } finally {
+    session.dispose();
+  }
+});
+
+test("the daemon's compaction-enabled override survives for an unselected agent whose file disables it", async () => {
+  // The daemon has always forced Pi's SDK compaction on so lifecycle events surface. That must not depend
+  // on the policy applying: an unselected agent with `compaction.enabled: false` keeps the override.
+  const session = await createFixtureSession({ selected: false, existingModelOverride: false, settings: { compaction: { enabled: false } } });
+  try {
+    expect(session.settingsManager.getCompactionEnabled()).toBe(true);
+  } finally {
+    session.dispose();
+  }
+});
+
+test("another model's own override is untouched by applying or rolling back the policy", async () => {
+  const session = await createFixtureSession({
+    selected: true,
+    existingModelOverride: false,
+    settings: { compaction: { modelOverrides: { "openai/another-model": { reserveTokens: 5_000, keepRecentTokens: 1_000 } } } },
+  });
+  try {
+    expect(session.settingsManager.getCompactionSettings(session.model)).toEqual({
+      enabled: true, reserveTokens: 400_000, keepRecentTokens: 20_000,
+    });
+    const other = session.settingsManager.getCompactionSettings({ provider: "openai", id: "another-model" } as never);
+    expect(other.reserveTokens).toBe(5_000);
+    expect(other.keepRecentTokens).toBe(1_000);
   } finally {
     session.dispose();
   }

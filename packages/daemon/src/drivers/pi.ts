@@ -1608,6 +1608,11 @@ export async function createPiAgentSessionForContext(
       envVars: launchRuntimeFields.envVars,
       model,
     });
+    // Unconditional and policy-independent: the daemon has always enabled Pi's SDK compaction so the
+    // compaction lifecycle events surface (PI_SDK_COMPACTION_ENABLED), and the policy only SHAPES that. r5
+    // briefly made this depend on the policy applying, which silently changed every unselected agent whose
+    // settings file disables compaction -- caught by testing the boundary directly rather than the happy path.
+    applyPiDaemonSettingsOverrides(services.settingsManager, null);
     // Settles both layers, applies them through Pi's own settings, verifies the read-back, and only then
     // describes the result -- so neither the readback nor the telemetry can claim anything the session will
     // not actually do (a per-model settings entry used to shadow the applied numbers).
