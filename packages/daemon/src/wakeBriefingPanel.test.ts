@@ -201,10 +201,19 @@ test("message read with a quoted thread target feeds recent messages", async () 
   const file = writeTranscript([
     record("assistant", [toolUse("r1", "Bash", { command: 'raft message read --target "#proj-x:abcd1234" --unread' })]),
     record("user", [toolResult("r1", "[target=#proj-x:abcd1234 msg=eeee5555 time=2026-09-01T01:15Z] @eve: hello")]),
-    record("assistant", [toolUse("r2", "Bash", { command: 'raft message read --target "#proj-x:abcd1234" | cut -c1-20' })]),
+    record("assistant", [toolUse("r2", "Bash", { command: 'raft message read --target "#proj-x:abcd1234" | grep hello' })]),
     record("user", [toolResult("r2", "[target=#proj-x:abcd1234 msg=ffff6666 time=2026-09-01T01:16Z] @eve: ignored")]),
   ]);
   assert.deepEqual((await collectRecentMessages(file, 15)).map((m) => m.msgId), ["eeee5555"]);
+});
+
+test("message listings accept one head, tail, or cut pipeline only", async () => {
+  const commands = ["head -n 30", "tail -n 20", "cut -c1-3000", "cut -c1-3000 | head", "grep hello", "cut -c1-3000; echo hello"];
+  const lines = commands.flatMap((suffix, i) => [
+    record("assistant", [toolUse(`p${i}`, "Bash", { command: `raft message read --target "#proj-x:abcd1234" --unread | ${suffix}` })]),
+    record("user", [toolResult(`p${i}`, `[target=#proj-x:abcd1234 msg=pipe${i} time=2026-09-01T01:15Z] @eve: hello`)]),
+  ]);
+  assert.deepEqual((await collectRecentMessages(writeTranscript(lines), 15)).map((m) => m.msgId), ["pipe0", "pipe1", "pipe2"]);
 });
 
 test("a Codex message-read call reaches the panel through the transcript converter", async () => {

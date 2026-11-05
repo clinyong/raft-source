@@ -229,10 +229,10 @@ export interface PanelMessage {
 
 const SEND_COMMAND_RE = /\braft\s+message\s+send\b/;
 /** `raft message check` or `raft message read` on its own: its output is a message listing, so it
- * feeds the recent-messages section. A pipeline, a redirect other than 2>&1 or
- * any other subcommand does not match. */
+ * feeds the recent-messages section. One head/tail/cut pipeline is allowed;
+ * other pipelines, redirects (except 2>&1), and subcommands do not match. */
 const MESSAGE_LIST_COMMAND_RE =
-  /^\s*raft\s+message\s+(?:check|read)(?:\s+--?[\w-]+(?:[ =][\w"'#:@.-]+)?)*\s*(?:2>&1\s*)?$/;
+  /^\s*raft\s+message\s+(?:check|read)(?:\s+--?[\w-]+(?:[ =][\w"'#:@.-]+)?)*\s*(?:2>&1\s*)?(?:\|\s*(?:head|tail|cut)\b(?:\s+[-\w,=+.]+)*\s*)?$/;
 const MSG_ATTR_RE = /\bmsg=([\w-]+)/;
 const TIME_ATTR_RE = /\btime=([0-9T:\- ]+Z?)/;
 /** Ephemeral system chrome: reminder firings and catch-up notices describe a
