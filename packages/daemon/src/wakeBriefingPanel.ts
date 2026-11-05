@@ -228,11 +228,11 @@ export interface PanelMessage {
 }
 
 const SEND_COMMAND_RE = /\braft\s+message\s+send\b/;
-/** `raft message check` on its own: its output is a message listing, so it
+/** `raft message check` or `raft message read` on its own: its output is a message listing, so it
  * feeds the recent-messages section. A pipeline, a redirect other than 2>&1 or
  * any other subcommand does not match. */
-const MESSAGE_CHECK_COMMAND_RE =
-  /^\s*raft\s+message\s+check(?:\s+--?[\w-]+(?:[ =][\w"'#:@.-]+)?)*\s*(?:2>&1\s*)?$/;
+const MESSAGE_LIST_COMMAND_RE =
+  /^\s*raft\s+message\s+(?:check|read)(?:\s+--?[\w-]+(?:[ =][\w"'#:@.-]+)?)*\s*(?:2>&1\s*)?$/;
 const MSG_ATTR_RE = /\bmsg=([\w-]+)/;
 const TIME_ATTR_RE = /\btime=([0-9T:\- ]+Z?)/;
 /** Ephemeral system chrome: reminder firings and catch-up notices describe a
@@ -345,7 +345,7 @@ export function parseSentMessage(command: string, ts: string | null): PanelMessa
 
 /**
  * Reconstruct the messages the retired session recently saw or sent, from its
- * transcript tail: `raft message check/read/search` tool results, message
+ * transcript tail: `raft message check/read` tool results, message
  * bodies carried by wake inputs, and `raft message send` commands (rendered
  * first-person). Deduplicated by message id, newest `max` kept, transcript
  * order preserved. A lossy view by construction — the section header says so.
@@ -365,7 +365,7 @@ export async function collectRecentMessages(
   // the body, the follow-up `--send-draft` confirms delivery. Only confirmed
   // sends are listed as the agent's own words.
   const sendAttempts = new Map<string, { message: PanelMessage | null; target: string | null }>();
-  const messageCheckCalls = new Set<string>();
+  const messageListCalls = new Set<string>();
   const pendingDraftByTarget = new Map<string, PanelMessage>();
   const found: PanelMessage[] = [];
   for (const line of lines) {
@@ -386,7 +386,7 @@ export async function collectRecentMessages(
         const id = typeof b.id === "string" ? b.id : null;
         const input = (b.input && typeof b.input === "object" ? b.input : {}) as Record<string, unknown>;
         const command = typeof input.command === "string" ? input.command : "";
-        if (id && MESSAGE_CHECK_COMMAND_RE.test(command)) messageCheckCalls.add(id);
+        if (id && MESSAGE_LIST_COMMAND_RE.test(command)) messageListCalls.add(id);
         if (!id || !command || !SEND_COMMAND_RE.test(command)) continue;
         const targetMatch = /--target[=\s]+(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(command);
         sendAttempts.set(id, {
@@ -415,7 +415,7 @@ export async function collectRecentMessages(
         }
         // Only a message listing we asked for counts; any other tool output that
         // happens to quote a header is debris, not conversation.
-        if (id !== null && messageCheckCalls.has(id) && resultText.includes("[target=")) {
+        if (id !== null && messageListCalls.has(id) && resultText.includes("[target=")) {
           found.push(...parseMessageChunks(resultText));
         }
       };
