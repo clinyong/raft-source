@@ -28,11 +28,25 @@ Do not rewrite history that is already on `main`.
 
 ## Review
 
-- Every pull request needs a review from @Dassai before merge.
+- Every pull request needs an architecture review before merge. The reviewer
+  is the architecture role on the team; the executor of the change is not the
+  reviewer of it.
 - One person executes; the reviewer decides and reviews. The same person
   should not both approve and merge their own change.
 - A review comment about deployment, migration or production timing is a
-  decision for @leocc, not something a pull request body can authorize.
+  decision for the deployment owner, not something a pull request body can
+  authorize.
+
+## Upstream automation
+
+The upstream snapshot ships `.github/workflows/close-external-prs.yml`, which
+closes every pull request as soon as it is opened. It is disabled in this
+fork's Actions settings; the file itself is kept so `main` stays identical to
+upstream.
+
+After every upstream sync, check that this workflow is still disabled before
+opening a pull request. A sync restores or re-adds the file, and the Actions
+setting is the only thing that keeps it from closing our pull requests.
 
 ## Builds
 
@@ -45,13 +59,16 @@ Do not rewrite history that is already on `main`.
   before using it.
 - Run a new Computer binary once in a separate `RAFT_HOME` before it is used
   anywhere real. Never point an unverified binary at a live server.
+- Archive every binary that goes live in a GitHub Release of this fork, with
+  the build commit, the reported version and the SHA256 in the release notes.
+  The build artifact expires; the release does not.
 
 ## Deployment
 
 - Nothing in this repository is deployed to production by a merge.
 - Switching the production Computer or Server to a fork build needs a separate
-  approval from @leocc, with a named time window, a backup of the running
-  binary and written rollback steps.
+  approval from the deployment owner, with a named time window, a backup of
+  the running binary and written rollback steps.
 - Keep the previous binary until the new one has run long enough to be accepted.
 
 ## Generated files
