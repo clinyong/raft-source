@@ -7,6 +7,13 @@ import type { AxSurfaceText } from "@botiverse/raft-shared";
 import { axSurface, composeAxSurfaces } from "./agentRuntimeInput";
 import { WAKE_SECTION_BREAK, buildStartupMemoryBlock, resolveStartupMemoryBlockConfig } from "./startupMemoryBlock";
 import { buildConstructedPanel } from "./wakeBriefingPanel";
+import {
+  isCompactionRecord,
+  parseCodexRecord,
+  readContextTokens,
+  readStringField,
+  type JsonObject,
+} from "./codexWakeTranscript";
 
 /**
  * At-wake session recycling (RFC 070, phase 1).
@@ -40,6 +47,18 @@ const DEFAULT_MIN_COLD_GAP_MS = 60 * 60_000;
  * sessions their continuity while capturing ~98.6% of the cold rewrite. */
 const DEFAULT_MIN_CONTEXT_TOKENS = 128_000;
 
+/** Codex reports the input size of its last request, not a per-session context
+ * estimate, so the Codex path uses a higher bar than the Claude one. */
+const CODEX_DEFAULT_MIN_CONTEXT_TOKENS = 150_000;
+
+/** Codex has no prompt-cache TTL we can read. Ten minutes of silence is long
+ * enough that the agent is not visibly mid-conversation, while staying far
+ * below the 1h cold-gap assumption used for Claude. */
+const CODEX_DEFAULT_MIN_IDLE_MS = 10 * 60_000;
+
+/** Codex names its rollout files after the session id. */
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /** Bounded tail read of the session transcript; at the fleet's measured
  * ~1.4k tokens of growth per request this spans many turns, which is plenty
  * to find the last assistant usage record. */
@@ -70,7 +89,7 @@ export type WakeRecyclePlan =
   | { action: "resume"; reason: string }
   | {
       action: "recycle";
-      reason: "cold_gap_large_context";
+      reason: "cold_gap_large_context" | "large_context";
       priorSessionId: string;
       idleMs: number;
       priorContextTokens: number;
@@ -188,6 +207,67 @@ export async function readClaudeSessionResumeFacts(
   }
 }
 
+/** Read the tail of a file as text, dropping the first partial line when the
+ * read started mid-file. Null means the tail could not be read. */
+async function readTranscriptTailText(filePath: string): Promise<string | null> {
+  const info = await stat(filePath);
+  const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
+  const buffer = Buffer.alloc(info.size - start);
+  const handle = await open(filePath, "r");
+  try {
+    let read = 0;
+    while (read < buffer.length) {
+      const result = await handle.read(buffer, read, buffer.length - read, start + read);
+      if (!result.bytesRead) return null;
+      read += result.bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+  const text = buffer.toString("utf8");
+  if (start === 0) return text;
+  const firstBreak = text.indexOf("\n");
+  return firstBreak === -1 ? "" : text.slice(firstBreak + 1);
+}
+
+/** Latest activity timestamp a record carries, or the running maximum. */
+function latestTimestamp(current: number | null, record: JsonObject): number | null {
+  const raw = readStringField(record, "timestamp");
+  if (raw === null) return current;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return current;
+  return Math.max(current ?? 0, parsed);
+}
+
+/** Read Codex's last request, whose input includes cached tokens. A damaged
+ * tail is unknown, never permission to discard the old session. */
+export async function readCodexSessionResumeFacts(sessionId: string, homeDir = os.homedir()): Promise<SessionResumeFacts> {
+  const empty: SessionResumeFacts = { transcriptPath: null, lastActivityAtMs: null, lastContextTokens: null };
+  if (!SESSION_ID_PATTERN.test(sessionId)) return empty;
+  const ref = resolveRuntimeSessionRef("codex", sessionId, homeDir);
+  if (!ref.reachable || !ref.path) return empty;
+  if (!ref.path.endsWith(`-${sessionId}.jsonl`)) return empty;
+  const unknown: SessionResumeFacts = { ...empty, transcriptPath: ref.path };
+  try {
+    const text = await readTranscriptTailText(ref.path);
+    if (text === null) return unknown;
+    let lastActivityAtMs: number | null = null;
+    let lastContextTokens: number | null = null;
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      const record = parseCodexRecord(line);
+      if (record === null) return unknown;
+      lastActivityAtMs = latestTimestamp(lastActivityAtMs, record);
+      if (isCompactionRecord(record)) lastContextTokens = null;
+      const tokens = readContextTokens(record);
+      if (tokens !== null) lastContextTokens = tokens;
+    }
+    return { transcriptPath: ref.path, lastActivityAtMs, lastContextTokens };
+  } catch {
+    return unknown;
+  }
+}
+
 export interface WakeRecycleDecisionInput {
   config: WakeRecycleConfig;
   runtime: string | undefined;
@@ -238,11 +318,17 @@ export function decideWakeRecycle(input: WakeRecycleDecisionInput): WakeRecycleP
     return { action: "resume", reason: "session_facts_unavailable" };
   }
   const idleMs = input.nowMs - facts.lastActivityAtMs;
-  if (idleMs <= config.minColdGapMs) return { action: "resume", reason: "cache_possibly_warm" };
+  if (idleMs < 0) return { action: "resume", reason: "session_facts_unavailable" };
+  if (input.runtime === "codex") {
+    // A warm conversation must not be recycled just because the context is big.
+    if (idleMs < config.minColdGapMs) return { action: "resume", reason: "codex_idle_below_threshold" };
+  } else if (idleMs <= config.minColdGapMs) {
+    return { action: "resume", reason: "cache_possibly_warm" };
+  }
   if (facts.lastContextTokens <= config.minContextTokens) return { action: "resume", reason: "context_below_threshold" };
   return {
     action: "recycle",
-    reason: "cold_gap_large_context",
+    reason: input.runtime === "codex" ? "large_context" : "cold_gap_large_context",
     priorSessionId: input.sessionId,
     idleMs,
     priorContextTokens: facts.lastContextTokens,
@@ -531,7 +617,21 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
       nowMs: args.nowMs ?? Date.now(),
     });
   }
-  const facts = await readRuntimeSessionResumeFacts(args.config.runtime ?? "claude", args.config.sessionId, args.homeDir);
+  const runtime = args.config.runtime ?? "claude";
+  const env = args.config.envVars ?? {};
+  // Explicit per-agent opt-in; the existing cold-idle sweeper stays unchanged.
+  if (runtime === "codex" && parseBooleanFlag(env.RAFT_CODEX_WAKE_RECYCLE) !== true) {
+    return { action: "resume", reason: "codex_opt_in_required" };
+  }
+  if (runtime === "codex") {
+    recycleConfig.minContextTokens = parsePositiveInteger(env.RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS)
+      ?? CODEX_DEFAULT_MIN_CONTEXT_TOKENS;
+    recycleConfig.minColdGapMs = parsePositiveInteger(env.RAFT_CODEX_WAKE_RECYCLE_MIN_IDLE_MS)
+      ?? CODEX_DEFAULT_MIN_IDLE_MS;
+  }
+  const facts = runtime === "codex"
+    ? await readCodexSessionResumeFacts(args.config.sessionId, args.homeDir)
+    : await readRuntimeSessionResumeFacts(runtime, args.config.sessionId, args.homeDir);
   const plan = decideWakeRecycle({
     config: recycleConfig,
     runtime: args.config.runtime,
@@ -584,11 +684,13 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
         workspacePath: workspacePath ?? undefined,
         budgetTokens: panelBudget,
         recentMessagesMax,
+        codex: runtime === "codex",
       });
       if (panel) return { ...plan, briefing: composeWakeSections(briefing, panel) };
     } catch (err) {
       logger.warn(`[WakeRecycle] panel construction failed, using bare briefing: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  if (runtime === "codex") return { action: "resume", reason: "codex_panel_unavailable" };
   return plan.briefing === briefing ? plan : { ...plan, briefing };
 }
