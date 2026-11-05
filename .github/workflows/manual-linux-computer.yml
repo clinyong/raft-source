@@ -1,0 +1,42 @@
+name: Manual Linux Computer build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build Linux x64 Computer
+        run: pnpm --filter @botiverse/raft-computer build:native
+      - name: Verify and checksum
+        working-directory: packages/computer/dist-native
+        run: |
+          expected="$(node -p 'require("../package.json").version')"
+          actual="$(./raft-computer-linux-x64 --version)"
+          test "$actual" = "$expected"
+          printf 'Verified Computer version: %s\n' "$actual"
+          sha256sum raft-computer-linux-x64 photon_rs_bg.wasm > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raft-computer-linux-x64-${{ github.sha }}
+          path: |
+            packages/computer/dist-native/raft-computer-linux-x64
+            packages/computer/dist-native/photon_rs_bg.wasm
+            packages/computer/dist-native/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
