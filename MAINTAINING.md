@@ -80,6 +80,12 @@ setting is the only thing that keeps it from closing our pull requests.
   build under its own name carrying the commit SHA, point the mount at the new
   name, and recreate the container. Never overwrite the file a running
   container has mounted.
+- Operational scripts must set the Raft state directory explicitly instead of
+  relying on a default. The default depends on what already exists in the
+  operator's home directory, so a shell that never set it can read a different
+  state directory and report a healthy instance as "not logged in, stopped".
+  Pass the directory in the environment or as a flag, and make any verification
+  step use the same value.
 - A Computer binary ships with `photon_rs_bg.wasm`. Mount the wasm as well
   whenever a build's wasm differs from the image's; when the hashes match, the
   binary alone is enough.
