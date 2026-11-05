@@ -7,6 +7,13 @@ import type { AxSurfaceText } from "@botiverse/raft-shared";
 import { axSurface, composeAxSurfaces } from "./agentRuntimeInput";
 import { WAKE_SECTION_BREAK, buildStartupMemoryBlock, resolveStartupMemoryBlockConfig } from "./startupMemoryBlock";
 import { buildConstructedPanel } from "./wakeBriefingPanel";
+import {
+  isCompactionRecord,
+  parseCodexRecord,
+  readContextTokens,
+  readStringField,
+  type JsonObject,
+} from "./codexWakeTranscript";
 
 /**
  * At-wake session recycling (RFC 070, phase 1).
@@ -48,6 +55,9 @@ const CODEX_DEFAULT_MIN_CONTEXT_TOKENS = 150_000;
  * enough that the agent is not visibly mid-conversation, while staying far
  * below the 1h cold-gap assumption used for Claude. */
 const CODEX_DEFAULT_MIN_IDLE_MS = 10 * 60_000;
+
+/** Codex names its rollout files after the session id. */
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Bounded tail read of the session transcript; at the fleet's measured
  * ~1.4k tokens of growth per request this spans many turns, which is plenty
@@ -197,48 +207,65 @@ export async function readClaudeSessionResumeFacts(
   }
 }
 
+/** Read the tail of a file as text, dropping the first partial line when the
+ * read started mid-file. Null means the tail could not be read. */
+async function readTranscriptTailText(filePath: string): Promise<string | null> {
+  const info = await stat(filePath);
+  const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
+  const buffer = Buffer.alloc(info.size - start);
+  const handle = await open(filePath, "r");
+  try {
+    let read = 0;
+    while (read < buffer.length) {
+      const result = await handle.read(buffer, read, buffer.length - read, start + read);
+      if (!result.bytesRead) return null;
+      read += result.bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+  const text = buffer.toString("utf8");
+  if (start === 0) return text;
+  const firstBreak = text.indexOf("\n");
+  return firstBreak === -1 ? "" : text.slice(firstBreak + 1);
+}
+
+/** Latest activity timestamp a record carries, or the running maximum. */
+function latestTimestamp(current: number | null, record: JsonObject): number | null {
+  const raw = readStringField(record, "timestamp");
+  if (raw === null) return current;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return current;
+  return Math.max(current ?? 0, parsed);
+}
+
 /** Read Codex's last request, whose input includes cached tokens. A damaged
  * tail is unknown, never permission to discard the old session. */
 export async function readCodexSessionResumeFacts(sessionId: string, homeDir = os.homedir()): Promise<SessionResumeFacts> {
   const empty: SessionResumeFacts = { transcriptPath: null, lastActivityAtMs: null, lastContextTokens: null };
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) return empty;
+  if (!SESSION_ID_PATTERN.test(sessionId)) return empty;
   const ref = resolveRuntimeSessionRef("codex", sessionId, homeDir);
-  if (!ref.reachable || !ref.path || !ref.path.endsWith(`-${sessionId}.jsonl`)) return empty;
-  const unknown = { ...empty, transcriptPath: ref.path };
+  if (!ref.reachable || !ref.path) return empty;
+  if (!ref.path.endsWith(`-${sessionId}.jsonl`)) return empty;
+  const unknown: SessionResumeFacts = { ...empty, transcriptPath: ref.path };
   try {
-    const info = await stat(ref.path);
-    const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
-    const buffer = Buffer.alloc(info.size - start);
-    const fd = await open(ref.path, "r");
-    try {
-      let n = 0;
-      while (n < buffer.length) {
-        const result = await fd.read(buffer, n, buffer.length - n, start + n);
-        if (!result.bytesRead) return unknown;
-        n += result.bytesRead;
-      }
-    } finally { await fd.close(); }
-    const lines = buffer.toString("utf8").split("\n");
-    if (start > 0) lines.shift();
+    const text = await readTranscriptTailText(ref.path);
+    if (text === null) return unknown;
     let lastActivityAtMs: number | null = null;
     let lastContextTokens: number | null = null;
-    for (const line of lines) {
+    for (const line of text.split("\n")) {
       if (!line) continue;
-      let record: any;
-      try { record = JSON.parse(line); } catch { return unknown; }
-      if (!record || typeof record !== "object" || Array.isArray(record)) return unknown;
-      if (typeof record.timestamp === "string") {
-        const timestamp = Date.parse(record.timestamp);
-        if (Number.isFinite(timestamp)) lastActivityAtMs = Math.max(lastActivityAtMs ?? 0, timestamp);
-      }
-      if (record.type === "compacted" || (record.type === "response_item" && record.payload?.type === "compaction")) lastContextTokens = null;
-      if (record.type === "event_msg" && record.payload?.type === "token_count" && record.payload.info != null) {
-        const tokens = record.payload.info?.last_token_usage?.input_tokens;
-        lastContextTokens = typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens > 0 ? tokens : null;
-      }
+      const record = parseCodexRecord(line);
+      if (record === null) return unknown;
+      lastActivityAtMs = latestTimestamp(lastActivityAtMs, record);
+      if (isCompactionRecord(record)) lastContextTokens = null;
+      const tokens = readContextTokens(record);
+      if (tokens !== null) lastContextTokens = tokens;
     }
     return { transcriptPath: ref.path, lastActivityAtMs, lastContextTokens };
-  } catch { return unknown; }
+  } catch {
+    return unknown;
+  }
 }
 
 export interface WakeRecycleDecisionInput {

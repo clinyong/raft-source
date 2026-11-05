@@ -27,6 +27,7 @@ const RECORD_TYPE_COMPACTED = "compacted";
 const PAYLOAD_TYPE_TASK_STARTED = "task_started";
 const PAYLOAD_TYPE_COMPACTION = "compaction";
 const PAYLOAD_TYPE_MESSAGE = "message";
+const PAYLOAD_TYPE_TOKEN_COUNT = "token_count";
 const ROLE_USER = "user";
 const FUNCTION_CALL = "function_call";
 const EXEC_COMMAND_FUNCTION_NAME = "exec_command";
@@ -53,7 +54,8 @@ const RUNNING_SESSION_PATTERN = /\bsession[_ ]id\b/i;
 /** Stamped marker line, used to read back the turn a marker came from. */
 const STAMPED_MARKER = /^\{"type":"codex_unrecoverable_tool","turn":(\d+)\}$/;
 
-type JsonObject = Record<string, unknown>;
+/** One decoded rollout record, read only through the helpers below. */
+export type JsonObject = Record<string, unknown>;
 
 interface PendingCall {
   command: string;
@@ -70,49 +72,68 @@ interface ConvertState {
   turn: number;
 }
 
-function asObject(value: unknown): JsonObject | null {
+/** Narrow an unknown value to a plain object, or null. */
+export function asJsonObject(value: unknown): JsonObject | null {
   if (value === null || typeof value !== "object") return null;
   if (Array.isArray(value)) return null;
   return value as JsonObject;
 }
 
-function readString(source: JsonObject | null, key: string): string | null {
+/** Read a string field without trusting its type. */
+export function readStringField(source: JsonObject | null, key: string): string | null {
   const value = source?.[key];
   return typeof value === "string" ? value : null;
 }
 
-function parseLine(line: string): JsonObject | null {
+/** Parse one rollout line, or null when it is not a JSON object. */
+export function parseCodexRecord(line: string): JsonObject | null {
   try {
-    return asObject(JSON.parse(line));
+    return asJsonObject(JSON.parse(line));
   } catch {
     return null;
   }
 }
 
 function payloadOf(record: JsonObject): JsonObject | null {
-  return asObject(record.payload);
+  return asJsonObject(record.payload);
+}
+
+/** True when this record either marks or survives a compaction. */
+export function isCompactionRecord(record: JsonObject): boolean {
+  const type = readStringField(record, "type");
+  if (type === RECORD_TYPE_COMPACTED) return true;
+  if (type !== RECORD_TYPE_RESPONSE_ITEM) return false;
+  return readStringField(payloadOf(record), "type") === PAYLOAD_TYPE_COMPACTION;
+}
+
+/** The input size of the last request, or null when the record does not say. */
+export function readContextTokens(record: JsonObject): number | null {
+  if (readStringField(record, "type") !== RECORD_TYPE_EVENT_MESSAGE) return null;
+  const payload = payloadOf(record);
+  if (readStringField(payload, "type") !== PAYLOAD_TYPE_TOKEN_COUNT) return null;
+  const info = asJsonObject(payload?.info);
+  if (info === null) return null;
+  const usage = asJsonObject(info.last_token_usage);
+  const tokens = usage?.input_tokens;
+  if (typeof tokens !== "number") return null;
+  if (!Number.isSafeInteger(tokens) || tokens <= 0) return null;
+  return tokens;
 }
 
 function readTimestamp(record: JsonObject): string | null {
-  return readString(record, "timestamp");
+  return readStringField(record, "timestamp");
 }
 
 function isTaskStarted(record: JsonObject, payload: JsonObject | null): boolean {
   if (record.type !== RECORD_TYPE_EVENT_MESSAGE) return false;
-  return readString(payload, "type") === PAYLOAD_TYPE_TASK_STARTED;
-}
-
-function isCompaction(record: JsonObject, payload: JsonObject | null): boolean {
-  if (record.type === RECORD_TYPE_COMPACTED) return true;
-  if (record.type !== RECORD_TYPE_RESPONSE_ITEM) return false;
-  return readString(payload, "type") === PAYLOAD_TYPE_COMPACTION;
+  return readStringField(payload, "type") === PAYLOAD_TYPE_TASK_STARTED;
 }
 
 /** Text used only to classify an unparseable call, never to run anything. */
 function describeCallSource(payload: JsonObject): string {
-  const input = readString(payload, "input");
+  const input = readStringField(payload, "input");
   if (input !== null) return input;
-  const callArguments = readString(payload, "arguments");
+  const callArguments = readStringField(payload, "arguments");
   if (callArguments !== null) return callArguments;
   return "";
 }
@@ -137,18 +158,18 @@ function readCommandLiteral(input: string): string | null {
 
 /** Read the command of a call, or null when it is not statically known. */
 function readCallCommand(payload: JsonObject): string | null {
-  if (readString(payload, "type") === FUNCTION_CALL) {
-    if (readString(payload, "name") !== EXEC_COMMAND_FUNCTION_NAME) return null;
-    const callArguments = readString(payload, "arguments");
+  if (readStringField(payload, "type") === FUNCTION_CALL) {
+    if (readStringField(payload, "name") !== EXEC_COMMAND_FUNCTION_NAME) return null;
+    const callArguments = readStringField(payload, "arguments");
     if (callArguments === null) return null;
     try {
-      const parsed = asObject(JSON.parse(callArguments));
-      return readString(parsed, "cmd");
+      const parsed = asJsonObject(JSON.parse(callArguments));
+      return readStringField(parsed, "cmd");
     } catch {
       return null;
     }
   }
-  const input = readString(payload, "input");
+  const input = readStringField(payload, "input");
   if (input === null) return null;
   return readCommandLiteral(input);
 }
@@ -160,9 +181,9 @@ function readOutputText(output: unknown): string | null {
   if (!Array.isArray(output)) return null;
   const parts: string[] = [];
   for (const part of output) {
-    const parsed = asObject(part);
-    const type = readString(parsed, "type");
-    const text = readString(parsed, "text");
+    const parsed = asJsonObject(part);
+    const type = readStringField(parsed, "type");
+    const text = readStringField(parsed, "text");
     if (type === null || text === null) continue;
     if (!TEXT_PART_TYPES.has(type)) continue;
     parts.push(text);
@@ -197,9 +218,9 @@ function userMessageLine(record: JsonObject, payload: JsonObject): string | null
   if (!Array.isArray(content)) return null;
   const parts: JsonObject[] = [];
   for (const part of content) {
-    const parsed = asObject(part);
-    const type = readString(parsed, "type");
-    const text = readString(parsed, "text");
+    const parsed = asJsonObject(part);
+    const type = readStringField(parsed, "type");
+    const text = readStringField(parsed, "text");
     if (type !== "input_text" || text === null) continue;
     parts.push({ type: "text", text });
   }
@@ -226,7 +247,7 @@ function rememberCall(state: ConvertState, payload: JsonObject, callId: string, 
   }
   const source = describeCallSource(payload);
   const talksToRaft = RAFT_COMMAND_PATTERN.test(source);
-  const input = readString(payload, "input");
+  const input = readStringField(payload, "input");
   const hidesShellCall = input !== null && SHELL_CALL_PATTERN.test(input);
   if (talksToRaft || hidesShellCall) {
     state.unknownRaftCalls.set(callId, state.turn);
@@ -268,8 +289,8 @@ function pairUnknownResult(state: ConvertState, record: JsonObject, callId: stri
 }
 
 function handleResponseItem(state: ConvertState, record: JsonObject, payload: JsonObject): void {
-  const type = readString(payload, "type");
-  const callId = readString(payload, "call_id");
+  const type = readStringField(payload, "type");
+  const callId = readStringField(payload, "call_id");
   if (callId === null) return;
   if (TOOL_CALL_TYPES.has(type ?? "")) {
     rememberCall(state, payload, callId, record);
@@ -287,13 +308,13 @@ function handleRecord(state: ConvertState, record: JsonObject): void {
     state.turn += 1;
     return;
   }
-  if (isCompaction(record, payload)) {
+  if (isCompactionRecord(record)) {
     resetForCompaction(state);
     return;
   }
   if (record.type !== RECORD_TYPE_RESPONSE_ITEM) return;
   if (payload === null) return;
-  if (readString(payload, "type") === PAYLOAD_TYPE_MESSAGE && readString(payload, "role") === ROLE_USER) {
+  if (readStringField(payload, "type") === PAYLOAD_TYPE_MESSAGE && readStringField(payload, "role") === ROLE_USER) {
     const line = userMessageLine(record, payload);
     if (line !== null) state.lines.push(line);
     return;
@@ -332,7 +353,7 @@ export function codexWakeLines(lines: string[]): string[] {
     turn: 0,
   };
   for (const line of lines) {
-    const record = parseLine(line);
+    const record = parseCodexRecord(line);
     if (record === null) continue;
     handleRecord(state, record);
   }
