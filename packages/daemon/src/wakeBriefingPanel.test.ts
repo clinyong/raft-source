@@ -173,6 +173,30 @@ test("recent messages harvest tool results, wake inputs, and sends, deduped by i
   assert.deepEqual(messages.filter((m) => m.msgId).map((m) => m.msgId), ["aaaa1111", "bbbb2222"]);
 });
 
+test("only a message-check result feeds recent messages; other output that quotes a header does not", async () => {
+  const listing = "[target=#proj-x:abcd1234 msg=cccc3333 time=2026-09-01T01:10Z] @carol: ready";
+  const file = writeTranscript([
+    record("assistant", [toolUse("t1", "Bash", { command: "rg -n 'target=' notes.md" })]),
+    record("user", [toolResult("t1", listing)]),
+    record("assistant", [toolUse("t2", "Bash", { command: "raft message check --after 1234" })]),
+    record("user", [toolResult("t2", listing)]),
+  ]);
+  const messages = await collectRecentMessages(file, 15);
+  assert.deepEqual(messages.map((m) => m.msgId), ["cccc3333"]);
+});
+
+test("a Codex message-check call reaches the panel through the transcript converter", async () => {
+  const item = (payload: unknown) => JSON.stringify({ timestamp: "2026-09-01T01:00:00.000Z", type: "response_item", payload });
+  const command = 'const r = await tools.exec_command({cmd:"raft message check --after 77"}); text(r.output);';
+  const listing = "[target=#proj-x:abcd1234 msg=dddd4444 time=2026-09-01T01:12Z] @dave: done";
+  const file = writeTranscript([
+    item({ type: "custom_tool_call", call_id: "c1", input: command }),
+    item({ type: "custom_tool_call_output", call_id: "c1", output: [{ type: "text", text: listing }] }),
+  ]);
+  const messages = await collectRecentMessages(file, 15, undefined, true);
+  assert.deepEqual(messages.map((m) => m.msgId), ["dddd4444"]);
+});
+
 test("panel renders the recent-messages section and 0 disables it", async () => {
   const lines = [
     record("assistant", [toolUse("t1", "Bash", { command: "raft message check" })]),
