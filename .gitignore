@@ -42,3 +42,6 @@ scripts/app-name-ratchet-baseline.txt.mutating
 
 # vitest coverage reports (e.g. packages/sync-core test:coverage)
 coverage/
+
+# Local native build output (not a release artifact)
+packages/computer/dist-native/
