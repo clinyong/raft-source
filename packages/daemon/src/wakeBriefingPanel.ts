@@ -1,3 +1,4 @@
+import { codexWakeLines } from "./codexWakeTranscript";
 import { open, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { AxSurfaceText } from "@botiverse/raft-shared";
@@ -139,9 +140,12 @@ async function readTranscriptTailLines(
 export async function parseTranscriptActions(
   transcriptPath: string,
   tailBytes: number = TRANSCRIPT_TAIL_BYTES,
+  codex = false,
 ): Promise<TranscriptAction[]> {
-  const lines = await readTranscriptTailLines(transcriptPath, tailBytes);
-  if (lines === null) return [];
+  const rawLines = await readTranscriptTailLines(transcriptPath, tailBytes);
+  if (rawLines === null) return [];
+  const lines = codex ? codexWakeLines(rawLines) : rawLines;
+  if (codex && lines.includes('{"type":"codex_unrecoverable_tool"}')) return [];
 
   const calls = new Map<string, { tool: string; input: Record<string, unknown>; ts: string | null }>();
   const results = new Map<string, { text: string; isError: boolean }>();
@@ -345,9 +349,12 @@ export async function collectRecentMessages(
   transcriptPath: string,
   max: number,
   tailBytes: number = MESSAGE_SCAN_TAIL_BYTES,
+  codex = false,
 ): Promise<PanelMessage[]> {
-  const lines = await readTranscriptTailLines(transcriptPath, tailBytes);
-  if (lines === null) return [];
+  const rawLines = await readTranscriptTailLines(transcriptPath, tailBytes);
+  if (rawLines === null) return [];
+  const lines = codex ? codexWakeLines(rawLines) : rawLines;
+  if (codex && lines.includes('{"type":"codex_unrecoverable_tool"}')) return [];
 
   // Send attempts pair with their tool results: a guard-blocked attempt holds
   // the body, the follow-up `--send-draft` confirms delivery. Only confirmed
@@ -671,14 +678,17 @@ export async function buildConstructedPanel(args: {
   budgetTokens?: number;
   /** Max messages in the recent-messages section; 0 disables the section. */
   recentMessagesMax?: number;
+  codex?: boolean;
 }): Promise<AxSurfaceText | null> {
   const budget = args.budgetTokens ?? DEFAULT_PANEL_BUDGET_TOKENS;
-  const actions = await parseTranscriptActions(args.transcriptPath);
+  const actions = await parseTranscriptActions(args.transcriptPath, TRANSCRIPT_TAIL_BYTES, args.codex);
   if (actions.length < 5) return null;
   const recentMessagesMax = args.recentMessagesMax ?? RECENT_MESSAGES_DEFAULT;
   const messages = recentMessagesMax > 0
-    ? await collectRecentMessages(args.transcriptPath, recentMessagesMax)
+    ? await collectRecentMessages(args.transcriptPath, recentMessagesMax, MESSAGE_SCAN_TAIL_BYTES, args.codex)
     : [];
+
+  if (args.codex && messages.length === 0) return null;
 
   const maxIndex = Math.max(1, ...actions.map((a) => a.i));
   const lastTsMs = [...actions].reverse()
@@ -694,6 +704,7 @@ export async function buildConstructedPanel(args: {
   const ranked = hotObjects(actions)
     .sort((a, b) => b.touches * (0.3 + b.last / maxIndex) - a.touches * (0.3 + a.last / maxIndex))
     .sort((a, b) => Number(isInPlay(b)) - Number(isInPlay(a)));
+  if (args.codex && !ranked.some(isInPlay)) return null;
   const objects: ResolvedPanelObject[] = [];
   for (const object of ranked) {
     const inPlay = isInPlay(object);

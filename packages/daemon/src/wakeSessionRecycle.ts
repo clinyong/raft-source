@@ -70,7 +70,7 @@ export type WakeRecyclePlan =
   | { action: "resume"; reason: string }
   | {
       action: "recycle";
-      reason: "cold_gap_large_context";
+      reason: "cold_gap_large_context" | "large_context";
       priorSessionId: string;
       idleMs: number;
       priorContextTokens: number;
@@ -188,6 +188,50 @@ export async function readClaudeSessionResumeFacts(
   }
 }
 
+/** Read Codex's last request, whose input includes cached tokens. A damaged
+ * tail is unknown, never permission to discard the old session. */
+export async function readCodexSessionResumeFacts(sessionId: string, homeDir = os.homedir()): Promise<SessionResumeFacts> {
+  const empty: SessionResumeFacts = { transcriptPath: null, lastActivityAtMs: null, lastContextTokens: null };
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) return empty;
+  const ref = resolveRuntimeSessionRef("codex", sessionId, homeDir);
+  if (!ref.reachable || !ref.path || !ref.path.endsWith(`-${sessionId}.jsonl`)) return empty;
+  const unknown = { ...empty, transcriptPath: ref.path };
+  try {
+    const info = await stat(ref.path);
+    const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
+    const buffer = Buffer.alloc(info.size - start);
+    const fd = await open(ref.path, "r");
+    try {
+      let n = 0;
+      while (n < buffer.length) {
+        const result = await fd.read(buffer, n, buffer.length - n, start + n);
+        if (!result.bytesRead) return unknown;
+        n += result.bytesRead;
+      }
+    } finally { await fd.close(); }
+    const lines = buffer.toString("utf8").split("\n");
+    if (start > 0) lines.shift();
+    let lastActivityAtMs: number | null = null;
+    let lastContextTokens: number | null = null;
+    for (const line of lines) {
+      if (!line) continue;
+      let record: any;
+      try { record = JSON.parse(line); } catch { return unknown; }
+      if (!record || typeof record !== "object" || Array.isArray(record)) return unknown;
+      if (typeof record.timestamp === "string") {
+        const timestamp = Date.parse(record.timestamp);
+        if (Number.isFinite(timestamp)) lastActivityAtMs = Math.max(lastActivityAtMs ?? 0, timestamp);
+      }
+      if (record.type === "compacted" || (record.type === "response_item" && record.payload?.type === "compaction")) lastContextTokens = null;
+      if (record.type === "event_msg" && record.payload?.type === "token_count" && record.payload.info != null) {
+        const tokens = record.payload.info?.last_token_usage?.input_tokens;
+        lastContextTokens = typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens > 0 ? tokens : null;
+      }
+    }
+    return { transcriptPath: ref.path, lastActivityAtMs, lastContextTokens };
+  } catch { return unknown; }
+}
+
 export interface WakeRecycleDecisionInput {
   config: WakeRecycleConfig;
   runtime: string | undefined;
@@ -238,11 +282,12 @@ export function decideWakeRecycle(input: WakeRecycleDecisionInput): WakeRecycleP
     return { action: "resume", reason: "session_facts_unavailable" };
   }
   const idleMs = input.nowMs - facts.lastActivityAtMs;
-  if (idleMs <= config.minColdGapMs) return { action: "resume", reason: "cache_possibly_warm" };
+  if (idleMs < 0) return { action: "resume", reason: "session_facts_unavailable" };
+  if (input.runtime !== "codex" && idleMs <= config.minColdGapMs) return { action: "resume", reason: "cache_possibly_warm" };
   if (facts.lastContextTokens <= config.minContextTokens) return { action: "resume", reason: "context_below_threshold" };
   return {
     action: "recycle",
-    reason: "cold_gap_large_context",
+    reason: input.runtime === "codex" ? "large_context" : "cold_gap_large_context",
     priorSessionId: input.sessionId,
     idleMs,
     priorContextTokens: facts.lastContextTokens,
@@ -531,7 +576,18 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
       nowMs: args.nowMs ?? Date.now(),
     });
   }
-  const facts = await readRuntimeSessionResumeFacts(args.config.runtime ?? "claude", args.config.sessionId, args.homeDir);
+  const runtime = args.config.runtime ?? "claude";
+  const env = args.config.envVars ?? {};
+  // Explicit per-agent opt-in; the existing cold-idle sweeper stays unchanged.
+  if (runtime === "codex" && parseBooleanFlag(env.RAFT_CODEX_WAKE_RECYCLE) !== true) {
+    return { action: "resume", reason: "codex_opt_in_required" };
+  }
+  if (runtime === "codex") {
+    recycleConfig.minContextTokens = parsePositiveInteger(env.RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS) ?? 150_000;
+  }
+  const facts = runtime === "codex"
+    ? await readCodexSessionResumeFacts(args.config.sessionId, args.homeDir)
+    : await readRuntimeSessionResumeFacts(runtime, args.config.sessionId, args.homeDir);
   const plan = decideWakeRecycle({
     config: recycleConfig,
     runtime: args.config.runtime,
@@ -584,11 +640,13 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
         workspacePath: workspacePath ?? undefined,
         budgetTokens: panelBudget,
         recentMessagesMax,
+        codex: runtime === "codex",
       });
       if (panel) return { ...plan, briefing: composeWakeSections(briefing, panel) };
     } catch (err) {
       logger.warn(`[WakeRecycle] panel construction failed, using bare briefing: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  if (runtime === "codex") return { action: "resume", reason: "codex_panel_unavailable" };
   return plan.briefing === briefing ? plan : { ...plan, briefing };
 }

@@ -9,6 +9,7 @@ import {
   decideWakeRecycle,
   planWakeSessionRecycle,
   readClaudeSessionResumeFacts,
+  readCodexSessionResumeFacts,
   resolveWakeRecycleConfig,
   selectColdIdleRecycleStops,
   type ColdIdleRuntimeView,
@@ -290,4 +291,57 @@ test("planWakeSessionRecycle recycles end to end from a real transcript tail", a
     processEnv: {},
   });
   assert.equal(disabledPlan.action, "resume");
+});
+
+test("Codex wake recycling requires explicit opt-in and valid latest usage", async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "codex-wake-"));
+  const dir = path.join(home, ".codex", "sessions", "2026", "11", "05");
+  mkdirSync(dir, { recursive: true });
+  const sessionId = "01a1a713-1184-7b72-b26e-99967b550fb5";
+  const file = path.join(dir, `rollout-2026-11-05T00-00-07-${sessionId}.jsonl`);
+  const record = (input: unknown) => JSON.stringify({ timestamp: "2026-11-05T00:00:00Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: input, cached_input_tokens: 140000 } } } }) + "\n";
+  const config = { runtime: "codex", sessionId, constructedWakeContext: true, envVars: {} } as unknown as AgentConfig;
+  const run = (envVars: Record<string, string>) => planWakeSessionRecycle({ config: { ...config, envVars }, hasResumePrompt: false, homeDir: home, nowMs: Date.parse("2026-11-05T00:01:00Z"), processEnv: {} });
+  writeFileSync(file, record(150001));
+  assert.equal((await run({})).action, "resume");
+  const codexFacts = await readCodexSessionResumeFacts(sessionId, home);
+  assert.equal(codexFacts.lastContextTokens, 150001);
+  assert.equal(decideWakeRecycle(decisionInput({ runtime: "codex", facts: codexFacts, config: enabledConfig({ minContextTokens: 150000 }), nowMs: Date.parse("2026-11-05T00:01:00Z") })).action, "recycle");
+  assert.deepEqual(await run({ RAFT_CODEX_WAKE_RECYCLE: "1" }), { action: "resume", reason: "codex_panel_unavailable" });
+  assert.equal((await run({ RAFT_CODEX_WAKE_RECYCLE: "1", RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS: "160000" })).action, "resume");
+  writeFileSync(file, record(150000));
+  assert.equal((await run({ RAFT_CODEX_WAKE_RECYCLE: "1" })).action, "resume");
+  writeFileSync(file, record(null));
+  assert.equal((await run({ RAFT_CODEX_WAKE_RECYCLE: "1" })).action, "resume");
+  writeFileSync(file, record(200000) + "{broken\n");
+  assert.equal((await run({ RAFT_CODEX_WAKE_RECYCLE: "1" })).action, "resume");
+});
+
+test("Codex isolated wake carries recent message and file state, or resumes if either is missing", async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "codex-wake-panel-"));
+  const dir = path.join(home, ".codex", "sessions", "2026", "11", "05");
+  const workspace = path.join(home, "workspace");
+  mkdirSync(dir, { recursive: true }); mkdirSync(workspace, { recursive: true });
+  writeFileSync(path.join(workspace, "work.md"), "Current objective: finish the test.\n");
+  const id = "01a1a713-1184-7b72-b26e-99967b550fb5";
+  const file = path.join(dir, `rollout-2026-11-05T00-00-07-${id}.jsonl`);
+  const timestamp = "2026-11-05T00:00:00Z";
+  const item = (payload: unknown) => JSON.stringify({ timestamp, type: "response_item", payload });
+  const actions = Array.from({ length: 5 }, (_, n) => [
+    item({ type: "custom_tool_call", call_id: `c${n}`, input: `const r = await tools.exec_command({cmd:"cat work.md"}); text(r.output);` }),
+    item({ type: "custom_tool_call_output", call_id: `c${n}`, output: [{ type: "text", text: "Current objective: finish the test." }] }),
+  ]).flat();
+  const message = item({ type: "message", role: "user", content: [{ type: "input_text", text: "[target=#test msg=12345678 time=2026-11-05 00:00:00Z type=human] @user: finish the test" }] });
+  const usage = JSON.stringify({ timestamp, type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 200000 } } } });
+  const config = { runtime: "codex", sessionId: id, constructedWakeContext: true, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1" }, runtimeContext: { workspacePath: workspace } } as unknown as AgentConfig;
+  const run = () => planWakeSessionRecycle({ config, hasResumePrompt: false, homeDir: home, nowMs: Date.parse("2026-11-05T00:01:00Z"), processEnv: {} });
+  writeFileSync(file, [message, ...actions, usage].join("\n") + "\n");
+  const plan = await run();
+  assert.equal(plan.action, "recycle");
+  if (plan.action === "recycle") {
+    assert.match(String(plan.briefing), /finish the test/);
+    assert.match(String(plan.briefing), /work\.md/);
+  }
+  writeFileSync(file, [...actions, usage].join("\n") + "\n");
+  assert.equal((await run()).action, "resume");
 });

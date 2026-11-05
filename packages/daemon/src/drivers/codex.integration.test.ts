@@ -127,7 +127,7 @@ interface CodexHarness {
 
 async function withCodexAppServer(
   cb: (harness: CodexHarness) => Promise<void>,
-  opts: { cwd?: string } = {},
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
 ): Promise<void> {
   if (!CODEX_BIN) throw new Error("codex binary not found (guard should have skipped)");
 
@@ -135,7 +135,7 @@ async function withCodexAppServer(
   const proc = spawn(CODEX_BIN, ["app-server", "--listen", "stdio://"], {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, NO_COLOR: "1" },
+    env: { ...(opts.env ?? process.env), NO_COLOR: "1" },
   });
 
   const inbox: JsonRpcMessage[] = [];
@@ -455,4 +455,56 @@ test("codex integration test guard state (always runs; reports skip reason if an
   } else {
     assert.ok(CODEX_BIN && HAS_AUTH && OPT_IN, "all guards satisfied; integration tests will run");
   }
+});
+
+integrationTest("codex integration: reconstructed briefing reaches a fresh live thread", { timeout: 60_000 }, async () => {
+  // This probes the real Codex app-server and model with entirely synthetic
+  // prior context. It does not claim to exercise a running Raft daemon.
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync, copyFileSync, chmodSync } = await import("node:fs");
+  const { planWakeSessionRecycle } = await import("../wakeSessionRecycle");
+  const root = mkdtempSync(path.join(os.tmpdir(), "raft-codex-live-"));
+  const workspace = path.join(root, "work");
+  const sessionDir = path.join(root, ".codex", "sessions", "2026", "11", "05");
+  const stubBin = path.join(root, "bin");
+  mkdirSync(workspace, { recursive: true }); mkdirSync(sessionDir, { recursive: true }); mkdirSync(stubBin);
+  const authCopy = path.join(root, ".codex", "auth.json");
+  copyFileSync(path.join(os.homedir(), ".codex", "auth.json"), authCopy); chmodSync(authCopy, 0o600);
+  writeFileSync(path.join(stubBin, "raft"), "#!/bin/sh\necho isolated-stub >&2\nexit 1\n", { mode: 0o700 });
+  const previousId = "01a1a713-1184-7b72-b26e-99967b550fb5";
+  const timestamp = "2026-11-05T00:00:00Z";
+  const record = (payload: unknown) => JSON.stringify({ timestamp, type: "response_item", payload });
+  const marker = "violet-koala-2846";
+  writeFileSync(path.join(workspace, "work.md"), `Task marker: ${marker}\n`);
+  const events = Array.from({ length: 5 }, (_, i) => [
+    record({ type: "custom_tool_call", call_id: `call-${i}`, input: 'const r = await tools.exec_command({cmd:"cat work.md"}); text(r.output);' }),
+    record({ type: "custom_tool_call_output", call_id: `call-${i}`, output: [{ type: "input_text", text: `Task marker: ${marker}` }] }),
+  ]).flat();
+  const user = record({ type: "message", role: "user", content: [{ type: "input_text", text: `[target=#test msg=12345678 time=2026-11-05 00:00:00Z type=human] @user: Remember the task marker ${marker}.` }] });
+  const usage = JSON.stringify({ timestamp, type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 200000 } } } });
+  writeFileSync(path.join(sessionDir, `rollout-2026-11-05T00-00-07-${previousId}.jsonl`), [user, ...events, usage].join("\n") + "\n");
+  try {
+    const config = { runtime: "codex", sessionId: previousId, constructedWakeContext: true, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1" }, runtimeContext: { workspacePath: workspace } } as any;
+    const plan = await planWakeSessionRecycle({ config, hasResumePrompt: false, homeDir: root, nowMs: Date.parse("2026-11-05T00:01:00Z"), processEnv: {} });
+    assert.equal(plan.action, "recycle");
+    if (plan.action !== "recycle") return;
+    await withCodexAppServer(async (h) => {
+      const init = h.send("initialize", { clientInfo: { name: "raft-isolated-wake-probe", version: "0.0.1" }, capabilities: {} });
+      const initResponse = await h.recvUntil((m) => m.id === init);
+      assert.ok(initResponse.result);
+      h.notify("initialized", {});
+      const start = h.send("thread/start", { cwd: workspace, model: "gpt-6.1-terra", approvalPolicy: "never", sandbox: "read-only", ephemeral: true });
+      const started = await h.recvUntil((m) => m.id === start);
+      assert.ok(started.result, "thread/start must succeed");
+      const id = (started.result as any)?.thread?.id;
+      assert.ok(typeof id === "string" && id !== previousId);
+      h.send("turn/start", { threadId: id, input: [{ type: "text", text: `${String(plan.briefing)}\nWhat is the task marker? Do not use tools or perform any actions. Reply with the marker only.` }] });
+      let answer = "";
+      await h.recvUntil((m) => {
+        if (m.method === "item/completed" && m.params?.item?.type === "agentMessage") answer += String(m.params.item.text ?? "");
+        return m.method === "turn/completed";
+      }, 45_000);
+      assert.ok(answer.includes(marker), "fresh live thread must recover the synthetic task marker");
+    }, { cwd: workspace, env: { HOME: root, CODEX_HOME: path.join(root, ".codex"), TMPDIR: root,
+      PATH: `${stubBin}:/usr/bin:/bin:/usr/sbin:/sbin`, LANG: "en_US.UTF-8" } });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
