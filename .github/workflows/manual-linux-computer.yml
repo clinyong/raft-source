@@ -26,7 +26,10 @@ jobs:
       - name: Verify and checksum
         working-directory: packages/computer/dist-native
         run: |
-          ./raft-computer-linux-x64 --version
+          expected="$(node -p 'require("../package.json").version')"
+          actual="$(./raft-computer-linux-x64 --version)"
+          test "$actual" = "$expected"
+          printf 'Verified Computer version: %s\n' "$actual"
           sha256sum raft-computer-linux-x64 photon_rs_bg.wasm > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
