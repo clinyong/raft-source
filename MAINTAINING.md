@@ -70,6 +70,11 @@ setting is the only thing that keeps it from closing our pull requests.
   approval from the deployment owner, with a named time window, a backup of
   the running binary and written rollback steps.
 - Keep the previous binary until the new one has run long enough to be accepted.
+- A fork binary copied into a running container lives in that container's
+  writable layer, not in the image. Recreating the container silently brings
+  the image's own binary back. After any recreate, put the fork binary back and
+  check the version it reports before assuming the Computer runs the fork
+  build.
 
 ## Generated files
 
