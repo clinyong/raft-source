@@ -40,6 +40,15 @@ const DEFAULT_MIN_COLD_GAP_MS = 60 * 60_000;
  * sessions their continuity while capturing ~98.6% of the cold rewrite. */
 const DEFAULT_MIN_CONTEXT_TOKENS = 128_000;
 
+/** Codex reports the input size of its last request, not a per-session context
+ * estimate, so the Codex path uses a higher bar than the Claude one. */
+const CODEX_DEFAULT_MIN_CONTEXT_TOKENS = 150_000;
+
+/** Codex has no prompt-cache TTL we can read. Ten minutes of silence is long
+ * enough that the agent is not visibly mid-conversation, while staying far
+ * below the 1h cold-gap assumption used for Claude. */
+const CODEX_DEFAULT_MIN_IDLE_MS = 10 * 60_000;
+
 /** Bounded tail read of the session transcript; at the fleet's measured
  * ~1.4k tokens of growth per request this spans many turns, which is plenty
  * to find the last assistant usage record. */
@@ -283,7 +292,12 @@ export function decideWakeRecycle(input: WakeRecycleDecisionInput): WakeRecycleP
   }
   const idleMs = input.nowMs - facts.lastActivityAtMs;
   if (idleMs < 0) return { action: "resume", reason: "session_facts_unavailable" };
-  if (input.runtime !== "codex" && idleMs <= config.minColdGapMs) return { action: "resume", reason: "cache_possibly_warm" };
+  if (input.runtime === "codex") {
+    // A warm conversation must not be recycled just because the context is big.
+    if (idleMs < config.minColdGapMs) return { action: "resume", reason: "codex_idle_below_threshold" };
+  } else if (idleMs <= config.minColdGapMs) {
+    return { action: "resume", reason: "cache_possibly_warm" };
+  }
   if (facts.lastContextTokens <= config.minContextTokens) return { action: "resume", reason: "context_below_threshold" };
   return {
     action: "recycle",
@@ -583,7 +597,10 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
     return { action: "resume", reason: "codex_opt_in_required" };
   }
   if (runtime === "codex") {
-    recycleConfig.minContextTokens = parsePositiveInteger(env.RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS) ?? 150_000;
+    recycleConfig.minContextTokens = parsePositiveInteger(env.RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS)
+      ?? CODEX_DEFAULT_MIN_CONTEXT_TOKENS;
+    recycleConfig.minColdGapMs = parsePositiveInteger(env.RAFT_CODEX_WAKE_RECYCLE_MIN_IDLE_MS)
+      ?? CODEX_DEFAULT_MIN_IDLE_MS;
   }
   const facts = runtime === "codex"
     ? await readCodexSessionResumeFacts(args.config.sessionId, args.homeDir)

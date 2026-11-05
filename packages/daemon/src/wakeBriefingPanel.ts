@@ -1,4 +1,4 @@
-import { codexWakeLines } from "./codexWakeTranscript";
+import { UNRECOVERABLE_WAKE_MARKER, codexWakeLines } from "./codexWakeTranscript";
 import { open, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { AxSurfaceText } from "@botiverse/raft-shared";
@@ -145,7 +145,7 @@ export async function parseTranscriptActions(
   const rawLines = await readTranscriptTailLines(transcriptPath, tailBytes);
   if (rawLines === null) return [];
   const lines = codex ? codexWakeLines(rawLines) : rawLines;
-  if (codex && lines.includes('{"type":"codex_unrecoverable_tool"}')) return [];
+  if (codex && lines.includes(UNRECOVERABLE_WAKE_MARKER)) return [];
 
   const calls = new Map<string, { tool: string; input: Record<string, unknown>; ts: string | null }>();
   const results = new Map<string, { text: string; isError: boolean }>();
@@ -354,7 +354,7 @@ export async function collectRecentMessages(
   const rawLines = await readTranscriptTailLines(transcriptPath, tailBytes);
   if (rawLines === null) return [];
   const lines = codex ? codexWakeLines(rawLines) : rawLines;
-  if (codex && lines.includes('{"type":"codex_unrecoverable_tool"}')) return [];
+  if (codex && lines.includes(UNRECOVERABLE_WAKE_MARKER)) return [];
 
   // Send attempts pair with their tool results: a guard-blocked attempt holds
   // the body, the follow-up `--send-draft` confirms delivery. Only confirmed

@@ -293,7 +293,7 @@ test("planWakeSessionRecycle recycles end to end from a real transcript tail", a
   assert.equal(disabledPlan.action, "resume");
 });
 
-test("Codex wake recycling requires explicit opt-in and valid latest usage", async () => {
+test("Codex wake recycling requires explicit opt-in, a large context and enough idle time", async () => {
   const home = mkdtempSync(path.join(os.tmpdir(), "codex-wake-"));
   const dir = path.join(home, ".codex", "sessions", "2026", "11", "05");
   mkdirSync(dir, { recursive: true });
@@ -301,20 +301,38 @@ test("Codex wake recycling requires explicit opt-in and valid latest usage", asy
   const file = path.join(dir, `rollout-2026-11-05T00-00-07-${sessionId}.jsonl`);
   const record = (input: unknown) => JSON.stringify({ timestamp: "2026-11-05T00:00:00Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: input, cached_input_tokens: 140000 } } } }) + "\n";
   const config = { runtime: "codex", sessionId, constructedWakeContext: true, envVars: {} } as unknown as AgentConfig;
-  const run = (envVars: Record<string, string>) => planWakeSessionRecycle({ config: { ...config, envVars }, hasResumePrompt: false, homeDir: home, nowMs: Date.parse("2026-11-05T00:01:00Z"), processEnv: {} });
+  // 30 minutes after the last request, so the default 10-minute idle floor is met.
+  const wakeAt = Date.parse("2026-11-05T00:30:00Z");
+  const run = (envVars: Record<string, string>, nowMs = wakeAt) => planWakeSessionRecycle({ config: { ...config, envVars }, hasResumePrompt: false, homeDir: home, nowMs, processEnv: {} });
   writeFileSync(file, record(150001));
   assert.equal((await run({})).action, "resume");
   const codexFacts = await readCodexSessionResumeFacts(sessionId, home);
   assert.equal(codexFacts.lastContextTokens, 150001);
-  assert.equal(decideWakeRecycle(decisionInput({ runtime: "codex", facts: codexFacts, config: enabledConfig({ minContextTokens: 150000 }), nowMs: Date.parse("2026-11-05T00:01:00Z") })).action, "recycle");
+  const decided = (nowMs: number) => decideWakeRecycle(decisionInput({ runtime: "codex", facts: codexFacts, config: enabledConfig({ minContextTokens: 150000, minColdGapMs: 600_000 }), nowMs }));
+  const large = decided(wakeAt);
+  assert.equal(large.action, "recycle");
+  if (large.action === "recycle") {
+    assert.equal(large.reason, "large_context");
+    assert.equal(large.idleMs, 1_800_000);
+    assert.equal(large.priorContextTokens, 150_001);
+  }
+  assert.deepEqual(decided(Date.parse("2026-11-05T00:05:00Z")), { action: "resume", reason: "codex_idle_below_threshold" });
+  assert.equal(decided(Date.parse("2026-11-05T00:10:00Z")).action, "recycle", "exactly the idle floor still recycles");
   assert.deepEqual(await run({ RAFT_CODEX_WAKE_RECYCLE: "1" }), { action: "resume", reason: "codex_panel_unavailable" });
   assert.equal((await run({ RAFT_CODEX_WAKE_RECYCLE: "1", RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS: "160000" })).action, "resume");
+  // A shorter idle floor is honoured, and the idle gate is what stops a warm wake.
+  const warm = { RAFT_CODEX_WAKE_RECYCLE: "1", RAFT_CODEX_WAKE_RECYCLE_MIN_IDLE_MS: "60000" };
+  const fiveMinutesLater = Date.parse("2026-11-05T00:05:00Z");
+  assert.deepEqual(await run({ RAFT_CODEX_WAKE_RECYCLE: "1" }, fiveMinutesLater), { action: "resume", reason: "codex_idle_below_threshold" });
+  assert.deepEqual(await run(warm, fiveMinutesLater), { action: "resume", reason: "codex_panel_unavailable" });
   writeFileSync(file, record(150000));
   assert.equal((await run({ RAFT_CODEX_WAKE_RECYCLE: "1" })).action, "resume");
   writeFileSync(file, record(null));
   assert.equal((await run({ RAFT_CODEX_WAKE_RECYCLE: "1" })).action, "resume");
   writeFileSync(file, record(200000) + "{broken\n");
   assert.equal((await run({ RAFT_CODEX_WAKE_RECYCLE: "1" })).action, "resume");
+  writeFileSync(file, JSON.stringify({ timestamp: "2026-11-05T00:29:00Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 200000 } } } }) + "\n");
+  assert.deepEqual(await run({ RAFT_CODEX_WAKE_RECYCLE: "1" }), { action: "resume", reason: "codex_idle_below_threshold" }, "a wake right after the last turn never recycles");
 });
 
 test("Codex isolated wake carries recent message and file state, or resumes if either is missing", async () => {
@@ -334,7 +352,7 @@ test("Codex isolated wake carries recent message and file state, or resumes if e
   const message = item({ type: "message", role: "user", content: [{ type: "input_text", text: "[target=#test msg=12345678 time=2026-11-05 00:00:00Z type=human] @user: finish the test" }] });
   const usage = JSON.stringify({ timestamp, type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 200000 } } } });
   const config = { runtime: "codex", sessionId: id, constructedWakeContext: true, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1" }, runtimeContext: { workspacePath: workspace } } as unknown as AgentConfig;
-  const run = () => planWakeSessionRecycle({ config, hasResumePrompt: false, homeDir: home, nowMs: Date.parse("2026-11-05T00:01:00Z"), processEnv: {} });
+  const run = () => planWakeSessionRecycle({ config, hasResumePrompt: false, homeDir: home, nowMs: Date.parse("2026-11-05T00:30:00Z"), processEnv: {} });
   writeFileSync(file, [message, ...actions, usage].join("\n") + "\n");
   const plan = await run();
   assert.equal(plan.action, "recycle");
