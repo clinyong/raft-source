@@ -75,6 +75,14 @@ setting is the only thing that keeps it from closing our pull requests.
   the image's own binary back. After any recreate, put the fork binary back and
   check the version it reports before assuming the Computer runs the fork
   build.
+- Mounting a single file read-only is the sturdier form of that: the container
+  sees the file the mount pointed at when the container started. Publish every
+  build under its own name carrying the commit SHA, point the mount at the new
+  name, and recreate the container. Never overwrite the file a running
+  container has mounted.
+- A Computer binary ships with `photon_rs_bg.wasm`. Mount the wasm as well
+  whenever a build's wasm differs from the image's; when the hashes match, the
+  binary alone is enough.
 
 ## Generated files
 
