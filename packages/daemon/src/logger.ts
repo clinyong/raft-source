@@ -16,7 +16,7 @@ function timestamp(): string {
   return formatUtcTimestamp(new Date());
 }
 
-function format(level: DaemonLogLevel, msg: string): string {
+function format(level: DaemonLogLevel | "DEBUG", msg: string): string {
   return `${timestamp()} [${level}] ${msg}`;
 }
 
@@ -34,6 +34,10 @@ export function subscribeDaemonLogs(listener: Listener): () => void {
 }
 
 export const logger = {
+  /** Diagnostic-only output; excluded from the user-facing log event stream. */
+  debug(msg: string) {
+    console.log(format("DEBUG", msg));
+  },
   info(msg: string) {
     const line = format("INFO", msg);
     console.log(line);

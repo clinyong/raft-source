@@ -173,7 +173,7 @@ test("cold-idle sweep selects only enabled, idle, cold runtimes with readable fa
     "agent-busy:not_idle",
     "agent-warm-memory:recent_event",
     "agent-disabled:disabled",
-    "agent-codex:disabled",
+    "agent-codex:codex_opt_in_required",
     "agent-no-session:no_session",
     "agent-no-transcript:session_facts_unavailable",
   ]);
@@ -418,4 +418,21 @@ test("Codex cold-idle sweep requires both gates, valid facts, and finished tool 
   assert.equal((await run()).length, 0, "the turn has not completed");
   write(start, call, result, usage, complete, "{broken");
   assert.equal((await run()).length, 0, "unreadable records fail closed");
+});
+
+test("observation strategies never stop or recycle even when all work checks pass", async () => {
+  const { createPiIdleRecycleObservation } = await import("./drivers/piIdleRecycleObservation");
+  const snapshot = { sessionId: "current", tokens: 200_000, threshold: 150_000 };
+  const strategy = { ...createPiIdleRecycleObservation(() => snapshot), checkWork: async () => ({ status: "clear" as const }) };
+  const nowMs = Date.now();
+  const config = { runtime: "pi", sessionId: "current", constructedWakeContext: true, envVars: {} } as unknown as AgentConfig;
+  const reasons: string[] = [];
+  const view: ColdIdleRuntimeView = { agentId: "a", config, idle: true, lastEventAtMs: nowMs - 700_000, liveSessionId: "current", idleRecycle: strategy, observation: snapshot };
+  const stops = await selectColdIdleRecycleStops([view, { ...view, agentId: "b", observation: { ...snapshot, sessionId: "old" } }], {
+    nowMs, processEnv: {}, onDecision: (id, _runtime, result, tokens, threshold) => reasons.push(`${id}:${result}:${tokens}:${threshold}`),
+  });
+  assert.deepEqual(stops, []);
+  assert.deepEqual(reasons, ["a:observe_only_would_stop:200000:150000", "b:observation_unavailable:200000:150000"]);
+  assert.equal((await planWakeSessionRecycle({ config, hasResumePrompt: false, idleRecycle: strategy })).action, "resume");
+  assert.equal(decideWakeRecycle({ config: enabledConfig(), runtime: "pi", sessionId: "current", hasResumePrompt: false, hasRuntimeProfileControl: false, facts: facts(), nowMs, idleRecycle: strategy }).action, "resume");
 });

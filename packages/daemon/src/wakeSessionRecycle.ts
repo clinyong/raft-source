@@ -131,6 +131,7 @@ export function decideWakeRecycle(input: WakeRecycleDecisionInput): WakeRecycleP
   if (!config.enabled) return { action: "resume", reason: "disabled" };
   const strategy = input.idleRecycle === undefined ? getIdleRecycleStrategy(input.runtime) : input.idleRecycle;
   if (!strategy) return { action: "resume", reason: "unsupported_runtime" };
+  if (strategy.observeOnly) return { action: "resume", reason: "observe_only" };
   if (!input.sessionId) return { action: "resume", reason: "no_prior_session" };
   if (input.hasResumePrompt) return { action: "resume", reason: "explicit_resume_prompt" };
   if (input.hasRuntimeProfileControl) return { action: "resume", reason: "runtime_profile_control" };
@@ -221,6 +222,7 @@ export interface ColdIdleRuntimeView {
   /** Live session id latched from the runtime (falls back to config.sessionId). */
   liveSessionId: string | null;
   idleRecycle?: IdleRecycleStrategy | null;
+  observation?: { sessionId: string | null; tokens: number | null; threshold: number | null; reason?: string };
   runtimeState?: IdleRecycleState;
 }
 
@@ -263,32 +265,47 @@ export async function selectColdIdleRecycleStops(
     processEnv?: NodeJS.ProcessEnv;
     /** Called once for every view the sweep does not stop, with the gate that held it. */
     onSkip?: (agentId: string, reason: ColdIdleSkipReason) => void;
+    onDecision?: (agentId: string, runtime: string, result: string, tokens: number | null, threshold: number | null) => void;
   } = {},
 ): Promise<ColdIdleRecycleStop[]> {
   const nowMs = opts.nowMs ?? Date.now();
   const out: ColdIdleRecycleStop[] = [];
-  const skip = (agentId: string, reason: ColdIdleSkipReason) => opts.onSkip?.(agentId, reason);
   for (const view of views) {
     const cfg = resolveWakeRecycleConfig(view.config.constructedWakeContext, view.config.envVars, opts.processEnv ?? process.env);
+    let diagnosticTokens: number | null = view.observation?.tokens ?? null;
+    let diagnosticThreshold: number | null = view.observation?.threshold ?? null;
+    const decision = (reason: string) => opts.onDecision?.(view.agentId, view.config.runtime ?? "unknown", reason, diagnosticTokens, diagnosticThreshold);
+    const skip = (agentId: string, reason: ColdIdleSkipReason) => { opts.onSkip?.(agentId, reason); decision(reason); };
     if (!cfg.enabled) { skip(view.agentId, "disabled"); continue; }
     const strategy = view.idleRecycle === undefined ? getIdleRecycleStrategy(view.config.runtime) : view.idleRecycle;
     if (!strategy) { skip(view.agentId, "unsupported_runtime"); continue; }
     const settings = strategy.configure(cfg, view.config.envVars ?? {});
-    if (settings.skip) { skip(view.agentId, "disabled"); continue; }
+    if (settings.skip) { skip(view.agentId, settings.skip); continue; }
     Object.assign(cfg, settings.config);
     if (view.runtimeState && !strategy.stateSafe(view.runtimeState)) { skip(view.agentId, "not_idle"); continue; }
     if (!view.idle) { skip(view.agentId, "not_idle"); continue; }
     const sessionId = view.liveSessionId ?? view.config.sessionId;
     if (!sessionId) { skip(view.agentId, "no_session"); continue; }
     if (nowMs - view.lastEventAtMs <= cfg.minColdGapMs) { skip(view.agentId, "recent_event"); continue; }
-    const facts = await strategy.readFacts(sessionId, opts.homeDir);
+    const observation = view.observation;
+    if (strategy.observeOnly && (!observation || observation.sessionId !== sessionId || observation.reason || observation.tokens === null || observation.threshold === null)) {
+      diagnosticTokens = observation?.tokens ?? null;
+      diagnosticThreshold = observation?.threshold ?? null;
+      skip(view.agentId, observation?.reason ?? "observation_unavailable"); continue;
+    }
+    if (strategy.observeOnly && observation) cfg.minContextTokens = observation.threshold!;
+    const facts = strategy.observeOnly && observation
+      ? { transcriptPath: "observation", lastActivityAtMs: view.lastEventAtMs, lastContextTokens: observation.tokens }
+      : await strategy.readFacts(sessionId, opts.homeDir);
+    diagnosticTokens = facts.lastContextTokens;
+    diagnosticThreshold = cfg.minContextTokens;
     if (facts.lastActivityAtMs === null || facts.lastContextTokens === null) { skip(view.agentId, "session_facts_unavailable"); continue; }
     // A turn-idle runtime can still host live background work (subagents,
     // monitors) whose activity lands in the session's sidecar directory, not
     // the main transcript. Stopping mid-subagent loses that work — count the
     // sidecar's freshest mtime as activity. (Observed live: the sweep killed a
     // runtime whose Explore subagent was mid-flight.)
-    const sidecarActivityAtMs = facts.transcriptPath
+    const sidecarActivityAtMs = facts.transcriptPath && !strategy.observeOnly
       ? await latestMtimeUnder(facts.transcriptPath.replace(/\.jsonl$/, ""))
       : null;
     const lastActive = Math.max(facts.lastActivityAtMs, view.lastEventAtMs, sidecarActivityAtMs ?? 0);
@@ -309,6 +326,8 @@ export async function selectColdIdleRecycleStops(
       skip(view.agentId, work.reason ?? (work.status === "busy" ? "background_tasks_outstanding" : "background_tasks_unknown"));
       continue;
     }
+    if (strategy.observeOnly) { skip(view.agentId, "observe_only_would_stop"); continue; }
+    decision("would_stop");
     out.push({
       agentId: view.agentId,
       sessionId,
@@ -384,6 +403,7 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
   }
   const strategy = args.idleRecycle === undefined ? getIdleRecycleStrategy(args.config.runtime) : args.idleRecycle;
   if (!strategy) return { action: "resume", reason: "unsupported_runtime" };
+  if (strategy.observeOnly) return { action: "resume", reason: "observe_only" };
   const settings = strategy.configure(recycleConfig, args.config.envVars ?? {});
   if (settings.skip) return { action: "resume", reason: settings.skip };
   Object.assign(recycleConfig, settings.config);
