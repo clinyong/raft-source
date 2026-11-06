@@ -1,3 +1,5 @@
+import { readCodexSessionResumeFacts } from "./drivers/codexRecycleTranscript";
+import { createCodexIdleRecycle } from "./drivers/codexIdleRecycle";
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -9,7 +11,6 @@ import {
   decideWakeRecycle,
   planWakeSessionRecycle,
   readClaudeSessionResumeFacts,
-  readCodexSessionResumeFacts,
   resolveWakeRecycleConfig,
   selectColdIdleRecycleStops,
   type ColdIdleRuntimeView,
@@ -172,7 +173,7 @@ test("cold-idle sweep selects only enabled, idle, cold runtimes with readable fa
     "agent-busy:not_idle",
     "agent-warm-memory:recent_event",
     "agent-disabled:disabled",
-    "agent-codex:session_facts_unavailable",
+    "agent-codex:disabled",
     "agent-no-session:no_session",
     "agent-no-transcript:session_facts_unavailable",
   ]);
@@ -306,6 +307,13 @@ test("Codex wake recycling requires explicit opt-in, a large context and enough 
   const run = (envVars: Record<string, string>, nowMs = wakeAt) => planWakeSessionRecycle({ config: { ...config, envVars }, hasResumePrompt: false, homeDir: home, nowMs, processEnv: {} });
   writeFileSync(file, record(150001));
   assert.equal((await run({})).action, "resume");
+  // A rate-limit event can append token_count with null info. It must not
+  // erase the last known usage unless a compaction invalidates it.
+  writeFileSync(file, record(150001) + JSON.stringify({ timestamp: "2026-11-05T00:01:00Z", type: "event_msg", payload: { type: "token_count", info: null } }) + "\n");
+  assert.equal((await readCodexSessionResumeFacts(sessionId, home)).lastContextTokens, 150001);
+  writeFileSync(file, record(150001) + JSON.stringify({ timestamp: "2026-11-05T00:02:00Z", type: "compacted", payload: {} }) + "\n" + JSON.stringify({ timestamp: "2026-11-05T00:03:00Z", type: "event_msg", payload: { type: "token_count", info: null } }) + "\n");
+  assert.equal((await readCodexSessionResumeFacts(sessionId, home)).lastContextTokens, null, "compaction invalidates the prior measurement");
+  writeFileSync(file, record(150001));
   const codexFacts = await readCodexSessionResumeFacts(sessionId, home);
   assert.equal(codexFacts.lastContextTokens, 150001);
   const decided = (nowMs: number) => decideWakeRecycle(decisionInput({ runtime: "codex", facts: codexFacts, config: enabledConfig({ minContextTokens: 150000, minColdGapMs: 600_000 }), nowMs }));
@@ -362,4 +370,52 @@ test("Codex isolated wake carries recent message and file state, or resumes if e
   }
   writeFileSync(file, [...actions, usage].join("\n") + "\n");
   assert.equal((await run()).action, "resume");
+});
+
+test("Codex cold-idle sweep requires both gates, valid facts, and finished tool calls", async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "codex-sweep-"));
+  const dir = path.join(home, ".codex", "sessions", "2026", "11", "05");
+  mkdirSync(dir, { recursive: true });
+  const id = "01a1a713-1184-7b72-b26e-99967b550fb5";
+  const file = path.join(dir, `rollout-2026-11-05T00-00-07-${id}.jsonl`);
+  const nowMs = Date.parse("2026-11-05T01:00:00Z");
+  const timestamp = "2026-11-05T00:00:00Z";
+  const rec = (type: string, payload: unknown) => JSON.stringify({ timestamp, type, payload });
+  const start = rec("event_msg", { type: "task_started" });
+  const call = rec("response_item", { type: "custom_tool_call", call_id: "c1", input: 'tools.exec_command({cmd:"true"})' });
+  const result = rec("response_item", { type: "custom_tool_call_output", call_id: "c1", output: [{ type: "text", text: "ok" }] });
+  const complete = rec("event_msg", { type: "task_complete" });
+  const usage = rec("event_msg", { type: "token_count", info: { last_token_usage: { input_tokens: 150001 } } });
+  const write = (...records: string[]) => writeFileSync(file, records.join("\n") + "\n");
+  const config = { runtime: "codex", sessionId: id, constructedWakeContext: true, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1" } } as unknown as ColdIdleRuntimeView["config"];
+  const view = (overrides: Partial<ColdIdleRuntimeView> = {}): ColdIdleRuntimeView => ({ agentId: "codex", config, idle: true, lastEventAtMs: nowMs - 700_000, liveSessionId: id, ...overrides });
+  const run = (v = view(), live: number | null = 0) => selectColdIdleRecycleStops([{ ...v, idleRecycle: createCodexIdleRecycle(async () => live) }], { nowMs, homeDir: home, processEnv: {} });
+  write(start, call, result, usage, complete);
+  assert.equal((await run()).length, 1, "a normal completed Codex turn is eligible");
+  const throwingStrategy = { ...createCodexIdleRecycle(async () => 0), checkWork: async () => { throw new Error("test failure"); } };
+  assert.equal((await selectColdIdleRecycleStops([{ ...view(), idleRecycle: throwingStrategy }], { nowMs, homeDir: home, processEnv: {} })).length, 0, "a strategy exception must not stop the runtime");
+  assert.equal((await selectColdIdleRecycleStops([{ ...view(), idleRecycle: null }], { nowMs, homeDir: home, processEnv: {} })).length, 0, "a runtime without a strategy must not stop");
+  assert.equal((await run(view(), null)).length, 0, "unknown protocol result fails closed");
+  assert.equal((await run(view(), 1)).length, 0, "a live terminal prevents stopping");
+  assert.equal((await run(view({ idle: false }))).length, 0, "busy or untold inbox work");
+  assert.equal((await run(view({ lastEventAtMs: nowMs - 60_000 }))).length, 0);
+  assert.equal((await run(view({ config: { ...config, constructedWakeContext: false } }))).length, 0);
+  assert.equal((await run(view({ config: { ...config, envVars: {} } }))).length, 0);
+  assert.equal((await run(view({ config: { ...config, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1", RAFT_WAKE_RECYCLE: "0" } } }))).length, 0);
+  assert.equal((await run(view({ config: { ...config, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1", RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS: "160000" } } }))).length, 0);
+  assert.equal((await run(view({ config: { ...config, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1", RAFT_CODEX_WAKE_RECYCLE_MIN_IDLE_MS: "800000" } } }))).length, 0);
+  write(start, call, result, rec("event_msg", { type: "token_count", info: { last_token_usage: { input_tokens: 150000 } } }), complete);
+  assert.equal((await run()).length, 0, "the context must exceed the threshold");
+  write(start, call, usage, complete);
+  assert.equal((await run()).length, 0, "a tool call without a result stays outstanding");
+  write(start, rec("response_item", { type: "custom_tool_call", name: "exec", call_id: "cell", input: "yield_control()" }), rec("response_item", { type: "custom_tool_call_output", call_id: "cell", output: [{ type: "text", text: "Script running with cell ID 123" }] }), usage, complete);
+  assert.equal((await run()).length, 0, "a yielded code-mode cell is outstanding");
+  write(start, rec("response_item", { type: "custom_tool_call", name: "exec", call_id: "cell", input: "yield_control()" }), rec("response_item", { type: "custom_tool_call_output", call_id: "cell", output: [{ type: "text", text: "Script running with cell ID 123" }] }), rec("response_item", { type: "function_call", name: "wait", call_id: "wait", arguments: '{"cell_id":"123"}' }), rec("response_item", { type: "function_call_output", call_id: "wait", output: [{ type: "text", text: "Script completed\n" }] }), usage, complete);
+  assert.equal((await run()).length, 1, "a cell with its matching completion is no longer outstanding");
+  write(start, rec("response_item", { type: "function_call", name: "collaboration.spawn_agent", call_id: "sub", arguments: "{}" }), rec("response_item", { type: "function_call_output", call_id: "sub", output: "started" }), usage, complete);
+  assert.equal((await run()).length, 0, "a spawned agent can outlive its tool result");
+  write(start, call, result, usage);
+  assert.equal((await run()).length, 0, "the turn has not completed");
+  write(start, call, result, usage, complete, "{broken");
+  assert.equal((await run()).length, 0, "unreadable records fail closed");
 });

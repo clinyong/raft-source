@@ -4165,3 +4165,31 @@ test("task #1277 (launch): a codex launch cancelled while the candidate search r
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("Codex background terminal query reads every page and fails closed on errors", async () => {
+  const driver = new CodexDriver();
+  const internals = driver as any;
+  internals.normalizer.adoptThreadId("thread-1");
+  const requests: any[] = [];
+  let replies: unknown[] = [];
+  internals.process = {
+    exitCode: null,
+    stdin: { destroyed: false, write: (chunk: string) => {
+      const request = JSON.parse(chunk);
+      requests.push(request);
+      const response = replies.shift();
+      queueMicrotask(() => driver.parseLine(JSON.stringify({ jsonrpc: "2.0", id: request.id, ...(response === "error" ? { error: { code: -32601, message: "unsupported" } } : { result: response }) })));
+      return true;
+    } },
+  };
+  const terminal = { processId: "1", itemId: "item-1", command: "sleep", cwd: "/tmp" };
+  replies = [{ data: [terminal], nextCursor: "page-2" }, { data: [], nextCursor: null }];
+  assert.equal(await driver.countBackgroundTerminals(), 1);
+  assert.deepEqual(requests.map((r) => r.params.cursor ?? null), [null, "page-2"]);
+  replies = [{ data: [], nextCursor: "cycle" }, { data: [], nextCursor: "cycle" }];
+  assert.equal(await driver.countBackgroundTerminals(), null, "cursor cycles fail closed");
+  replies = [{ data: [{ processId: "1" }], nextCursor: null }];
+  assert.equal(await driver.countBackgroundTerminals(), null, "unknown item shape fails closed");
+  replies = ["error"];
+  assert.equal(await driver.countBackgroundTerminals(), null, "unsupported protocol fails closed");
+});

@@ -1,4 +1,4 @@
-import type { RuntimeDriver } from "./types";
+import type { IdleRecycleStrategy, RuntimeDriver } from "./types";
 import { ClaudeDriver } from "./claude";
 import { CodexDriver } from "./codex";
 import { GrokDriver } from "./grok";
@@ -88,3 +88,8 @@ export function getDriver(runtimeId: string): RuntimeDriver {
 
 // The release smoke loads the kimi SDK the way a launch does (computer native build).
 export { verifyBundledKimiSdk } from "./kimi-sdk";
+
+/** Resolve the optional strategy through the existing driver factory. */
+export function getIdleRecycleStrategy(runtimeId?: string): IdleRecycleStrategy | undefined {
+  try { return getDriver(runtimeId ?? "claude").idleRecycle; } catch { return undefined; }
+}

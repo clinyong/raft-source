@@ -1804,20 +1804,30 @@ export class AgentProcessManager {
    * provides no warmth; stop it so the next wake takes the process-start path,
    * where the at-wake recycle decides between resume and a fresh briefing. */
   private async sweepColdIdleRuntimes(): Promise<void> {
+    const runtimeState = (ap: AgentProcess) => ({
+      sessionId: ap.sessionId ?? ap.config.sessionId ?? null,
+      liveSessionId: ap.sessionId,
+      lastEventAtMs: ap.runtimeProgress.lastEventAt,
+      backgroundTasks: ap.backgroundTasks.size,
+      outstandingToolUses: ap.gatedSteering.outstandingToolUses,
+      compacting: ap.gatedSteering.compacting,
+      reviewing: Boolean(ap.gatedSteering.reviewing),
+    });
     const views = [...this.agents.entries()].map(([agentId, ap]) => ({
-      agentId,
-      config: ap.config,
+      agentId, config: ap.config,
       idle: this.isApmIdle(ap) && !this.hasUntoldInboxWork(ap) && ap.exit.kind === "live",
       lastEventAtMs: ap.runtimeProgress.lastEventAt,
       liveSessionId: ap.sessionId,
       idleRecycle: ap.driver.idleRecycle ?? null,
+      runtimeState: runtimeState(ap),
     }));
-    // RFC 070 observability: one event per sweep with how many processes each
-    // gate held, so "the sweep never stops anything" shows which gate it is.
     const skipped: Record<string, number> = {};
     const stops = await selectColdIdleRecycleStops(views, {
       homeDir: this.runtimeSessionHomeDir,
-      onSkip: (_agentId, reason) => { skipped[reason] = (skipped[reason] ?? 0) + 1; },
+      onSkip: (agentId, reason) => {
+        skipped[reason] = (skipped[reason] ?? 0) + 1;
+        if (this.agents.get(agentId)?.driver.idleRecycle?.logSkip(reason)) logger.info(`[WakeRecycle] agent ${agentId} sweep skipped: ${reason}`);
+      },
     });
     if (views.length > 0) {
       this.recordDaemonEvent("daemon.agent.cold_idle_sweep", {
@@ -1829,6 +1839,9 @@ export class AgentProcessManager {
     for (const stop of stops) {
       const ap = this.agents.get(stop.agentId);
       if (!ap || !this.isApmIdle(ap) || this.hasUntoldInboxWork(ap) || ap.exit.kind !== "live") continue;
+      // Selection reads files asynchronously: a new turn or a replacement
+      // session must invalidate the old decision before stopping anything.
+      if (!ap.driver.idleRecycle?.stateSafe(runtimeState(ap), { sessionId: stop.sessionId, lastEventAtMs: stop.observedLastEventAtMs })) continue;
       logger.info(`[Agent ${stop.agentId}] Stopping cold idle runtime (idle ${Math.round(stop.idleMs / 60_000)}m, ~${Math.round(stop.priorContextTokens / 1000)}k context, session ${stop.sessionId}, ${ap.inbox.length} notified unread); next wake decides resume vs fresh briefing`);
       this.recordDaemonEvent("daemon.agent.cold_idle_stop", {
         agentId: stop.agentId,

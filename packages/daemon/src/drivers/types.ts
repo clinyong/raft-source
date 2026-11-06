@@ -1,4 +1,4 @@
-import type { SessionResumeFacts } from "../wakeSessionRecycle";
+import type { SessionResumeFacts, WakeRecycleConfig } from "../wakeSessionRecycle";
 import type { ChildProcess } from "node:child_process";
 import type { RuntimeCompactionInterruption } from "@botiverse/raft-shared";
 import type { ActiveSpan, AgentConfig, AgentMessage, RuntimeModelSourceOutcome, SubagentLineage, Tracer, AxSurfaceText } from "@botiverse/raft-shared";
@@ -478,10 +478,35 @@ export interface RuntimeSession {
 // ── Runtime Driver ──
 // Minimal interface encapsulating runtime-specific behavior.
 
-/** Runtime-owned idle recycling behavior. Unknown work never permits a stop. */
+export interface IdleRecycleState {
+  sessionId: string | null;
+  liveSessionId: string | null;
+  lastEventAtMs: number;
+  backgroundTasks: number;
+  outstandingToolUses: number;
+  compacting: boolean;
+  reviewing: boolean;
+}
+
 export interface IdleRecycleStrategy {
+  /** Startup and sweep: resolve runtime thresholds; return a skip reason when disabled or uncertain. */
+  configure(config: WakeRecycleConfig, env: Record<string, string>): { config: WakeRecycleConfig; skip?: string };
+  /** Startup and sweep: read session facts; return null fields for facts that cannot be verified. */
   readFacts(sessionId: string, homeDir?: string): Promise<SessionResumeFacts>;
-  checkWork(transcriptPath: string): Promise<"clear" | "busy" | "unknown">;
+  /** Sweep: determine whether background work is clear; return unknown when it cannot be verified. */
+  checkWork(path: string, sessionId: string, state?: IdleRecycleState): Promise<{ status: "clear" | "busy" | "unknown"; reason?: string }>;
+  /** Sweep: check runtime state before selection and stop; return false if safety is uncertain. */
+  stateSafe(state: IdleRecycleState, expected?: { sessionId: string; lastEventAtMs: number }): boolean;
+  /** Sweep: choose whether to log a skip reason; return false if no runtime-specific log is needed. */
+  logSkip(reason: string): boolean;
+  /** Startup: return a reason to resume when the idle gap is insufficient or uncertain, otherwise null. */
+  wakeGapReason(idleMs: number, thresholdMs: number): string | null;
+  /** Startup: label an approved recycle in logs; use a stable, descriptive reason. */
+  wakeReason: string;
+  /** Startup: build the handoff panel; return null when it cannot be built. */
+  buildPanel(args: { transcriptPath: string; workspacePath?: string; budgetTokens?: number; recentMessagesMax?: number }): Promise<AxSurfaceText | null>;
+  /** Startup: return a resume reason when a panel is required, or null if proceeding without one is safe. */
+  panelUnavailableReason: string | null;
 }
 
 export interface RuntimeDriver {
