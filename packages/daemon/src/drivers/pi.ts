@@ -60,6 +60,7 @@ import {
 import { buildRuntimeErrorActivityDiagnostic } from "../runtimeErrorDiagnostics";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { buildPiTokenUsageEvent } from "./piEventNormalizer";
+import { createPiIdleRecycle } from "./piIdleRecycle";
 import { createManagedMcpPiTools } from "./managedMcpTools";
 import { createPiCommandTool } from "./piCommandTool";
 import {
@@ -1883,6 +1884,25 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       : undefined;
   }
 
+  idleRecycleObservation(): { sessionId: string | null; tokens: number | null; threshold: number | null; transcriptPath?: string; reason?: string } {
+    const session = this.session;
+    const sessionId = this.currentSessionId;
+    if (!session || !sessionId || this.didClose || this.ctx.config.runtime !== "pi") return { sessionId, tokens: null, threshold: null, reason: "session_unavailable" };
+    try {
+      const model = session.model;
+      const usage = session.getContextUsage();
+      if (!model || !usage || !Number.isSafeInteger(usage.contextWindow) || usage.contextWindow <= 0) return { sessionId, tokens: null, threshold: null, reason: "window_unavailable" };
+      const reserve = session.settingsManager.getCompactionReserveTokens(model);
+      // Candidate margin, subject to validation from observation data.
+      const threshold = Math.min(150_000, usage.contextWindow - reserve - 32_000);
+      if (!Number.isSafeInteger(reserve) || reserve < 0 || threshold <= 0) return { sessionId, tokens: usage.tokens, threshold: null, reason: "threshold_unavailable" };
+      if (usage.tokens === null || !Number.isFinite(usage.tokens)) return { sessionId, tokens: null, threshold, reason: "context_unavailable" };
+      return { sessionId, tokens: usage.tokens, threshold, transcriptPath: session.sessionFile };
+    } catch {
+      return { sessionId, tokens: null, threshold: null, reason: "observation_failed" };
+    }
+  }
+
   get pid(): undefined {
     return undefined;
   }
@@ -2373,6 +2393,8 @@ export class PiSdkRuntimeSession implements RuntimeSession {
  * `slock` CLI wrapper injected into PATH by prepareCliTransport.
  */
 export class PiDriver implements RuntimeDriver {
+  private activeSession: PiSdkRuntimeSession | null = null;
+  readonly idleRecycle = createPiIdleRecycle(() => this.activeSession?.idleRecycleObservation() ?? { sessionId: null, tokens: null, threshold: null, reason: "session_unavailable" });
   readonly id: string = "pi";
   readonly supportsNativeStandingPrompt = true;
   readonly standingPromptRefreshesOnResume = true;
@@ -2414,9 +2436,10 @@ export class PiDriver implements RuntimeDriver {
 
   createSession(ctx: SpawnContext): RuntimeSession {
     this.sessionId = ctx.config.sessionId || null;
-    return new PiSdkRuntimeSession(ctx, (sessionId) => {
+    this.activeSession = new PiSdkRuntimeSession(ctx, (sessionId) => {
       this.sessionId = sessionId;
     });
+    return this.activeSession;
   }
 
   async spawn(_ctx: SpawnContext): Promise<SpawnResult> {

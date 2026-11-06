@@ -4685,3 +4685,14 @@ test("task #17: Pi tool ends carry the call id, Pi's own duration, and a non-zer
   assert.deepEqual(end({ isError: true, durationMs: 900, result: { structuredContent: { exit_code: 1, output: "" } } }), [{ kind: "tool_output", name: "bash", callId: "call-7", ok: true, exitCode: 1, durationMs: 900 }]);
   assert.deepEqual(end({ isError: true, result: { content: [{ type: "text", text: "Command timed out" }] } }), [{ kind: "tool_output", name: "bash", callId: "call-7", ok: false }]);
 });
+
+test("Pi idle observation uses SDK context and loaded model settings, and fails closed", () => {
+  const snapshot = (overrides: Record<string, unknown> = {}) => PiSdkRuntimeSession.prototype.idleRecycleObservation.call({
+    session: { model: { id: "example", provider: "example" }, getContextUsage: () => ({ tokens: 105_000, contextWindow: 140_000 }), settingsManager: { getCompactionReserveTokens: () => 16_384 } },
+    currentSessionId: "s1", didClose: false, ctx: { config: { runtime: "pi" } }, ...overrides,
+  } as unknown as PiSdkRuntimeSession);
+  assert.deepEqual(snapshot(), { sessionId: "s1", tokens: 105_000, threshold: 91_616, transcriptPath: undefined });
+  assert.equal(snapshot({ didClose: true }).reason, "session_unavailable");
+  assert.equal(snapshot({ session: { model: {}, getContextUsage: () => ({ tokens: null, contextWindow: 140_000 }), settingsManager: { getCompactionReserveTokens: () => 16_384 } } }).reason, "context_unavailable");
+  assert.equal(snapshot({ session: { model: {}, getContextUsage: () => { throw new Error("bad"); } } }).reason, "observation_failed");
+});

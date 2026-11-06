@@ -2,7 +2,7 @@ import { readCodexSessionResumeFacts } from "./drivers/codexRecycleTranscript";
 import { createCodexIdleRecycle } from "./drivers/codexIdleRecycle";
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -173,7 +173,7 @@ test("cold-idle sweep selects only enabled, idle, cold runtimes with readable fa
     "agent-busy:not_idle",
     "agent-warm-memory:recent_event",
     "agent-disabled:disabled",
-    "agent-codex:disabled",
+    "agent-codex:codex_opt_in_required",
     "agent-no-session:no_session",
     "agent-no-transcript:session_facts_unavailable",
   ]);
@@ -418,4 +418,37 @@ test("Codex cold-idle sweep requires both gates, valid facts, and finished tool 
   assert.equal((await run()).length, 0, "the turn has not completed");
   write(start, call, result, usage, complete, "{broken");
   assert.equal((await run()).length, 0, "unreadable records fail closed");
+});
+
+test("Pi strategy leaves an eligible session running and resumes when its handoff is unavailable", async () => {
+  const { createPiIdleRecycle } = await import("./drivers/piIdleRecycle");
+  const nowMs = Date.now();
+  const home = mkdtempSync(path.join(os.tmpdir(), "pi-observe-"));
+  const transcriptPath = path.join(home, "session.jsonl");
+  writeFileSync(transcriptPath, "{}\n");
+  utimesSync(transcriptPath, (nowMs - 700_000) / 1000, (nowMs - 700_000) / 1000);
+  const snapshot = { sessionId: "current", tokens: 200_000, threshold: 150_000, transcriptPath };
+  const strategy = createPiIdleRecycle(() => snapshot);
+  const config = { runtime: "pi", sessionId: "current", constructedWakeContext: true, envVars: {} } as unknown as AgentConfig;
+  const reasons: string[] = [];
+  const view: ColdIdleRuntimeView = { agentId: "a", config, idle: true, lastEventAtMs: nowMs - 700_000, liveSessionId: "current", idleRecycle: strategy };
+  const stops = await selectColdIdleRecycleStops([view, { ...view, agentId: "b", liveSessionId: "old" }], {
+    nowMs, processEnv: {}, onDecision: (id, _runtime, result, tokens, threshold) => reasons.push(`${id}:${result}:${tokens}:${threshold}`),
+  });
+  assert.deepEqual(stops, []);
+  assert.deepEqual(reasons, ["a:pi_background_work_unverified:200000:150000", "b:observation_session_mismatch:null:null"]);
+  assert.deepEqual(await planWakeSessionRecycle({ config, hasResumePrompt: false, idleRecycle: strategy, nowMs, processEnv: {} }), { action: "resume", reason: "pi_panel_unavailable" });
+});
+
+test("Pi observation refuses absent transcripts and sessions replaced during file inspection", async () => {
+  const { createPiIdleRecycle } = await import("./drivers/piIdleRecycle");
+  const home = mkdtempSync(path.join(os.tmpdir(), "pi-observe-swap-"));
+  const transcriptPath = path.join(home, "session.jsonl");
+  writeFileSync(transcriptPath, "{}\n");
+  const sample = { sessionId: "current", tokens: 200_000, threshold: 150_000, transcriptPath };
+  let calls = 0;
+  const replaced = createPiIdleRecycle(() => (++calls === 1 ? sample : { ...sample, sessionId: "new" }));
+  assert.equal((await replaced.readFacts("current")).unavailableReason, "observation_session_mismatch");
+  const missing = createPiIdleRecycle(() => ({ ...sample, transcriptPath: path.join(home, "absent") }));
+  assert.equal((await missing.readFacts("current")).unavailableReason, "observation_transcript_unavailable");
 });

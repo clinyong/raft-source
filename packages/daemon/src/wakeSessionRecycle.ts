@@ -50,6 +50,10 @@ export interface SessionResumeFacts {
   transcriptPath: string | null;
   lastActivityAtMs: number | null;
   lastContextTokens: number | null;
+  /** Optional threshold derived by the strategy from the same session as these facts. */
+  minContextTokens?: number;
+  /** Stable reason when the strategy cannot establish the required facts. */
+  unavailableReason?: string;
 }
 
 export type WakeRecyclePlan =
@@ -263,18 +267,22 @@ export async function selectColdIdleRecycleStops(
     processEnv?: NodeJS.ProcessEnv;
     /** Called once for every view the sweep does not stop, with the gate that held it. */
     onSkip?: (agentId: string, reason: ColdIdleSkipReason) => void;
+    onDecision?: (agentId: string, runtime: string, result: string, tokens: number | null, threshold: number | null) => void;
   } = {},
 ): Promise<ColdIdleRecycleStop[]> {
   const nowMs = opts.nowMs ?? Date.now();
   const out: ColdIdleRecycleStop[] = [];
-  const skip = (agentId: string, reason: ColdIdleSkipReason) => opts.onSkip?.(agentId, reason);
   for (const view of views) {
     const cfg = resolveWakeRecycleConfig(view.config.constructedWakeContext, view.config.envVars, opts.processEnv ?? process.env);
+    let diagnosticTokens: number | null = null;
+    let diagnosticThreshold: number | null = null;
+    const decision = (reason: string) => opts.onDecision?.(view.agentId, view.config.runtime ?? "unknown", reason, diagnosticTokens, diagnosticThreshold);
+    const skip = (agentId: string, reason: ColdIdleSkipReason) => { opts.onSkip?.(agentId, reason); decision(reason); };
     if (!cfg.enabled) { skip(view.agentId, "disabled"); continue; }
     const strategy = view.idleRecycle === undefined ? getIdleRecycleStrategy(view.config.runtime) : view.idleRecycle;
     if (!strategy) { skip(view.agentId, "unsupported_runtime"); continue; }
     const settings = strategy.configure(cfg, view.config.envVars ?? {});
-    if (settings.skip) { skip(view.agentId, "disabled"); continue; }
+    if (settings.skip) { skip(view.agentId, settings.skip); continue; }
     Object.assign(cfg, settings.config);
     if (view.runtimeState && !strategy.stateSafe(view.runtimeState)) { skip(view.agentId, "not_idle"); continue; }
     if (!view.idle) { skip(view.agentId, "not_idle"); continue; }
@@ -282,6 +290,10 @@ export async function selectColdIdleRecycleStops(
     if (!sessionId) { skip(view.agentId, "no_session"); continue; }
     if (nowMs - view.lastEventAtMs <= cfg.minColdGapMs) { skip(view.agentId, "recent_event"); continue; }
     const facts = await strategy.readFacts(sessionId, opts.homeDir);
+    const threshold = facts.minContextTokens ?? cfg.minContextTokens;
+    diagnosticTokens = facts.lastContextTokens;
+    diagnosticThreshold = facts.unavailableReason ? (facts.minContextTokens ?? null) : threshold;
+    if (facts.unavailableReason) { skip(view.agentId, facts.unavailableReason); continue; }
     if (facts.lastActivityAtMs === null || facts.lastContextTokens === null) { skip(view.agentId, "session_facts_unavailable"); continue; }
     // A turn-idle runtime can still host live background work (subagents,
     // monitors) whose activity lands in the session's sidecar directory, not
@@ -293,7 +305,7 @@ export async function selectColdIdleRecycleStops(
       : null;
     const lastActive = Math.max(facts.lastActivityAtMs, view.lastEventAtMs, sidecarActivityAtMs ?? 0);
     if (nowMs - lastActive <= cfg.minColdGapMs) { skip(view.agentId, "recent_activity"); continue; }
-    if (facts.lastContextTokens <= cfg.minContextTokens) { skip(view.agentId, "context_below_threshold"); continue; }
+    if (facts.lastContextTokens <= threshold) { skip(view.agentId, "context_below_threshold"); continue; }
     // Sweep only sessions with DEFINITELY zero outstanding background tasks
     // right now: a runtime holding an armed monitor/background task may have
     // silent pending intent the daemon cannot see; leave it alone.
@@ -309,6 +321,7 @@ export async function selectColdIdleRecycleStops(
       skip(view.agentId, work.reason ?? (work.status === "busy" ? "background_tasks_outstanding" : "background_tasks_unknown"));
       continue;
     }
+    decision("would_stop");
     out.push({
       agentId: view.agentId,
       sessionId,

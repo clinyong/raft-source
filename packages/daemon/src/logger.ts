@@ -1,6 +1,6 @@
 import { formatUtcTimestamp } from "@botiverse/raft-shared";
 
-export type DaemonLogLevel = "INFO" | "WARN" | "ERROR";
+export type DaemonLogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
 export interface DaemonLogEvent {
   level: DaemonLogLevel;
@@ -34,6 +34,10 @@ export function subscribeDaemonLogs(listener: Listener): () => void {
 }
 
 export const logger = {
+  /** Diagnostic-only output; excluded from the user-facing log event stream. */
+  debug(msg: string) {
+    console.log(format("DEBUG", msg));
+  },
   info(msg: string) {
     const line = format("INFO", msg);
     console.log(line);

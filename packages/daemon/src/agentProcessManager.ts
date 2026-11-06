@@ -1824,6 +1824,9 @@ export class AgentProcessManager {
     const skipped: Record<string, number> = {};
     const stops = await selectColdIdleRecycleStops(views, {
       homeDir: this.runtimeSessionHomeDir,
+      onDecision: (agentId, runtime, reason, tokens, threshold) => {
+        logger.debug(`[WakeRecycle] agent=${agentId} runtime=${runtime} decision=${reason} tokens=${tokens ?? "unknown"} threshold=${threshold ?? "unknown"}`);
+      },
       onSkip: (agentId, reason) => {
         skipped[reason] = (skipped[reason] ?? 0) + 1;
         if (this.agents.get(agentId)?.driver.idleRecycle?.logSkip(reason)) logger.info(`[WakeRecycle] agent ${agentId} sweep skipped: ${reason}`);
