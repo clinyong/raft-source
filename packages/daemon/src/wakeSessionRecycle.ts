@@ -135,7 +135,6 @@ export function decideWakeRecycle(input: WakeRecycleDecisionInput): WakeRecycleP
   if (!config.enabled) return { action: "resume", reason: "disabled" };
   const strategy = input.idleRecycle === undefined ? getIdleRecycleStrategy(input.runtime) : input.idleRecycle;
   if (!strategy) return { action: "resume", reason: "unsupported_runtime" };
-  if (strategy.observeOnly) return { action: "resume", reason: "observe_only" };
   if (!input.sessionId) return { action: "resume", reason: "no_prior_session" };
   if (input.hasResumePrompt) return { action: "resume", reason: "explicit_resume_prompt" };
   if (input.hasRuntimeProfileControl) return { action: "resume", reason: "runtime_profile_control" };
@@ -322,7 +321,6 @@ export async function selectColdIdleRecycleStops(
       skip(view.agentId, work.reason ?? (work.status === "busy" ? "background_tasks_outstanding" : "background_tasks_unknown"));
       continue;
     }
-    if (strategy.observeOnly) { skip(view.agentId, "observe_only_would_stop"); continue; }
     decision("would_stop");
     out.push({
       agentId: view.agentId,

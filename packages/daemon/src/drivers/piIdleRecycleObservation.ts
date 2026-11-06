@@ -9,10 +9,9 @@ type PiObservation = {
   reason?: string;
 };
 
-/** Observation only: background work and handoff are deliberately unimplemented. */
+/** Pi cannot stop while background work is unknown, or recycle without a handoff panel. */
 export function createPiIdleRecycleObservation(snapshot: () => PiObservation): IdleRecycleStrategy {
   return {
-    observeOnly: true,
     configure: (config) => ({ config: { ...config, minColdGapMs: 600_000 } }),
     async readFacts(sessionId) {
       const unavailable = (reason: string) => ({ transcriptPath: null, lastActivityAtMs: null, lastContextTokens: null, unavailableReason: reason });
@@ -34,9 +33,9 @@ export function createPiIdleRecycleObservation(snapshot: () => PiObservation): I
     stateSafe: (state) => state.backgroundTasks === 0 && state.outstandingToolUses === 0 && !state.compacting && !state.reviewing,
     checkWork: async () => ({ status: "unknown", reason: "pi_background_work_unverified" }),
     logSkip: () => false,
-    wakeGapReason: () => "observe_only",
-    wakeReason: "observe_only",
+    wakeGapReason: (idleMs, thresholdMs) => idleMs < thresholdMs ? "pi_idle_below_threshold" : null,
+    wakeReason: "large_context",
     buildPanel: async () => null,
-    panelUnavailableReason: "observe_only",
+    panelUnavailableReason: "pi_panel_unavailable",
   };
 }

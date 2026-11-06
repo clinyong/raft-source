@@ -7,6 +7,7 @@ test("daemon log subscribers receive structured events and can unsubscribe", () 
     events.push(event);
   });
 
+  logger.debug("diagnostic");
   logger.info("hello");
   logger.warn("careful");
   unsubscribe();

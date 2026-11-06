@@ -1,6 +1,6 @@
 import { formatUtcTimestamp } from "@botiverse/raft-shared";
 
-export type DaemonLogLevel = "INFO" | "WARN" | "ERROR";
+export type DaemonLogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
 export interface DaemonLogEvent {
   level: DaemonLogLevel;
@@ -16,7 +16,7 @@ function timestamp(): string {
   return formatUtcTimestamp(new Date());
 }
 
-function format(level: DaemonLogLevel | "DEBUG", msg: string): string {
+function format(level: DaemonLogLevel, msg: string): string {
   return `${timestamp()} [${level}] ${msg}`;
 }
 

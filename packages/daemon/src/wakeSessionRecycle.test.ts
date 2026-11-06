@@ -420,7 +420,7 @@ test("Codex cold-idle sweep requires both gates, valid facts, and finished tool 
   assert.equal((await run()).length, 0, "unreadable records fail closed");
 });
 
-test("observation strategies never stop or recycle even when all work checks pass", async () => {
+test("Pi strategy leaves an eligible session running and resumes when its handoff is unavailable", async () => {
   const { createPiIdleRecycleObservation } = await import("./drivers/piIdleRecycleObservation");
   const nowMs = Date.now();
   const home = mkdtempSync(path.join(os.tmpdir(), "pi-observe-"));
@@ -428,7 +428,7 @@ test("observation strategies never stop or recycle even when all work checks pas
   writeFileSync(transcriptPath, "{}\n");
   utimesSync(transcriptPath, (nowMs - 700_000) / 1000, (nowMs - 700_000) / 1000);
   const snapshot = { sessionId: "current", tokens: 200_000, threshold: 150_000, transcriptPath };
-  const strategy = { ...createPiIdleRecycleObservation(() => snapshot), checkWork: async () => ({ status: "clear" as const }) };
+  const strategy = createPiIdleRecycleObservation(() => snapshot);
   const config = { runtime: "pi", sessionId: "current", constructedWakeContext: true, envVars: {} } as unknown as AgentConfig;
   const reasons: string[] = [];
   const view: ColdIdleRuntimeView = { agentId: "a", config, idle: true, lastEventAtMs: nowMs - 700_000, liveSessionId: "current", idleRecycle: strategy };
@@ -436,9 +436,8 @@ test("observation strategies never stop or recycle even when all work checks pas
     nowMs, processEnv: {}, onDecision: (id, _runtime, result, tokens, threshold) => reasons.push(`${id}:${result}:${tokens}:${threshold}`),
   });
   assert.deepEqual(stops, []);
-  assert.deepEqual(reasons, ["a:observe_only_would_stop:200000:150000", "b:observation_session_mismatch:null:null"]);
-  assert.equal((await planWakeSessionRecycle({ config, hasResumePrompt: false, idleRecycle: strategy })).action, "resume");
-  assert.equal(decideWakeRecycle({ config: enabledConfig(), runtime: "pi", sessionId: "current", hasResumePrompt: false, hasRuntimeProfileControl: false, facts: facts(), nowMs, idleRecycle: strategy }).action, "resume");
+  assert.deepEqual(reasons, ["a:pi_background_work_unverified:200000:150000", "b:observation_session_mismatch:null:null"]);
+  assert.deepEqual(await planWakeSessionRecycle({ config, hasResumePrompt: false, idleRecycle: strategy, nowMs, processEnv: {} }), { action: "resume", reason: "pi_panel_unavailable" });
 });
 
 test("Pi observation refuses absent transcripts and sessions replaced during file inspection", async () => {
