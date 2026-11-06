@@ -1819,7 +1819,6 @@ export class AgentProcessManager {
       lastEventAtMs: ap.runtimeProgress.lastEventAt,
       liveSessionId: ap.sessionId,
       idleRecycle: ap.driver.idleRecycle ?? null,
-      observation: ap.driver.idleRecycle?.observeSnapshot?.(),
       runtimeState: runtimeState(ap),
     }));
     const skipped: Record<string, number> = {};

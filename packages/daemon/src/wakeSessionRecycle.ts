@@ -50,6 +50,10 @@ export interface SessionResumeFacts {
   transcriptPath: string | null;
   lastActivityAtMs: number | null;
   lastContextTokens: number | null;
+  /** Optional threshold derived by the strategy from the same session as these facts. */
+  minContextTokens?: number;
+  /** Stable reason when the strategy cannot establish the required facts. */
+  unavailableReason?: string;
 }
 
 export type WakeRecyclePlan =
@@ -222,7 +226,6 @@ export interface ColdIdleRuntimeView {
   /** Live session id latched from the runtime (falls back to config.sessionId). */
   liveSessionId: string | null;
   idleRecycle?: IdleRecycleStrategy | null;
-  observation?: { sessionId: string | null; tokens: number | null; threshold: number | null; reason?: string };
   runtimeState?: IdleRecycleState;
 }
 
@@ -272,8 +275,8 @@ export async function selectColdIdleRecycleStops(
   const out: ColdIdleRecycleStop[] = [];
   for (const view of views) {
     const cfg = resolveWakeRecycleConfig(view.config.constructedWakeContext, view.config.envVars, opts.processEnv ?? process.env);
-    let diagnosticTokens: number | null = view.observation?.tokens ?? null;
-    let diagnosticThreshold: number | null = view.observation?.threshold ?? null;
+    let diagnosticTokens: number | null = null;
+    let diagnosticThreshold: number | null = null;
     const decision = (reason: string) => opts.onDecision?.(view.agentId, view.config.runtime ?? "unknown", reason, diagnosticTokens, diagnosticThreshold);
     const skip = (agentId: string, reason: ColdIdleSkipReason) => { opts.onSkip?.(agentId, reason); decision(reason); };
     if (!cfg.enabled) { skip(view.agentId, "disabled"); continue; }
@@ -287,30 +290,23 @@ export async function selectColdIdleRecycleStops(
     const sessionId = view.liveSessionId ?? view.config.sessionId;
     if (!sessionId) { skip(view.agentId, "no_session"); continue; }
     if (nowMs - view.lastEventAtMs <= cfg.minColdGapMs) { skip(view.agentId, "recent_event"); continue; }
-    const observation = view.observation;
-    if (strategy.observeOnly && (!observation || observation.sessionId !== sessionId || observation.reason || observation.tokens === null || observation.threshold === null)) {
-      diagnosticTokens = observation?.tokens ?? null;
-      diagnosticThreshold = observation?.threshold ?? null;
-      skip(view.agentId, observation?.reason ?? "observation_unavailable"); continue;
-    }
-    if (strategy.observeOnly && observation) cfg.minContextTokens = observation.threshold!;
-    const facts = strategy.observeOnly && observation
-      ? { transcriptPath: "observation", lastActivityAtMs: view.lastEventAtMs, lastContextTokens: observation.tokens }
-      : await strategy.readFacts(sessionId, opts.homeDir);
+    const facts = await strategy.readFacts(sessionId, opts.homeDir);
+    const threshold = facts.minContextTokens ?? cfg.minContextTokens;
     diagnosticTokens = facts.lastContextTokens;
-    diagnosticThreshold = cfg.minContextTokens;
+    diagnosticThreshold = facts.unavailableReason ? (facts.minContextTokens ?? null) : threshold;
+    if (facts.unavailableReason) { skip(view.agentId, facts.unavailableReason); continue; }
     if (facts.lastActivityAtMs === null || facts.lastContextTokens === null) { skip(view.agentId, "session_facts_unavailable"); continue; }
     // A turn-idle runtime can still host live background work (subagents,
     // monitors) whose activity lands in the session's sidecar directory, not
     // the main transcript. Stopping mid-subagent loses that work — count the
     // sidecar's freshest mtime as activity. (Observed live: the sweep killed a
     // runtime whose Explore subagent was mid-flight.)
-    const sidecarActivityAtMs = facts.transcriptPath && !strategy.observeOnly
+    const sidecarActivityAtMs = facts.transcriptPath
       ? await latestMtimeUnder(facts.transcriptPath.replace(/\.jsonl$/, ""))
       : null;
     const lastActive = Math.max(facts.lastActivityAtMs, view.lastEventAtMs, sidecarActivityAtMs ?? 0);
     if (nowMs - lastActive <= cfg.minColdGapMs) { skip(view.agentId, "recent_activity"); continue; }
-    if (facts.lastContextTokens <= cfg.minContextTokens) { skip(view.agentId, "context_below_threshold"); continue; }
+    if (facts.lastContextTokens <= threshold) { skip(view.agentId, "context_below_threshold"); continue; }
     // Sweep only sessions with DEFINITELY zero outstanding background tasks
     // right now: a runtime holding an armed monitor/background task may have
     // silent pending intent the daemon cannot see; leave it alone.
@@ -403,7 +399,6 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
   }
   const strategy = args.idleRecycle === undefined ? getIdleRecycleStrategy(args.config.runtime) : args.idleRecycle;
   if (!strategy) return { action: "resume", reason: "unsupported_runtime" };
-  if (strategy.observeOnly) return { action: "resume", reason: "observe_only" };
   const settings = strategy.configure(recycleConfig, args.config.envVars ?? {});
   if (settings.skip) return { action: "resume", reason: settings.skip };
   Object.assign(recycleConfig, settings.config);

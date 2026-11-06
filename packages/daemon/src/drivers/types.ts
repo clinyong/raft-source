@@ -489,9 +489,8 @@ export interface IdleRecycleState {
 }
 
 export interface IdleRecycleStrategy {
-  /** Observation strategies may never stop or replace a session. */
+  /** If true, a sweep may report eligibility but must not stop, and wake must always resume. */
   readonly observeOnly?: boolean;
-  observeSnapshot?(): { sessionId: string | null; tokens: number | null; threshold: number | null; reason?: string };
   /** Startup and sweep: resolve runtime thresholds; return a skip reason when disabled or uncertain. */
   configure(config: WakeRecycleConfig, env: Record<string, string>): { config: WakeRecycleConfig; skip?: string };
   /** Startup and sweep: read session facts; return null fields for facts that cannot be verified. */

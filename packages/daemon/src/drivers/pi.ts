@@ -1884,7 +1884,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       : undefined;
   }
 
-  idleRecycleObservation(): { sessionId: string | null; tokens: number | null; threshold: number | null; reason?: string } {
+  idleRecycleObservation(): { sessionId: string | null; tokens: number | null; threshold: number | null; transcriptPath?: string; reason?: string } {
     const session = this.session;
     const sessionId = this.currentSessionId;
     if (!session || !sessionId || this.didClose || this.ctx.config.runtime !== "pi") return { sessionId, tokens: null, threshold: null, reason: "session_unavailable" };
@@ -1897,7 +1897,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       const threshold = Math.min(150_000, usage.contextWindow - reserve - 32_000);
       if (!Number.isSafeInteger(reserve) || reserve < 0 || threshold <= 0) return { sessionId, tokens: usage.tokens, threshold: null, reason: "threshold_unavailable" };
       if (usage.tokens === null || !Number.isFinite(usage.tokens)) return { sessionId, tokens: null, threshold, reason: "context_unavailable" };
-      return { sessionId, tokens: usage.tokens, threshold };
+      return { sessionId, tokens: usage.tokens, threshold, transcriptPath: session.sessionFile };
     } catch {
       return { sessionId, tokens: null, threshold: null, reason: "observation_failed" };
     }
