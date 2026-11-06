@@ -421,14 +421,14 @@ test("Codex cold-idle sweep requires both gates, valid facts, and finished tool 
 });
 
 test("Pi strategy leaves an eligible session running and resumes when its handoff is unavailable", async () => {
-  const { createPiIdleRecycleObservation } = await import("./drivers/piIdleRecycleObservation");
+  const { createPiIdleRecycle } = await import("./drivers/piIdleRecycle");
   const nowMs = Date.now();
   const home = mkdtempSync(path.join(os.tmpdir(), "pi-observe-"));
   const transcriptPath = path.join(home, "session.jsonl");
   writeFileSync(transcriptPath, "{}\n");
   utimesSync(transcriptPath, (nowMs - 700_000) / 1000, (nowMs - 700_000) / 1000);
   const snapshot = { sessionId: "current", tokens: 200_000, threshold: 150_000, transcriptPath };
-  const strategy = createPiIdleRecycleObservation(() => snapshot);
+  const strategy = createPiIdleRecycle(() => snapshot);
   const config = { runtime: "pi", sessionId: "current", constructedWakeContext: true, envVars: {} } as unknown as AgentConfig;
   const reasons: string[] = [];
   const view: ColdIdleRuntimeView = { agentId: "a", config, idle: true, lastEventAtMs: nowMs - 700_000, liveSessionId: "current", idleRecycle: strategy };
@@ -441,14 +441,14 @@ test("Pi strategy leaves an eligible session running and resumes when its handof
 });
 
 test("Pi observation refuses absent transcripts and sessions replaced during file inspection", async () => {
-  const { createPiIdleRecycleObservation } = await import("./drivers/piIdleRecycleObservation");
+  const { createPiIdleRecycle } = await import("./drivers/piIdleRecycle");
   const home = mkdtempSync(path.join(os.tmpdir(), "pi-observe-swap-"));
   const transcriptPath = path.join(home, "session.jsonl");
   writeFileSync(transcriptPath, "{}\n");
   const sample = { sessionId: "current", tokens: 200_000, threshold: 150_000, transcriptPath };
   let calls = 0;
-  const replaced = createPiIdleRecycleObservation(() => (++calls === 1 ? sample : { ...sample, sessionId: "new" }));
+  const replaced = createPiIdleRecycle(() => (++calls === 1 ? sample : { ...sample, sessionId: "new" }));
   assert.equal((await replaced.readFacts("current")).unavailableReason, "observation_session_mismatch");
-  const missing = createPiIdleRecycleObservation(() => ({ ...sample, transcriptPath: path.join(home, "absent") }));
+  const missing = createPiIdleRecycle(() => ({ ...sample, transcriptPath: path.join(home, "absent") }));
   assert.equal((await missing.readFacts("current")).unavailableReason, "observation_transcript_unavailable");
 });

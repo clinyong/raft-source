@@ -9,8 +9,11 @@ type PiObservation = {
   reason?: string;
 };
 
-/** Pi cannot stop while background work is unknown, or recycle without a handoff panel. */
-export function createPiIdleRecycleObservation(snapshot: () => PiObservation): IdleRecycleStrategy {
+/**
+ * Pi cannot stop while background work is unknown, or recycle without a handoff panel.
+ * To enable recycling, implement checkWork and buildPanel; the safety tests will then fail by design.
+ */
+export function createPiIdleRecycle(snapshot: () => PiObservation): IdleRecycleStrategy {
   return {
     configure: (config) => ({ config: { ...config, minColdGapMs: 600_000 } }),
     async readFacts(sessionId) {

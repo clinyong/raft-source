@@ -60,7 +60,7 @@ import {
 import { buildRuntimeErrorActivityDiagnostic } from "../runtimeErrorDiagnostics";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { buildPiTokenUsageEvent } from "./piEventNormalizer";
-import { createPiIdleRecycleObservation } from "./piIdleRecycleObservation";
+import { createPiIdleRecycle } from "./piIdleRecycle";
 import { createManagedMcpPiTools } from "./managedMcpTools";
 import { createPiCommandTool } from "./piCommandTool";
 import {
@@ -2394,7 +2394,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
  */
 export class PiDriver implements RuntimeDriver {
   private activeSession: PiSdkRuntimeSession | null = null;
-  readonly idleRecycle = createPiIdleRecycleObservation(() => this.activeSession?.idleRecycleObservation() ?? { sessionId: null, tokens: null, threshold: null, reason: "session_unavailable" });
+  readonly idleRecycle = createPiIdleRecycle(() => this.activeSession?.idleRecycleObservation() ?? { sessionId: null, tokens: null, threshold: null, reason: "session_unavailable" });
   readonly id: string = "pi";
   readonly supportsNativeStandingPrompt = true;
   readonly standingPromptRefreshesOnResume = true;
