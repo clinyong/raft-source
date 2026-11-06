@@ -1,3 +1,4 @@
+import type { SessionResumeFacts } from "../wakeSessionRecycle";
 import type { ChildProcess } from "node:child_process";
 import type { RuntimeCompactionInterruption } from "@botiverse/raft-shared";
 import type { ActiveSpan, AgentConfig, AgentMessage, RuntimeModelSourceOutcome, SubagentLineage, Tracer, AxSurfaceText } from "@botiverse/raft-shared";
@@ -477,7 +478,14 @@ export interface RuntimeSession {
 // ── Runtime Driver ──
 // Minimal interface encapsulating runtime-specific behavior.
 
+/** Runtime-owned idle recycling behavior. Unknown work never permits a stop. */
+export interface IdleRecycleStrategy {
+  readFacts(sessionId: string, homeDir?: string): Promise<SessionResumeFacts>;
+  checkWork(transcriptPath: string): Promise<"clear" | "busy" | "unknown">;
+}
+
 export interface RuntimeDriver {
+  readonly idleRecycle?: IdleRecycleStrategy;
   /** Short ID matching RUNTIMES[].id (e.g. "claude", "codex") */
   readonly id: string;
 

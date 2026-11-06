@@ -1810,6 +1810,7 @@ export class AgentProcessManager {
       idle: this.isApmIdle(ap) && !this.hasUntoldInboxWork(ap) && ap.exit.kind === "live",
       lastEventAtMs: ap.runtimeProgress.lastEventAt,
       liveSessionId: ap.sessionId,
+      idleRecycle: ap.driver.idleRecycle ?? null,
     }));
     // RFC 070 observability: one event per sweep with how many processes each
     // gate held, so "the sweep never stops anything" shows which gate it is.
@@ -4511,7 +4512,7 @@ export class AgentProcessManager {
     });
     // RFC 070 phase 1: at a cold wake with a large prior context, retire the
     // session (drop driver `--resume`) but keep the ladder's resume semantics.
-    const wakeRecycle = await planWakeSessionRecycle({ config: runtimeConfig, hasResumePrompt: Boolean(resumePrompt), homeDir: this.runtimeSessionHomeDir });
+    const wakeRecycle = await planWakeSessionRecycle({ config: runtimeConfig, hasResumePrompt: Boolean(resumePrompt), homeDir: this.runtimeSessionHomeDir, idleRecycle: driver.idleRecycle ?? null });
     if (wakeRecycle.action === "resume") {
       // RFC 070 observability: the recycle's resume reason (flag off, warm
       // cache, small context, unreadable transcript, ...) was a local log line

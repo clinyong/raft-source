@@ -1,3 +1,4 @@
+import { claudeIdleRecycle } from "./claudeIdleRecycle";
 import { spawnRuntimeChild } from "./runtimeChild";
 import type { AgentConfig, AxSurfaceText } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent, RuntimeProbeResult } from "./types";
@@ -32,6 +33,7 @@ export {
 export { buildClaudeProviderIsolationEnv } from "./claudeProviderIsolation";
 
 export class ClaudeDriver implements RuntimeDriver {
+  readonly idleRecycle = claudeIdleRecycle;
   readonly id = "claude";
   readonly lifecycle = {
     kind: "persistent",

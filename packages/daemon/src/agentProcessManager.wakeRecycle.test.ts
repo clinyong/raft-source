@@ -1,3 +1,4 @@
+import { claudeIdleRecycle } from "./drivers/claudeIdleRecycle";
 // RFC 070 phase 1 behavior baseline: at-wake session recycling.
 //
 // Named protected object (invariant): a cold wake (>1h since last transcript
@@ -49,6 +50,7 @@ class FakeChildProcess extends EventEmitter {
 }
 
 class FakeClaudeDriver implements RuntimeDriver {
+  readonly idleRecycle = claudeIdleRecycle;
   readonly acceptsStdinDuringCompaction = true;
   readonly id = "claude";
   readonly lifecycle = { kind: "persistent", stdin: "direct", inFlightWake: "steer" } as const;
