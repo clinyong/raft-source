@@ -484,7 +484,7 @@ integrationTest("codex integration: reconstructed briefing reaches a fresh live 
   writeFileSync(path.join(sessionDir, `rollout-2026-11-05T00-00-07-${previousId}.jsonl`), [user, ...events, usage].join("\n") + "\n");
   try {
     const config = { runtime: "codex", sessionId: previousId, constructedWakeContext: true, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1" }, runtimeContext: { workspacePath: workspace } } as any;
-    const plan = await planWakeSessionRecycle({ config, hasResumePrompt: false, homeDir: root, nowMs: Date.parse("2026-11-05T00:01:00Z"), processEnv: {} });
+    const plan = await planWakeSessionRecycle({ config, hasResumePrompt: false, homeDir: root, nowMs: Date.parse("2026-11-05T00:30:00Z"), processEnv: {} });
     assert.equal(plan.action, "recycle");
     if (plan.action !== "recycle") return;
     await withCodexAppServer(async (h) => {
@@ -506,5 +506,43 @@ integrationTest("codex integration: reconstructed briefing reaches a fresh live 
       assert.ok(answer.includes(marker), "fresh live thread must recover the synthetic task marker");
     }, { cwd: workspace, env: { HOME: root, CODEX_HOME: path.join(root, ".codex"), TMPDIR: root,
       PATH: `${stubBin}:/usr/bin:/bin:/usr/sbin:/sbin`, LANG: "en_US.UTF-8" } });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+integrationTest("codex app-server: background terminal list reports a live command and its exit", { timeout: 90_000 }, async () => {
+  const { mkdtempSync, mkdirSync, copyFileSync, chmodSync, rmSync, writeFileSync } = await import("node:fs");
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-background-probe-"));
+  const home = path.join(root, ".codex");
+  const bin = path.join(root, "bin");
+  mkdirSync(home); mkdirSync(bin);
+  copyFileSync(path.join(os.homedir(), ".codex", "auth.json"), path.join(home, "auth.json"));
+  chmodSync(path.join(home, "auth.json"), 0o600);
+  writeFileSync(path.join(home, "config.toml"), "[features.code_mode]\nenabled = true\n");
+  writeFileSync(path.join(bin, "raft"), "#!/bin/sh\necho isolated-stub >&2\nexit 1\n", { mode: 0o700 });
+  try {
+    await withCodexAppServer(async (h) => {
+      const init = h.send("initialize", { clientInfo: { name: "isolated-background-probe", version: "1" }, capabilities: { experimentalApi: true } });
+      assert.ok((await h.recvUntil((m) => m.id === init)).result);
+      h.notify("initialized", {});
+      const start = h.send("thread/start", { cwd: root, model: "gpt-6.1-terra", approvalPolicy: "never", sandbox: "read-only", ephemeral: true, experimentalRawEvents: true });
+      const thread = (await h.recvUntil((m) => m.id === start)).result?.thread?.id;
+      assert.equal(typeof thread, "string");
+      h.send("turn/start", { threadId: thread, input: [{ type: "text", text: "Use functions.exec to call tools.exec_command with cmd `sleep 25` and yield_time_ms 1000. Once it returns a running session, reply DONE immediately without waiting, polling, or starting any other commands." }] });
+      await h.recvUntil((m) => m.method === "turn/completed", 45_000);
+      const list = async () => {
+        const id = h.send("thread/backgroundTerminals/list", { threadId: thread });
+        const response = await h.recvUntil((m) => m.id === id);
+        assert.ok(!response.error, JSON.stringify(response.error));
+        assert.ok(Array.isArray(response.result?.data));
+        return response.result!.data as Array<{ processId: string; command: string }>;
+      };
+      const active = await list();
+      assert.ok(h.receivedRawItemTypes.has("custom_tool_call"), "the model must use the code-mode call path");
+      assert.ok(active.some((entry) => entry.command.includes("sleep 25")), "the running command must be visible");
+      const deadline = Date.now() + 35_000;
+      let remaining = await list();
+      while (remaining.length && Date.now() < deadline) { await new Promise((resolve) => setTimeout(resolve, 500)); remaining = await list(); }
+      assert.equal(remaining.length, 0, "the naturally completed command must disappear");
+    }, { cwd: root, env: { HOME: root, CODEX_HOME: home, TMPDIR: root, PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`, LANG: "en_US.UTF-8" } });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

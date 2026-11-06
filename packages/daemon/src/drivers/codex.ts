@@ -1,3 +1,4 @@
+import { createCodexIdleRecycle } from "./codexIdleRecycle";
 import { ambientProcessEnv } from "../processEnvPatch";
 import { RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
 import { spawn, execFileSync } from "node:child_process";
@@ -873,6 +874,7 @@ function unsupportedInitializeResultMessage(): string {
 }
 
 export class CodexDriver implements RuntimeDriver {
+  readonly idleRecycle = createCodexIdleRecycle((sessionId) => this.countBackgroundTerminals(sessionId));
   readonly id = "codex";
   readonly lifecycle = {
     kind: "persistent",
@@ -973,6 +975,7 @@ export class CodexDriver implements RuntimeDriver {
   private pendingInitialTurnRequestId: JsonRpcId | null = null;
   private pendingInitialTurnInput: unknown = null;
   private pendingDeliveryRequests = new Map<JsonRpcId, { method: "turn/start" | "turn/steer"; input: unknown; turnId: string | null }>();
+  private pendingBackgroundTerminalRequests = new Map<JsonRpcId, (result: unknown) => void>();
   private initialTurnStarted = false;
   private normalizer = new CodexEventNormalizer();
   private codexHomeRoot: string | null = null;
@@ -1021,6 +1024,8 @@ export class CodexDriver implements RuntimeDriver {
     this.pendingInitialTurnRequestId = null;
     this.pendingInitialTurnInput = null;
     this.pendingDeliveryRequests.clear();
+    for (const resolve of this.pendingBackgroundTerminalRequests.values()) resolve(null);
+    this.pendingBackgroundTerminalRequests.clear();
     this.initialTurnStarted = false;
     this.normalizer.reset();
     this.spawnWorkingDirectory = ctx.workingDirectory;
@@ -1125,6 +1130,14 @@ export class CodexDriver implements RuntimeDriver {
     }
 
     const isResponse = isJsonRpcResponse(message);
+    if (isResponse && message.id !== undefined) {
+      const resolve = this.pendingBackgroundTerminalRequests.get(message.id);
+      if (resolve) {
+        this.pendingBackgroundTerminalRequests.delete(message.id);
+        resolve(hasJsonRpcField(message, "result") ? message.result : null);
+        return events;
+      }
+    }
     if (isResponse && hasJsonRpcField(message, "result")) {
       if (message.id === this.initializeRequestId) {
         if (!isCompatibleInitializeResult(message.result)) {
@@ -1414,6 +1427,44 @@ export class CodexDriver implements RuntimeDriver {
       threadId: this.normalizer.threadId,
       input,
     });
+  }
+
+  /** Experimental app-server API. An incomplete or unrecognised reply is
+   * unknown, not permission to stop the process. */
+  async countBackgroundTerminals(expectedThreadId?: string): Promise<number | null> {
+    const threadId = this.normalizer.threadId;
+    const process = this.process;
+    if (!threadId || (expectedThreadId && threadId !== expectedThreadId) || !process?.stdin || process.stdin.destroyed || process.exitCode !== null) return null;
+    let cursor: string | null = null;
+    let count = 0;
+    const seen = new Set<string>();
+    for (let page = 0; page < 100; page++) {
+      if (this.process !== process || this.normalizer.threadId !== threadId) return null;
+      const result = await new Promise<unknown>((resolve) => {
+        let requestId: JsonRpcId;
+        try {
+          requestId = this.sendRequest("thread/backgroundTerminals/list", { threadId, ...(cursor ? { cursor } : {}) });
+        } catch { resolve(null); return; }
+        const timer = setTimeout(() => { this.pendingBackgroundTerminalRequests.delete(requestId); resolve(null); }, 3_000);
+        timer.unref?.();
+        this.pendingBackgroundTerminalRequests.set(requestId, (value) => { clearTimeout(timer); resolve(value); });
+      });
+      if (this.process !== process || this.normalizer.threadId !== threadId || !result || typeof result !== "object" || Array.isArray(result)) return null;
+      const response = result as Record<string, unknown>;
+      if (!Array.isArray(response.data)) return null;
+      for (const entry of response.data) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+        const item = entry as Record<string, unknown>;
+        if (typeof item.processId !== "string" || !item.processId || typeof item.itemId !== "string" || typeof item.command !== "string" || typeof item.cwd !== "string") return null;
+        count++;
+      }
+      const next = response.nextCursor;
+      if (next == null) return count;
+      if (typeof next !== "string" || !next || seen.has(next)) return null;
+      seen.add(next);
+      cursor = next;
+    }
+    return null;
   }
 
   private sendRequest(method: string, params: Record<string, any>): JsonRpcId {

@@ -1,19 +1,12 @@
-import { open, readdir, stat } from "node:fs/promises";
-import os from "node:os";
+import { readdir, stat } from "node:fs/promises";
 import type { AgentConfig } from "@botiverse/raft-shared";
-import { resolveRuntimeSessionRef } from "./drivers/index";
+import { getIdleRecycleStrategy } from "./drivers/index";
+export { readClaudeSessionResumeFacts, transcriptOutstandingBackgroundTasks } from "./drivers/claudeRecycleTranscript";
+import type { IdleRecycleState, IdleRecycleStrategy } from "./drivers/types";
 import { logger } from "./logger";
 import type { AxSurfaceText } from "@botiverse/raft-shared";
 import { axSurface, composeAxSurfaces } from "./agentRuntimeInput";
 import { WAKE_SECTION_BREAK, buildStartupMemoryBlock, resolveStartupMemoryBlockConfig } from "./startupMemoryBlock";
-import { buildConstructedPanel } from "./wakeBriefingPanel";
-import {
-  isCompactionRecord,
-  parseCodexRecord,
-  readContextTokens,
-  readStringField,
-  type JsonObject,
-} from "./codexWakeTranscript";
 
 /**
  * At-wake session recycling (RFC 070, phase 1).
@@ -47,32 +40,6 @@ const DEFAULT_MIN_COLD_GAP_MS = 60 * 60_000;
  * sessions their continuity while capturing ~98.6% of the cold rewrite. */
 const DEFAULT_MIN_CONTEXT_TOKENS = 128_000;
 
-/** Codex reports the input size of its last request, not a per-session context
- * estimate, so the Codex path uses a higher bar than the Claude one. */
-const CODEX_DEFAULT_MIN_CONTEXT_TOKENS = 150_000;
-
-/** Codex has no prompt-cache TTL we can read. Ten minutes of silence is long
- * enough that the agent is not visibly mid-conversation, while staying far
- * below the 1h cold-gap assumption used for Claude. */
-const CODEX_DEFAULT_MIN_IDLE_MS = 10 * 60_000;
-
-/** Codex names its rollout files after the session id. */
-const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/** Bounded tail read of the session transcript; at the fleet's measured
- * ~1.4k tokens of growth per request this spans many turns, which is plenty
- * to find the last assistant usage record. */
-const TRANSCRIPT_TAIL_BYTES = 512 * 1024;
-
-/** RFC 070 §6.3 enabled set (decided 2026-09-03): recycling considers these
- * runtimes; everything else resumes as unsupported. Within the set, actually
- * firing additionally requires readable resume facts — today only the claude
- * transcript reader exists, so other members resolve to a facts-unavailable
- * resume until the daemon journal (§6.2) supplies their facts. */
-export const WAKE_RECYCLE_ENABLED_RUNTIMES = new Set([
-  "claude", "codex", "pi", "builtin", "grok", "kimi-sdk",
-]);
-
 export interface WakeRecycleConfig {
   enabled: boolean;
   minContextTokens: number;
@@ -89,7 +56,7 @@ export type WakeRecyclePlan =
   | { action: "resume"; reason: string }
   | {
       action: "recycle";
-      reason: "cold_gap_large_context" | "large_context";
+      reason: string;
       priorSessionId: string;
       idleMs: number;
       priorContextTokens: number;
@@ -131,143 +98,6 @@ export function resolveWakeRecycleConfig(
   };
 }
 
-function contextTokensFromUsage(usage: unknown): number | null {
-  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
-  const record = usage as Record<string, unknown>;
-  const finite = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
-  const total = finite(record.input_tokens)
-    + finite(record.cache_read_input_tokens)
-    + finite(record.cache_creation_input_tokens);
-  return total > 0 ? total : null;
-}
-
-/**
- * Read the two facts the recycle decision needs from the tail of the Claude
- * session transcript: when the session last progressed, and how large its
- * context was on the last completed request. Any unreadable/missing fact
- * yields nulls, and the caller falls back to a plain resume.
- *
- * Reading the transcript (rather than tracking live state) makes the decision
- * correct across daemon restarts and costs one bounded file read per wake.
- */
-export async function readClaudeSessionResumeFacts(
-  sessionId: string,
-  homeDir: string = os.homedir(),
-): Promise<SessionResumeFacts> {
-  const ref = resolveRuntimeSessionRef("claude", sessionId, homeDir);
-  if (!ref.reachable || !ref.path) {
-    return { transcriptPath: null, lastActivityAtMs: null, lastContextTokens: null };
-  }
-  try {
-    const info = await stat(ref.path);
-    const readStart = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
-    const toRead = info.size - readStart;
-    const buffer = Buffer.alloc(toRead);
-    const fd = await open(ref.path, "r");
-    try {
-      let bytesRead = 0;
-      while (bytesRead < toRead) {
-        const result = await fd.read(buffer, bytesRead, toRead - bytesRead, readStart + bytesRead);
-        if (result.bytesRead === 0) break;
-        bytesRead += result.bytesRead;
-      }
-    } finally {
-      await fd.close();
-    }
-    const lines = buffer.toString("utf8").split("\n");
-    // A mid-file window starts inside a record; drop the leading fragment.
-    if (readStart > 0) lines.shift();
-
-    let lastActivityAtMs: number | null = null;
-    let lastContextTokens: number | null = null;
-    for (const line of lines) {
-      if (!line) continue;
-      let record: Record<string, unknown>;
-      try {
-        record = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
-      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
-      if (typeof record.timestamp === "string") {
-        const parsed = Date.parse(record.timestamp);
-        if (Number.isFinite(parsed)) lastActivityAtMs = Math.max(lastActivityAtMs ?? 0, parsed);
-      }
-      if (record.type === "assistant") {
-        const message = record.message;
-        if (message && typeof message === "object" && !Array.isArray(message)) {
-          const tokens = contextTokensFromUsage((message as Record<string, unknown>).usage);
-          if (tokens !== null) lastContextTokens = tokens;
-        }
-      }
-    }
-    return { transcriptPath: ref.path, lastActivityAtMs, lastContextTokens };
-  } catch {
-    return { transcriptPath: ref.path, lastActivityAtMs: null, lastContextTokens: null };
-  }
-}
-
-/** Read the tail of a file as text, dropping the first partial line when the
- * read started mid-file. Null means the tail could not be read. */
-async function readTranscriptTailText(filePath: string): Promise<string | null> {
-  const info = await stat(filePath);
-  const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
-  const buffer = Buffer.alloc(info.size - start);
-  const handle = await open(filePath, "r");
-  try {
-    let read = 0;
-    while (read < buffer.length) {
-      const result = await handle.read(buffer, read, buffer.length - read, start + read);
-      if (!result.bytesRead) return null;
-      read += result.bytesRead;
-    }
-  } finally {
-    await handle.close();
-  }
-  const text = buffer.toString("utf8");
-  if (start === 0) return text;
-  const firstBreak = text.indexOf("\n");
-  return firstBreak === -1 ? "" : text.slice(firstBreak + 1);
-}
-
-/** Latest activity timestamp a record carries, or the running maximum. */
-function latestTimestamp(current: number | null, record: JsonObject): number | null {
-  const raw = readStringField(record, "timestamp");
-  if (raw === null) return current;
-  const parsed = Date.parse(raw);
-  if (!Number.isFinite(parsed)) return current;
-  return Math.max(current ?? 0, parsed);
-}
-
-/** Read Codex's last request, whose input includes cached tokens. A damaged
- * tail is unknown, never permission to discard the old session. */
-export async function readCodexSessionResumeFacts(sessionId: string, homeDir = os.homedir()): Promise<SessionResumeFacts> {
-  const empty: SessionResumeFacts = { transcriptPath: null, lastActivityAtMs: null, lastContextTokens: null };
-  if (!SESSION_ID_PATTERN.test(sessionId)) return empty;
-  const ref = resolveRuntimeSessionRef("codex", sessionId, homeDir);
-  if (!ref.reachable || !ref.path) return empty;
-  if (!ref.path.endsWith(`-${sessionId}.jsonl`)) return empty;
-  const unknown: SessionResumeFacts = { ...empty, transcriptPath: ref.path };
-  try {
-    const text = await readTranscriptTailText(ref.path);
-    if (text === null) return unknown;
-    let lastActivityAtMs: number | null = null;
-    let lastContextTokens: number | null = null;
-    for (const line of text.split("\n")) {
-      if (!line) continue;
-      const record = parseCodexRecord(line);
-      if (record === null) return unknown;
-      lastActivityAtMs = latestTimestamp(lastActivityAtMs, record);
-      if (isCompactionRecord(record)) lastContextTokens = null;
-      const tokens = readContextTokens(record);
-      if (tokens !== null) lastContextTokens = tokens;
-    }
-    return { transcriptPath: ref.path, lastActivityAtMs, lastContextTokens };
-  } catch {
-    return unknown;
-  }
-}
-
 export interface WakeRecycleDecisionInput {
   config: WakeRecycleConfig;
   runtime: string | undefined;
@@ -276,6 +106,7 @@ export interface WakeRecycleDecisionInput {
   hasRuntimeProfileControl: boolean;
   facts: SessionResumeFacts;
   nowMs: number;
+  idleRecycle?: IdleRecycleStrategy | null;
 }
 
 /** A pending runtime-profile control blocks recycling only when it is a real
@@ -289,18 +120,6 @@ export function runtimeProfileControlBlocksRecycle(
   return Boolean(control && control.kind !== "daemon_release_notice");
 }
 
-/** Facts dispatch per runtime (RFC 070 §6.2): claude reads its transcript
- * tail; every other enabled runtime reports unknown facts until the daemon
- * journal supplies them, which resolves to a conservative resume upstream. */
-export async function readRuntimeSessionResumeFacts(
-  runtime: string,
-  sessionId: string,
-  homeDir?: string,
-): Promise<SessionResumeFacts> {
-  if (runtime === "claude") return readClaudeSessionResumeFacts(sessionId, homeDir);
-  return { transcriptPath: null, lastActivityAtMs: null, lastContextTokens: null };
-}
-
 /**
  * Pure decision core. Every gate that fails resolves to a plain resume with a
  * reason string; the transcript-derived facts must POSITIVELY establish both
@@ -310,7 +129,8 @@ export async function readRuntimeSessionResumeFacts(
 export function decideWakeRecycle(input: WakeRecycleDecisionInput): WakeRecyclePlan {
   const { config, facts } = input;
   if (!config.enabled) return { action: "resume", reason: "disabled" };
-  if (!WAKE_RECYCLE_ENABLED_RUNTIMES.has(input.runtime ?? "claude")) return { action: "resume", reason: "unsupported_runtime" };
+  const strategy = input.idleRecycle === undefined ? getIdleRecycleStrategy(input.runtime) : input.idleRecycle;
+  if (!strategy) return { action: "resume", reason: "unsupported_runtime" };
   if (!input.sessionId) return { action: "resume", reason: "no_prior_session" };
   if (input.hasResumePrompt) return { action: "resume", reason: "explicit_resume_prompt" };
   if (input.hasRuntimeProfileControl) return { action: "resume", reason: "runtime_profile_control" };
@@ -319,16 +139,12 @@ export function decideWakeRecycle(input: WakeRecycleDecisionInput): WakeRecycleP
   }
   const idleMs = input.nowMs - facts.lastActivityAtMs;
   if (idleMs < 0) return { action: "resume", reason: "session_facts_unavailable" };
-  if (input.runtime === "codex") {
-    // A warm conversation must not be recycled just because the context is big.
-    if (idleMs < config.minColdGapMs) return { action: "resume", reason: "codex_idle_below_threshold" };
-  } else if (idleMs <= config.minColdGapMs) {
-    return { action: "resume", reason: "cache_possibly_warm" };
-  }
+  const gapReason = strategy.wakeGapReason(idleMs, config.minColdGapMs);
+  if (gapReason) return { action: "resume", reason: gapReason };
   if (facts.lastContextTokens <= config.minContextTokens) return { action: "resume", reason: "context_below_threshold" };
   return {
     action: "recycle",
-    reason: input.runtime === "codex" ? "large_context" : "cold_gap_large_context",
+    reason: strategy.wakeReason,
     priorSessionId: input.sessionId,
     idleMs,
     priorContextTokens: facts.lastContextTokens,
@@ -404,6 +220,8 @@ export interface ColdIdleRuntimeView {
   lastEventAtMs: number;
   /** Live session id latched from the runtime (falls back to config.sessionId). */
   liveSessionId: string | null;
+  idleRecycle?: IdleRecycleStrategy | null;
+  runtimeState?: IdleRecycleState;
 }
 
 export interface ColdIdleRecycleStop {
@@ -411,6 +229,7 @@ export interface ColdIdleRecycleStop {
   sessionId: string;
   idleMs: number;
   priorContextTokens: number;
+  observedLastEventAtMs: number;
 }
 
 /**
@@ -433,7 +252,8 @@ export type ColdIdleSkipReason =
   | "context_below_threshold"
   | "no_transcript"
   | "background_tasks_unknown"
-  | "background_tasks_outstanding";
+  | "background_tasks_outstanding"
+  | (string & {});
 
 export async function selectColdIdleRecycleStops(
   views: readonly ColdIdleRuntimeView[],
@@ -451,12 +271,17 @@ export async function selectColdIdleRecycleStops(
   for (const view of views) {
     const cfg = resolveWakeRecycleConfig(view.config.constructedWakeContext, view.config.envVars, opts.processEnv ?? process.env);
     if (!cfg.enabled) { skip(view.agentId, "disabled"); continue; }
+    const strategy = view.idleRecycle === undefined ? getIdleRecycleStrategy(view.config.runtime) : view.idleRecycle;
+    if (!strategy) { skip(view.agentId, "unsupported_runtime"); continue; }
+    const settings = strategy.configure(cfg, view.config.envVars ?? {});
+    if (settings.skip) { skip(view.agentId, "disabled"); continue; }
+    Object.assign(cfg, settings.config);
+    if (view.runtimeState && !strategy.stateSafe(view.runtimeState)) { skip(view.agentId, "not_idle"); continue; }
     if (!view.idle) { skip(view.agentId, "not_idle"); continue; }
-    if (!WAKE_RECYCLE_ENABLED_RUNTIMES.has(view.config.runtime ?? "claude")) { skip(view.agentId, "unsupported_runtime"); continue; }
     const sessionId = view.liveSessionId ?? view.config.sessionId;
     if (!sessionId) { skip(view.agentId, "no_session"); continue; }
     if (nowMs - view.lastEventAtMs <= cfg.minColdGapMs) { skip(view.agentId, "recent_event"); continue; }
-    const facts = await readRuntimeSessionResumeFacts(view.config.runtime ?? "claude", sessionId, opts.homeDir);
+    const facts = await strategy.readFacts(sessionId, opts.homeDir);
     if (facts.lastActivityAtMs === null || facts.lastContextTokens === null) { skip(view.agentId, "session_facts_unavailable"); continue; }
     // A turn-idle runtime can still host live background work (subagents,
     // monitors) whose activity lands in the session's sidecar directory, not
@@ -473,87 +298,26 @@ export async function selectColdIdleRecycleStops(
     // right now: a runtime holding an armed monitor/background task may have
     // silent pending intent the daemon cannot see; leave it alone.
     if (!facts.transcriptPath) { skip(view.agentId, "no_transcript"); continue; }
-    const outstanding = await transcriptOutstandingBackgroundTasks(facts.transcriptPath);
-    if (outstanding === null) { skip(view.agentId, "background_tasks_unknown"); continue; }
-    if (outstanding > 0) { skip(view.agentId, "background_tasks_outstanding"); continue; }
+    let work: Awaited<ReturnType<IdleRecycleStrategy["checkWork"]>>;
+    try {
+      work = await strategy.checkWork(facts.transcriptPath, sessionId, view.runtimeState);
+    } catch {
+      skip(view.agentId, "background_tasks_unknown");
+      continue;
+    }
+    if (work.status !== "clear") {
+      skip(view.agentId, work.reason ?? (work.status === "busy" ? "background_tasks_outstanding" : "background_tasks_unknown"));
+      continue;
+    }
     out.push({
       agentId: view.agentId,
       sessionId,
       idleMs: nowMs - lastActive,
       priorContextTokens: facts.lastContextTokens,
+      observedLastEventAtMs: view.lastEventAtMs,
     });
   }
   return out;
-}
-
-/**
- * Static transcript markers that a session has EVER created background work
- * (background bash, Monitor, async subagents, task notifications). The live
- * `background_tasks_changed` roster is not persisted to the transcript, so the
- * sweep's "definitely no background business" gate is the conservative
- * complement: any marker ever seen disqualifies the session from sweeping.
- * Markers only ever accumulate in an append-only transcript, so the scan is
- * incremental: previously scanned bytes are never re-read, and a hit is final.
- */
-const BACKGROUND_TASK_CREATE_PATTERNS = [
-  /Monitor started \(task ([a-z0-9]+)/g,
-  /background with ID: ([a-z0-9]+)/g,
-  /moved to the background \(ID: ([a-z0-9]+)\)/g,
-] as const;
-const BACKGROUND_TASK_TERMINAL_PATTERNS = [
-  /<task-id>([a-z0-9]+)<\/task-id>[\s\S]{0,400}?<status>(?:completed|failed|stopped|killed)<\/status>/g,
-  /Successfully stopped task: ([a-z0-9]+)/g,
-] as const;
-
-interface BackgroundTaskScanState {
-  scannedBytes: number;
-  live: Set<string>;
-}
-
-const backgroundTaskScans = new Map<string, BackgroundTaskScanState>();
-const MARKER_SCAN_CHUNK = 4 * 1024 * 1024;
-const MARKER_OVERLAP = 512;
-
-/**
- * Count background tasks (monitors, background bash, async subagents) that
- * were created in this transcript and have no terminal notification yet.
- * Fleet measurement (RFC 070): 95.7% of real cold wakes carry zero
- * outstanding tasks, so this paired accounting — versus "ever created any",
- * which only 12.5% pass — is what makes the sweep reach the fleet. The scan
- * is incremental over the append-only file with the live-set carried between
- * scans; an unmatched creation stays outstanding forever (fail-armed), and
- * read errors report null (unknown → the sweep must skip).
- */
-export async function transcriptOutstandingBackgroundTasks(transcriptPath: string): Promise<number | null> {
-  const state = backgroundTaskScans.get(transcriptPath) ?? { scannedBytes: 0, live: new Set<string>() };
-  try {
-    const info = await stat(transcriptPath);
-    if (info.size <= state.scannedBytes) return state.live.size;
-    const fd = await open(transcriptPath, "r");
-    try {
-      let position = Math.max(0, state.scannedBytes - MARKER_OVERLAP);
-      const buffer = Buffer.alloc(MARKER_SCAN_CHUNK);
-      while (position < info.size) {
-        const { bytesRead } = await fd.read(buffer, 0, MARKER_SCAN_CHUNK, position);
-        if (bytesRead === 0) break;
-        const text = buffer.subarray(0, bytesRead).toString("utf8");
-        for (const pattern of BACKGROUND_TASK_CREATE_PATTERNS) {
-          for (const match of text.matchAll(pattern)) state.live.add(match[1]!);
-        }
-        for (const pattern of BACKGROUND_TASK_TERMINAL_PATTERNS) {
-          for (const match of text.matchAll(pattern)) state.live.delete(match[1]!);
-        }
-        position += bytesRead;
-      }
-      state.scannedBytes = Math.max(state.scannedBytes, Math.min(position, info.size));
-    } finally {
-      await fd.close();
-    }
-    backgroundTaskScans.set(transcriptPath, state);
-    return state.live.size;
-  } catch {
-    return null;
-  }
 }
 
 /** Freshest mtime under a directory tree (one level of nesting is enough for
@@ -600,13 +364,14 @@ export interface PlanWakeSessionRecycleArgs {
   nowMs?: number;
   homeDir?: string;
   processEnv?: NodeJS.ProcessEnv;
+  idleRecycle?: IdleRecycleStrategy | null;
 }
 
 /** Async entry point for AgentProcessManager: resolve knobs, read transcript
  * facts, decide. Never throws — any failure is a plain resume. */
 export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): Promise<WakeRecyclePlan> {
   const recycleConfig = resolveWakeRecycleConfig(args.config.constructedWakeContext, args.config.envVars, args.processEnv ?? process.env);
-  if (!recycleConfig.enabled || !args.config.sessionId || !WAKE_RECYCLE_ENABLED_RUNTIMES.has(args.config.runtime ?? "claude")) {
+  if (!recycleConfig.enabled || !args.config.sessionId) {
     return decideWakeRecycle({
       config: recycleConfig,
       runtime: args.config.runtime,
@@ -617,27 +382,19 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
       nowMs: args.nowMs ?? Date.now(),
     });
   }
-  const runtime = args.config.runtime ?? "claude";
-  const env = args.config.envVars ?? {};
-  // Explicit per-agent opt-in; the existing cold-idle sweeper stays unchanged.
-  if (runtime === "codex" && parseBooleanFlag(env.RAFT_CODEX_WAKE_RECYCLE) !== true) {
-    return { action: "resume", reason: "codex_opt_in_required" };
-  }
-  if (runtime === "codex") {
-    recycleConfig.minContextTokens = parsePositiveInteger(env.RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS)
-      ?? CODEX_DEFAULT_MIN_CONTEXT_TOKENS;
-    recycleConfig.minColdGapMs = parsePositiveInteger(env.RAFT_CODEX_WAKE_RECYCLE_MIN_IDLE_MS)
-      ?? CODEX_DEFAULT_MIN_IDLE_MS;
-  }
-  const facts = runtime === "codex"
-    ? await readCodexSessionResumeFacts(args.config.sessionId, args.homeDir)
-    : await readRuntimeSessionResumeFacts(runtime, args.config.sessionId, args.homeDir);
+  const strategy = args.idleRecycle === undefined ? getIdleRecycleStrategy(args.config.runtime) : args.idleRecycle;
+  if (!strategy) return { action: "resume", reason: "unsupported_runtime" };
+  const settings = strategy.configure(recycleConfig, args.config.envVars ?? {});
+  if (settings.skip) return { action: "resume", reason: settings.skip };
+  Object.assign(recycleConfig, settings.config);
+  const facts = await strategy.readFacts(args.config.sessionId, args.homeDir);
   const plan = decideWakeRecycle({
     config: recycleConfig,
     runtime: args.config.runtime,
     sessionId: args.config.sessionId,
     hasResumePrompt: args.hasResumePrompt,
     hasRuntimeProfileControl: runtimeProfileControlBlocksRecycle(args.config.runtimeProfileControl),
+    idleRecycle: strategy,
     facts,
     nowMs: args.nowMs ?? Date.now(),
   });
@@ -679,18 +436,17 @@ export async function planWakeSessionRecycle(args: PlanWakeSessionRecycleArgs): 
   const recentMessagesMax = recentMessagesRaw?.trim() === "0" ? 0 : parsePositiveInteger(recentMessagesRaw);
   if (facts.transcriptPath && panelBudget > 0) {
     try {
-      const panel = await buildConstructedPanel({
+      const panel = await strategy.buildPanel({
         transcriptPath: facts.transcriptPath,
         workspacePath: workspacePath ?? undefined,
         budgetTokens: panelBudget,
         recentMessagesMax,
-        codex: runtime === "codex",
       });
       if (panel) return { ...plan, briefing: composeWakeSections(briefing, panel) };
     } catch (err) {
       logger.warn(`[WakeRecycle] panel construction failed, using bare briefing: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  if (runtime === "codex") return { action: "resume", reason: "codex_panel_unavailable" };
+  if (strategy.panelUnavailableReason) return { action: "resume", reason: strategy.panelUnavailableReason };
   return plan.briefing === briefing ? plan : { ...plan, briefing };
 }

@@ -1,3 +1,5 @@
+import { createCodexIdleRecycle } from "./drivers/codexIdleRecycle";
+import { claudeIdleRecycle } from "./drivers/claudeIdleRecycle";
 // RFC 070 phase 1 behavior baseline: at-wake session recycling.
 //
 // Named protected object (invariant): a cold wake (>1h since last transcript
@@ -49,6 +51,7 @@ class FakeChildProcess extends EventEmitter {
 }
 
 class FakeClaudeDriver implements RuntimeDriver {
+  readonly idleRecycle = claudeIdleRecycle;
   readonly acceptsStdinDuringCompaction = true;
   readonly id = "claude";
   readonly lifecycle = { kind: "persistent", stdin: "direct", inFlightWake: "steer" } as const;
@@ -416,5 +419,48 @@ test("a sweep stop is a clean exit even when a recovered runtime error is still 
       false,
       "a stale runtime error must not make the sweep stop look like a crash",
     );
+  });
+});
+
+test("Codex cold-idle sweep stops a completed session and preserves restart state", async () => {
+  await withManager(async (ctx) => {
+    const sessionId = "01a1a713-1184-7b72-b26e-99967b550fb5";
+    const agentId = "codex-cold-idle";
+    Object.defineProperty(ctx.driver, "idleRecycle", { value: createCodexIdleRecycle(async () => 0), configurable: true });
+    await ctx.manager.startAgent(agentId, makeConfig({ runtime: "codex", sessionId, envVars: { RAFT_CODEX_WAKE_RECYCLE: "1" } }));
+    const ap = (ctx.manager as any).agents.get(agentId);
+    ap.sessionId = sessionId;
+    ap.gatedSteering = { ...ap.gatedSteering, isIdle: true };
+    ap.runtimeProgress.noteInternalProgress(Date.now() - 700_000);
+    const timestamp = new Date(Date.now() - 700_000).toISOString();
+    const dir = path.join(ctx.dataDir, ".codex", "sessions", "2026", "11", "05");
+    await mkdir(dir, { recursive: true });
+    const rec = (type: string, payload: unknown) => JSON.stringify({ timestamp, type, payload });
+    await writeFile(path.join(dir, `rollout-2026-11-05T00-00-07-${sessionId}.jsonl`), [
+      rec("event_msg", { type: "task_started" }),
+      rec("response_item", { type: "function_call", call_id: "c1", name: "exec_command", arguments: '{"cmd":"true"}' }),
+      rec("response_item", { type: "function_call_output", call_id: "c1", output: "ok" }),
+      rec("event_msg", { type: "token_count", info: { last_token_usage: { input_tokens: 200000 } } }),
+      rec("event_msg", { type: "task_complete" }),
+    ].join("\n") + "\n");
+    const pending = coldIdleFixture(987);
+    ap.inbox.push(pending);
+    await (ctx.manager as any).sweepColdIdleRuntimes();
+    assert.equal(ctx.driver.processes[0]!.killed, false, "untold inbox work must prevent stopping");
+    assert.deepEqual(ap.inbox, [pending], "the pending message remains available");
+    ap.inbox.pop();
+    Object.defineProperty(ctx.driver, "idleRecycle", { value: createCodexIdleRecycle(async () => {
+      ap.runtimeProgress.noteInternalProgress(Date.now());
+      return 0;
+    }), configurable: true });
+    await (ctx.manager as any).sweepColdIdleRuntimes();
+    assert.equal(ctx.driver.processes[0]!.killed, false, "activity during the protocol query invalidates the stop");
+    ap.runtimeProgress.noteInternalProgress(Date.now() - 700_000);
+    Object.defineProperty(ctx.driver, "idleRecycle", { value: createCodexIdleRecycle(async () => 0), configurable: true });
+    await (ctx.manager as any).sweepColdIdleRuntimes();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(ctx.driver.processes[0]!.killed, true);
+    assert.equal(ap.gatedSteering.expectedTerminationReason, "cold_idle_recycle");
+    assert.equal((ctx.manager as any).lifecycleRecords.getRestartSnapshot(agentId)?.sessionId, sessionId);
   });
 });
