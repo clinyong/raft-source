@@ -9672,8 +9672,9 @@ export class AgentProcessManager {
           ap.gatedSteering.compacting || ap.gatedSteering.reviewing) return false;
       const snapshots = ap.runtime.emitToolDiagnosticSnapshots?.({ trigger: "runtime_inactivity_tripwire", runtimeInactivityAgeMs: staleForMs });
       if (!snapshots?.length) {
-        if (!this.stalledRecoveryBudgetAlerts.has(agentId)) {
-          this.stalledRecoveryBudgetAlerts.add(agentId);
+        const alertKey = `${agentId}:tool_status_unavailable`;
+        if (!this.stalledRecoveryBudgetAlerts.has(alertKey)) {
+          this.stalledRecoveryBudgetAlerts.add(alertKey);
           this.broadcastActivity(agentId, "error", "Automatic stalled recovery withheld: tool status is unavailable.", [], undefined, "runtime_stalled");
         }
         return false;
@@ -9681,15 +9682,18 @@ export class AgentProcessManager {
       if (snapshots.some((snapshot) => snapshot.toolPending !== false)) return false;
       const budget = this.stalledRecoveryBudget.tryReserve(agentId, Date.now());
       if (budget !== "reserved") {
-        if (!this.stalledRecoveryBudgetAlerts.has(agentId)) {
-          this.stalledRecoveryBudgetAlerts.add(agentId);
+        const alertKey = `${agentId}:budget_${budget}`;
+        if (!this.stalledRecoveryBudgetAlerts.has(alertKey)) {
+          this.stalledRecoveryBudgetAlerts.add(alertKey);
           this.broadcastActivity(agentId, "error", budget === "exhausted"
             ? "Automatic stalled recovery stopped after two attempts in one hour."
             : "Automatic stalled recovery unavailable: the recovery limit could not be checked.", [], undefined, "runtime_stalled");
         }
         return false;
       }
-      this.stalledRecoveryBudgetAlerts.delete(agentId);
+      this.stalledRecoveryBudgetAlerts.delete(`${agentId}:tool_status_unavailable`);
+      this.stalledRecoveryBudgetAlerts.delete(`${agentId}:budget_exhausted`);
+      this.stalledRecoveryBudgetAlerts.delete(`${agentId}:budget_unavailable`);
     }
     this.commitGatedSteeringDecisionState(agentId, ap, reduction.nextState);
 

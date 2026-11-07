@@ -5600,3 +5600,23 @@ test('periodic stall sweep skips runtimes other than Pi', async () => {
     assert.equal(driver.spawnCalls.length, 1);
   });
 });
+
+test('periodic stall recovery reports a budget limit after an earlier missing-tool-status alert', async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    const ap = getProcess(manager, 'agent-1');
+    const budget = (manager as any).stalledRecoveryBudget;
+    assert.equal(budget.tryReserve('agent-1', Date.now() - 2000), 'reserved');
+    assert.equal(budget.tryReserve('agent-1', Date.now() - 1000), 'reserved');
+    manager.deliverMessage('agent-1', makeMessage('queued message'));
+    ap.runtimeProgress.noteRuntimeEvent('tool_output', Date.now() - 16 * 60_000);
+    ap.lastRuntimeEventAtMs = Date.now() - 16 * 60_000;
+    (manager as any).sweepQueuedStalls();
+    assert.match(lastActivity(sent).detail, /tool status is unavailable/);
+    (ap.runtime as any).emitToolDiagnosticSnapshots = () => [{ toolPending: false }];
+    (manager as any).sweepQueuedStalls();
+    assert.match(lastActivity(sent).detail, /two attempts/);
+    assert.equal(driver.spawnCalls.length, 1);
+  });
+});
