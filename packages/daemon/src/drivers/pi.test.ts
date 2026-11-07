@@ -4701,12 +4701,16 @@ test('busy delivery starts an idle Pi session and steers an active Pi session', 
   const calls: string[] = [];
   const fake = createFakeAgentSession('pi-idle-guard', calls);
   Object.defineProperty(fake, 'isIdle', { get: () => !fake.isStreaming });
+  const originalPrompt = fake.prompt.bind(fake);
+  let fallbackBehavior: unknown;
+  (fake as any).prompt = async (text: string, options: any) => { if (text === 'idle-notice') fallbackBehavior = options?.streamingBehavior; return originalPrompt(text); };
   const runtime = new PiSdkRuntimeSession(makeSpawnContext(), () => undefined, async () => fake as unknown as AgentSession);
   await runtime.start({ text: 'initial' });
   await new Promise((resolve) => setImmediate(resolve));
   runtime.send({ mode: 'busy', text: 'idle-notice' });
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(calls.includes('prompt:idle-notice:subscribers=1'));
+  assert.equal(fallbackBehavior, 'steer');
   fake.__setStreaming(true);
   runtime.send({ mode: 'busy', text: 'active-notice' });
   await new Promise((resolve) => setImmediate(resolve));

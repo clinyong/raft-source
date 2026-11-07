@@ -2025,7 +2025,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
           if (session.isIdle) {
             requestMethod = "turn/start";
             this.toolExecutionObserver?.beginRuntimeTurn();
-            return this.promptWithPreflight(session, input.text);
+            return this.promptWithPreflight(session, input.text, true);
           }
           return session.steer(input.text);
         },
@@ -2094,7 +2094,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     this.emitRuntimeEvent({ kind: "session_init", sessionId } satisfies ParsedEvent);
   }
 
-  private async promptWithPreflight(session: AgentSession, text: string): Promise<void> {
+  private async promptWithPreflight(session: AgentSession, text: string, fallbackToSteer = false): Promise<void> {
     let release!: () => void;
     const barrier = new Promise<void>((resolve) => { release = resolve; });
     this.promptPreflight = barrier;
@@ -2103,7 +2103,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       release();
     };
     try {
-      await session.prompt(text, { preflightResult: finishPreflight });
+      await session.prompt(text, { preflightResult: finishPreflight, ...(fallbackToSteer ? { streamingBehavior: "steer" as const } : {}) });
     } finally {
       finishPreflight();
     }
