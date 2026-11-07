@@ -1,3 +1,4 @@
+import { StalledRecoveryBudget } from "./stalledRecoveryBudget";
 import type { AgentApiHistoryConsumptionScope } from "@botiverse/raft-shared";
 import { finishToolCall, noteToolCallStart } from "./toolCallOutcome";
 import { TurnSummaryTracker, turnOutcomeForActivity, turnTriggerFromMessages } from "./turnSummaryTracker";
@@ -830,6 +831,7 @@ interface AgentProcess {
   contextId: string | null;
   review: AgentProcessReviewState;
   runtimeProgress: RuntimeProgressState;
+  lastRuntimeEventAtMs: number;
   /** task #1114: stdin writes since the last runtime consumption signal (observation only). */
   deliveryConsumption: DeliveryConsumptionWatch;
   runtimeTraceSpan: ActiveSpan | null;
@@ -1525,6 +1527,9 @@ type RuntimeTurnTraceOutcome =
 
 export class AgentProcessManager {
   private agents = new Map<string, AgentProcess>();
+  private queuedStallSweepTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly stalledRecoveryBudget: StalledRecoveryBudget;
+  private readonly stalledRecoveryBudgetAlerts = new Set<string>();
   private readonly lifecycleRecords = new AgentLifecycleRecords<RuntimeErrorDeliveryBackoffState, RuntimeErrorFingerprintFenceState>();
 
   /**
@@ -1793,11 +1798,26 @@ export class AgentProcessManager {
       () => this.clockNow(),
       (config) => this.runtimeLaunchPolicyTraceAttrs(config),
     );
+    this.stalledRecoveryBudget = new StalledRecoveryBudget(this.dataDir);
+    this.queuedStallSweepTimer = setInterval(() => this.sweepQueuedStalls(), 60_000);
+    this.queuedStallSweepTimer.unref?.();
     this.coldIdleSweepTimer = setInterval(
       () => void this.sweepColdIdleRuntimes(),
       readPositiveIntegerEnv("RAFT_WAKE_RECYCLE_SWEEP_MS", COLD_IDLE_SWEEP_MS),
     );
     this.coldIdleSweepTimer.unref?.();
+  }
+
+  /** Re-evaluate queued messages even if no new message arrives. */
+  private sweepQueuedStalls(): void {
+    for (const [agentId, ap] of this.agents) {
+      if (ap.driver.id !== "pi" || ap.inbox.length === 0 || ap.runtimeProgress.ageMs() < RUNTIME_PROGRESS_STALE_MS) continue;
+      try {
+        this.recoverStaleProcessForQueuedMessageIfNeeded(agentId, ap, true);
+      } catch (error) {
+        logger.warn(`[Agent ${agentId}] Queued stall recovery check failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   /** RFC 070: an idle claude process past the cache TTL with a large context
@@ -4880,6 +4900,7 @@ export class AgentProcessManager {
       contextId: contextGeneration.contextId,
       review: { kind: "none" },
       runtimeProgress: new RuntimeProgressState(Date.now()),
+      lastRuntimeEventAtMs: Date.now(),
       deliveryConsumption: new DeliveryConsumptionWatch(),
       runtimeTraceSpan: null,
       runtimeTraceCounters: createRuntimeTraceCounters(),
@@ -7148,6 +7169,8 @@ export class AgentProcessManager {
     // Clear idle configs so no auto-restarts happen during shutdown.
     // Use silent: true so agents stay "active" in DB — on daemon reconnect,
     // the server's ready handler will auto-restart them.
+    if (this.queuedStallSweepTimer) clearInterval(this.queuedStallSweepTimer);
+    this.queuedStallSweepTimer = null;
     if (this.coldIdleSweepTimer) clearInterval(this.coldIdleSweepTimer);
     this.coldIdleSweepTimer = null;
     this.cancelAllQueuedAgentStarts("daemon shutdown");
@@ -9624,7 +9647,7 @@ export class AgentProcessManager {
     return ap.runtime.isAlive();
   }
 
-  private recoverStaleProcessForQueuedMessageIfNeeded(agentId: string, ap: AgentProcess): boolean {
+  private recoverStaleProcessForQueuedMessageIfNeeded(agentId: string, ap: AgentProcess, periodic = false): boolean {
     const staleForMs = ap.runtimeProgress.ageMs();
     const reduction = reduceApmStalledRecoveryTermination(ap.gatedSteering, {
       inboxLength: ap.inbox.length,
@@ -9641,6 +9664,33 @@ export class AgentProcessManager {
       return true;
     }
     if (!reduction.shouldTerminate) return false;
+    if (periodic) {
+      if (!ap.sessionId || staleForMs < RUNTIME_PROGRESS_STALE_MS ||
+          Date.now() - ap.lastRuntimeEventAtMs < RUNTIME_PROGRESS_STALE_MS) return false;
+      // A missing diagnostic is not proof that it is safe to interrupt work.
+      if (ap.gatedSteering.outstandingToolUses !== 0 || ap.backgroundTasks.size !== 0 ||
+          ap.gatedSteering.compacting || ap.gatedSteering.reviewing) return false;
+      const snapshots = ap.runtime.emitToolDiagnosticSnapshots?.({ trigger: "runtime_inactivity_tripwire", runtimeInactivityAgeMs: staleForMs });
+      if (!snapshots?.length) {
+        if (!this.stalledRecoveryBudgetAlerts.has(agentId)) {
+          this.stalledRecoveryBudgetAlerts.add(agentId);
+          this.broadcastActivity(agentId, "error", "Automatic stalled recovery withheld: tool status is unavailable.", [], undefined, "runtime_stalled");
+        }
+        return false;
+      }
+      if (snapshots.some((snapshot) => snapshot.toolPending !== false)) return false;
+      const budget = this.stalledRecoveryBudget.tryReserve(agentId, Date.now());
+      if (budget !== "reserved") {
+        if (!this.stalledRecoveryBudgetAlerts.has(agentId)) {
+          this.stalledRecoveryBudgetAlerts.add(agentId);
+          this.broadcastActivity(agentId, "error", budget === "exhausted"
+            ? "Automatic stalled recovery stopped after two attempts in one hour."
+            : "Automatic stalled recovery unavailable: the recovery limit could not be checked.", [], undefined, "runtime_stalled");
+        }
+        return false;
+      }
+      this.stalledRecoveryBudgetAlerts.delete(agentId);
+    }
     this.commitGatedSteeringDecisionState(agentId, ap, reduction.nextState);
 
     const staleForMinutes = Math.max(1, Math.floor(staleForMs / 60_000));
@@ -9745,6 +9795,7 @@ export class AgentProcessManager {
 
   private handleParsedEvent(agentId: string, event: ParsedEvent, driver: RuntimeDriver) {
     const ap = this.agents.get(agentId);
+    if (ap) ap.lastRuntimeEventAtMs = Date.now();
     // task #1114: only model-driven runtime events prove that stdin writes were
     // consumed, and only when they belong to the live session/turn of this
     // process. The process-binding fence upstream already rejects events from a

@@ -5485,3 +5485,118 @@ test("task #379: an unclassified runtime error keeps today's backoff that turn_e
     assert.equal(getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.kind, "idle", "without the structured limit the same text keeps the old runtime_error behaviour");
   });
 });
+
+test('periodic queued-stall sweep restarts when no tool is pending', async () => {
+  onTestFinished(installManagedRunnerCredentialFetch());
+  await withManager(async ({ driver, manager }) => {
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    const ap = getProcess(manager, 'agent-1');
+    (ap.runtime as any).emitToolDiagnosticSnapshots = () => [{ toolPending: false }];
+    manager.deliverMessage('agent-1', makeMessage('queued message'));
+    ap.runtimeProgress.noteRuntimeEvent('tool_output', Date.now() - 16 * 60_000);
+    ap.lastRuntimeEventAtMs = Date.now() - 16 * 60_000;
+    (manager as any).sweepQueuedStalls();
+    await waitFor(() => driver.spawnCalls.length === 2, 'stalled session restart');
+    assert.equal(driver.spawnCalls[1].config.sessionId, 'session-1');
+  });
+});
+
+test('periodic queued-stall sweep never restarts an active tool', async () => {
+  await withManager(async ({ driver, manager }) => {
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    const ap = getProcess(manager, 'agent-1');
+    (ap.runtime as any).emitToolDiagnosticSnapshots = () => [{ toolPending: true }];
+    manager.deliverMessage('agent-1', makeMessage('queued message'));
+    ap.runtimeProgress.noteRuntimeEvent('tool_output', Date.now() - 16 * 60_000);
+    ap.lastRuntimeEventAtMs = Date.now() - 16 * 60_000;
+    (manager as any).sweepQueuedStalls();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.equal(ap.runtime.closed, false);
+  });
+});
+
+test('periodic queued-stall sweep stops and displays error after budget exhausted', async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    const ap = getProcess(manager, 'agent-1');
+    (ap.runtime as any).emitToolDiagnosticSnapshots = () => [{ toolPending: false }];
+    const budget = (manager as any).stalledRecoveryBudget;
+    assert.equal(budget.tryReserve('agent-1', Date.now() - 2000), 'reserved');
+    assert.equal(budget.tryReserve('agent-1', Date.now() - 1000), 'reserved');
+    manager.deliverMessage('agent-1', makeMessage('queued message'));
+    ap.runtimeProgress.noteRuntimeEvent('tool_output', Date.now() - 16 * 60_000);
+    ap.lastRuntimeEventAtMs = Date.now() - 16 * 60_000;
+    (manager as any).sweepQueuedStalls();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.match(lastActivity(sent).detail, /two attempts/);
+  });
+});
+
+test('periodic queued-stall sweep fails closed without tool evidence', async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    const ap = getProcess(manager, 'agent-1');
+    manager.deliverMessage('agent-1', makeMessage('queued message'));
+    ap.runtimeProgress.noteRuntimeEvent('tool_output', Date.now() - 16 * 60_000);
+    ap.lastRuntimeEventAtMs = Date.now() - 16 * 60_000;
+    (manager as any).sweepQueuedStalls();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.match(lastActivity(sent).detail, /tool status is unavailable/);
+  });
+});
+
+test('a recent runtime event prevents periodic recovery', async () => {
+  await withManager(async ({ driver, manager }) => {
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    const ap = getProcess(manager, 'agent-1');
+    (ap.runtime as any).emitToolDiagnosticSnapshots = () => [{ toolPending: false }];
+    manager.deliverMessage('agent-1', makeMessage('queued message'));
+    ap.runtimeProgress.noteRuntimeEvent('tool_output', Date.now() - 16 * 60_000);
+    ap.lastRuntimeEventAtMs = Date.now();
+    (manager as any).sweepQueuedStalls();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+  });
+});
+
+test('periodic Pi stall sweep blocks on tracked tools and background tasks', async () => {
+  await withManager(async ({ driver, manager }) => {
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    const ap = getProcess(manager, 'agent-1');
+    (ap.runtime as any).emitToolDiagnosticSnapshots = () => [{ toolPending: false }];
+    manager.deliverMessage('agent-1', makeMessage('queued message'));
+    ap.runtimeProgress.noteRuntimeEvent('tool_output', Date.now() - 16 * 60_000);
+    ap.lastRuntimeEventAtMs = Date.now() - 16 * 60_000;
+    ap.gatedSteering.outstandingToolUses = 1;
+    (manager as any).sweepQueuedStalls();
+    ap.gatedSteering.outstandingToolUses = 0;
+    ap.backgroundTasks.set('task-1', {});
+    (manager as any).sweepQueuedStalls();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.equal(ap.runtime.closed, false);
+  });
+});
+
+test('periodic stall sweep skips runtimes other than Pi', async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1' }));
+    const ap = getProcess(manager, 'agent-1');
+    (ap.runtime as any).emitToolDiagnosticSnapshots = () => [{ toolPending: false }];
+    manager.deliverMessage('agent-1', makeMessage('queued message'));
+    ap.runtimeProgress.noteRuntimeEvent('tool_output', Date.now() - 16 * 60_000);
+    ap.lastRuntimeEventAtMs = Date.now() - 16 * 60_000;
+    (manager as any).sweepQueuedStalls();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 1);
+  });
+});
