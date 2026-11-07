@@ -1848,6 +1848,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
   private readonly mappingState: PiSdkEventMappingState;
   private readonly toolExecutionObserver: PiToolExecutionObserver | undefined;
   private session: AgentSession | null = null;
+  private promptPreflight: Promise<void> | null = null;
   private unsubscribe: (() => void) | null = null;
   private started = false;
   private didClose = false;
@@ -1990,7 +1991,10 @@ export class PiSdkRuntimeSession implements RuntimeSession {
         if (parsed.kind === "error") {
           this.reportProviderRequestFailure(parsed.message);
         }
-        this.emitRuntimeEvent(parsed, piTerminalCausePhaseForSdkEvent(event));
+        this.emitRuntimeEvent(
+          parsed.kind === "compaction_finished" ? { ...parsed, runtimeIdle: session.isIdle } : parsed,
+          piTerminalCausePhaseForSdkEvent(event),
+        );
       }
     });
 
@@ -2013,10 +2017,20 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     if (!session) return { ok: false, reason: "closed" };
 
     if (input.mode === "busy") {
+      let requestMethod: "turn/start" | "turn/steer" = "turn/steer";
       this.deferSdkCall(
-        () => session.steer(input.text),
+        async () => {
+          if (this.promptPreflight) await this.promptPreflight;
+          if (this.didClose || this.session !== session) return;
+          if (session.isIdle) {
+            requestMethod = "turn/start";
+            this.toolExecutionObserver?.beginRuntimeTurn();
+            return this.promptWithPreflight(session, input.text);
+          }
+          return session.steer(input.text);
+        },
         "steer_request",
-        { requestMethod: () => "turn/steer", text: input.text },
+        { requestMethod: () => requestMethod, text: input.text },
       );
       return { ok: true, acceptedAs: "steer" };
     }
@@ -2080,6 +2094,21 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     this.emitRuntimeEvent({ kind: "session_init", sessionId } satisfies ParsedEvent);
   }
 
+  private async promptWithPreflight(session: AgentSession, text: string): Promise<void> {
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    this.promptPreflight = barrier;
+    const finishPreflight = () => {
+      if (this.promptPreflight === barrier) this.promptPreflight = null;
+      release();
+    };
+    try {
+      await session.prompt(text, { preflightResult: finishPreflight });
+    } finally {
+      finishPreflight();
+    }
+  }
+
   private launchPrompt(text: string, delivery = false): void {
     const session = this.session;
     if (!session) {
@@ -2092,7 +2121,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     this.deferSdkCall(
       () => {
         this.toolExecutionObserver?.beginRuntimeTurn();
-        return session.prompt(text);
+        return this.promptWithPreflight(session, text);
       },
       "prompt_request",
       delivery ? { requestMethod: () => "turn/start", text } : undefined,
@@ -2111,7 +2140,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
         }
         if (ready) {
           this.toolExecutionObserver?.beginRuntimeTurn();
-          await session.prompt(text);
+          await this.promptWithPreflight(session, text);
         } else {
           requestMethod = "turn/steer";
           await session.steer(text);

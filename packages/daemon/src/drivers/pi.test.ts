@@ -4696,3 +4696,48 @@ test("Pi idle observation uses SDK context and loaded model settings, and fails 
   assert.equal(snapshot({ session: { model: {}, getContextUsage: () => ({ tokens: null, contextWindow: 140_000 }), settingsManager: { getCompactionReserveTokens: () => 16_384 } } }).reason, "context_unavailable");
   assert.equal(snapshot({ session: { model: {}, getContextUsage: () => { throw new Error("bad"); } } }).reason, "observation_failed");
 });
+
+test('busy delivery starts an idle Pi session and steers an active Pi session', async () => {
+  const calls: string[] = [];
+  const fake = createFakeAgentSession('pi-idle-guard', calls);
+  Object.defineProperty(fake, 'isIdle', { get: () => !fake.isStreaming });
+  const runtime = new PiSdkRuntimeSession(makeSpawnContext(), () => undefined, async () => fake as unknown as AgentSession);
+  await runtime.start({ text: 'initial' });
+  await new Promise((resolve) => setImmediate(resolve));
+  runtime.send({ mode: 'busy', text: 'idle-notice' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(calls.includes('prompt:idle-notice:subscribers=1'));
+  fake.__setStreaming(true);
+  runtime.send({ mode: 'busy', text: 'active-notice' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(calls.includes('steer:active-notice'));
+  await runtime.stop({ reason: 'test' });
+});
+
+test('busy notices wait for asynchronous Pi prompt preflight before deciding whether to steer', async () => {
+  const calls: string[] = [];
+  let running = false;
+  let releasePreflight!: () => void;
+  const fake = createFakeAgentSession('pi-preflight-race', calls);
+  Object.defineProperty(fake, 'isIdle', { get: () => !running });
+  (fake as any).prompt = async (text: string, opts?: { preflightResult?: (status: string) => void }) => {
+    calls.push(`preflight:${text}`);
+    if (text === 'slow-start') await new Promise<void>(resolve => { releasePreflight = resolve; });
+    running = true;
+    opts?.preflightResult?.('started');
+  };
+  const runtime = new PiSdkRuntimeSession(makeSpawnContext(), () => undefined, async () => fake as unknown as AgentSession);
+  await runtime.start({ text: 'initial' });
+  await new Promise((resolve) => setImmediate(resolve));
+  running = false;
+  runtime.send({ mode: 'busy', text: 'slow-start' });
+  await new Promise((resolve) => setImmediate(resolve));
+  runtime.send({ mode: 'busy', text: 'during-preflight' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.includes('steer:during-preflight'), false);
+  assert.equal(calls.includes('preflight:during-preflight'), false);
+  releasePreflight();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(calls.includes('steer:during-preflight'));
+  await runtime.stop({ reason: 'test' });
+});
