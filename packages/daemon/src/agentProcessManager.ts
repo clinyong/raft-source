@@ -10048,7 +10048,13 @@ export class AgentProcessManager {
         if (ap) {
           const reduction = reduceApmGatedCompaction(ap.gatedSteering, { kind: "compaction_finished" });
           this.commitGatedSteeringDecisionState(agentId, ap, reduction.nextState);
-          this.flushCompactionBoundaryMessages(agentId, ap);
+          if (event.runtimeIdle === true && ap.gatedSteering.outstandingToolUses === 0) {
+            this.commitApmIdleState(agentId, ap, true);
+            const delivered = this.flushIdleInboxDeliveryRetry(agentId, "idle_compaction_finished", "daemon.agent.stdin_delivery.compaction_idle");
+            if (!delivered) this.broadcastQuietTurnStatus(agentId, ap);
+          } else {
+            this.flushCompactionBoundaryMessages(agentId, ap);
+          }
         }
         break;
 

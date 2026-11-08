@@ -108,7 +108,7 @@ export type ParsedEvent =
   | ({ kind: "tool_call"; name: string; input: any; callId?: string } & SubagentLineage)
   | ({ kind: "tool_output"; name: string; callId?: string; ok?: boolean; durationMs?: number; exitCode?: number } & SubagentLineage)
   | { kind: "compaction_started" }
-  | { kind: "compaction_finished" }
+  | { kind: "compaction_finished"; runtimeIdle?: boolean }
   | {
       kind: "compaction_interrupted";
       outcome: "compaction_failed_or_exhausted" | "aborted";

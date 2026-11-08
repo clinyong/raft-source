@@ -5485,3 +5485,59 @@ test("task #379: an unclassified runtime error keeps today's backoff that turn_e
     assert.equal(getProcess(manager, "agent-1").runtimeErrorDeliveryBackoff.kind, "idle", "without the structured limit the same text keeps the old runtime_error behaviour");
   });
 });
+
+test('idle SDK compaction flushes queued notification as a new turn', async () => {
+  await withManager(async ({ driver, manager }) => {
+    (driver as any).acceptsStdinDuringCompaction = false;
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    driver.parsedLines.set('end', [{ kind: 'turn_end', sessionId: 'session-1' }]);
+    driver.parsedLines.set('start-compact', [{ kind: 'compaction_started' }]);
+    driver.parsedLines.set('finish-compact', [{ kind: 'compaction_finished', runtimeIdle: true }]);
+    driver.processes[0].stdout.emit('data', Buffer.from('end\nstart-compact\n'));
+    await flush();
+    manager.deliverMessage('agent-1', makeMessage('new message while compacting'));
+    await flush();
+    const before = driver.encodedCalls.length;
+    driver.processes[0].stdout.emit('data', Buffer.from('finish-compact\n'));
+    await waitFor(() => driver.encodedCalls.length > before, 'idle compaction delivery');
+    assert.equal(driver.encodedCalls.at(-1)?.mode, 'idle');
+    assert.match(driver.encodedCalls.at(-1)?.text ?? '', /Raft inbox notice/);
+  });
+});
+
+test('active SDK compaction continues to steer rather than starting a turn', async () => {
+  await withManager(async ({ driver, manager }) => {
+    (driver as any).acceptsStdinDuringCompaction = false;
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    driver.parsedLines.set('start-compact', [{ kind: 'compaction_started' }]);
+    driver.parsedLines.set('finish-compact', [{ kind: 'compaction_finished', runtimeIdle: false }]);
+    driver.processes[0].stdout.emit('data', Buffer.from('start-compact\n'));
+    await flush();
+    manager.deliverMessage('agent-1', makeMessage('new message while active'));
+    await flush();
+    const before = driver.encodedCalls.length;
+    driver.processes[0].stdout.emit('data', Buffer.from('finish-compact\n'));
+    await waitFor(() => driver.encodedCalls.length > before, 'busy compaction delivery');
+    assert.equal(driver.encodedCalls.at(-1)?.mode, 'busy');
+  });
+});
+
+test('idle SDK compaction leaves the next incoming message as an idle delivery', async () => {
+  await withManager(async ({ driver, manager }) => {
+    (driver as any).acceptsStdinDuringCompaction = false;
+    (driver as any).id = 'pi';
+    await manager.startAgent('agent-1', makeConfig({ sessionId: 'session-1', runtime: 'pi' }));
+    driver.parsedLines.set('end', [{ kind: 'turn_end', sessionId: 'session-1' }]);
+    driver.parsedLines.set('start-compact', [{ kind: 'compaction_started' }]);
+    driver.parsedLines.set('finish-compact', [{ kind: 'compaction_finished', runtimeIdle: true }]);
+    driver.processes[0].stdout.emit('data', Buffer.from('end\nstart-compact\nfinish-compact\n'));
+    await flush();
+    assert.equal(getProcess(manager, 'agent-1').gatedSteering.isIdle, true);
+    const before = driver.encodedCalls.length;
+    manager.deliverMessage('agent-1', makeMessage('next message'));
+    await waitFor(() => driver.encodedCalls.length > before, 'new idle turn');
+    assert.equal(driver.encodedCalls.at(-1)?.mode, 'idle');
+  });
+});
