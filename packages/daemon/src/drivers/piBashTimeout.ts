@@ -18,8 +18,14 @@ import { isToolCallEventType, type ExtensionFactory } from "@earendil-works/pi-c
  * timeout the model did not. A timeout the model chose is never overwritten.
  */
 
-/** 30 minutes: long enough for a build or a big download, short enough to unblock the agent. */
-export const PI_DEFAULT_BASH_TIMEOUT_SECONDS = 30 * 60;
+/**
+ * 10 minutes. This is a backstop for commands that are stuck, not a budget for real work: normal
+ * commands finish in seconds to minutes. A model that needs longer passes its own timeout, and a
+ * command cut short by this limit comes back as a timeout the agent can act on (re-run it with a
+ * longer limit, or do something else). 10 minutes matches the ceiling @Dassai uses in daily work
+ * with Claude Code, where the default is 2 minutes.
+ */
+export const PI_DEFAULT_BASH_TIMEOUT_SECONDS = 10 * 60;
 
 export function piBashTimeoutSeconds(input: { timeout?: unknown }): number | undefined {
   const timeout = input.timeout;
