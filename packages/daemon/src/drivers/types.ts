@@ -507,6 +507,8 @@ export interface IdleRecycleStrategy {
   buildPanel(args: { transcriptPath: string; workspacePath?: string; budgetTokens?: number; recentMessagesMax?: number }): Promise<AxSurfaceText | null>;
   /** Startup: return a resume reason when a panel is required, or null if proceeding without one is safe. */
   panelUnavailableReason: string | null;
+  /** Live idle probe: read the runtime's own idle state right now. */
+  probeIdle?(): { isIdle: boolean } | null;
 }
 
 export interface RuntimeDriver {

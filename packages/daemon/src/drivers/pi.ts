@@ -1886,22 +1886,25 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       : undefined;
   }
 
-  idleRecycleObservation(): { sessionId: string | null; tokens: number | null; threshold: number | null; transcriptPath?: string; reason?: string } {
+  idleRecycleObservation(): { sessionId: string | null; tokens: number | null; threshold: number | null; transcriptPath?: string; reason?: string; isIdle?: boolean } {
     const session = this.session;
     const sessionId = this.currentSessionId;
     if (!session || !sessionId || this.didClose || this.ctx.config.runtime !== "pi") return { sessionId, tokens: null, threshold: null, reason: "session_unavailable" };
+    // The live session's own idle state, read once so every return path reports the same fact.
+    // Pi clears its compaction state before it emits compaction_end, so a settled session reads idle.
+    const idleFact = typeof session.isIdle === "boolean" ? { isIdle: session.isIdle } : {};
     try {
       const model = session.model;
       const usage = session.getContextUsage();
-      if (!model || !usage || !Number.isSafeInteger(usage.contextWindow) || usage.contextWindow <= 0) return { sessionId, tokens: null, threshold: null, reason: "window_unavailable" };
+      if (!model || !usage || !Number.isSafeInteger(usage.contextWindow) || usage.contextWindow <= 0) return { sessionId, tokens: null, threshold: null, reason: "window_unavailable", ...idleFact };
       const reserve = session.settingsManager.getCompactionReserveTokens(model);
       // Candidate margin, subject to validation from observation data.
       const threshold = Math.min(150_000, usage.contextWindow - reserve - 32_000);
-      if (!Number.isSafeInteger(reserve) || reserve < 0 || threshold <= 0) return { sessionId, tokens: usage.tokens, threshold: null, reason: "threshold_unavailable" };
-      if (usage.tokens === null || !Number.isFinite(usage.tokens)) return { sessionId, tokens: null, threshold, reason: "context_unavailable" };
-      return { sessionId, tokens: usage.tokens, threshold, transcriptPath: session.sessionFile };
+      if (!Number.isSafeInteger(reserve) || reserve < 0 || threshold <= 0) return { sessionId, tokens: usage.tokens, threshold: null, reason: "threshold_unavailable", ...idleFact };
+      if (usage.tokens === null || !Number.isFinite(usage.tokens)) return { sessionId, tokens: null, threshold, reason: "context_unavailable", ...idleFact };
+      return { sessionId, tokens: usage.tokens, threshold, transcriptPath: session.sessionFile, ...idleFact };
     } catch {
-      return { sessionId, tokens: null, threshold: null, reason: "observation_failed" };
+      return { sessionId, tokens: null, threshold: null, reason: "observation_failed", ...idleFact };
     }
   }
 
