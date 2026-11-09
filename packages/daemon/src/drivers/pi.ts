@@ -63,6 +63,7 @@ import { buildPiTokenUsageEvent } from "./piEventNormalizer";
 import { createPiIdleRecycle } from "./piIdleRecycle";
 import { createManagedMcpPiTools } from "./managedMcpTools";
 import { createPiCommandTool } from "./piCommandTool";
+import { createPiBashTimeoutExtension } from "./piBashTimeout";
 import {
   createPiCompactionFitExtension,
   piCompactionFitTelemetryAttrs,
@@ -1606,7 +1607,7 @@ export async function createPiAgentSessionForContext(
           resourceLoaderOptions: {
             additionalExtensionPaths: localExtensionPaths,
             // Keeps an oversized compaction request inside the model limit (task #10).
-            extensionFactories: [createPiCompactionFitExtension()],
+            extensionFactories: [createPiCompactionFitExtension(), createPiBashTimeoutExtension()],
             systemPromptOverride: () => ctx.standingPrompt,
           },
         });
