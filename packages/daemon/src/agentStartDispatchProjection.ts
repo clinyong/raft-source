@@ -1,5 +1,6 @@
 import type { AgentConfig, AgentMessage } from "@botiverse/raft-shared";
 import type { AgentStartCoordinator } from "./agentStartCoordinator";
+import type { StartResumePrompt } from "./startResumePrompt";
 
 export type AgentStartAcceptance = {
   queueState: "queued" | "starting" | "running" | "rebound";
@@ -40,7 +41,7 @@ export class AgentStartDispatchProjection {
     config: AgentConfig,
     wakeMessage?: AgentMessage,
     unreadSummary?: Record<string, number>,
-    resumePrompt?: string,
+    resumePrompt?: StartResumePrompt,
     launchId?: string,
     wakeMessageTransient = false,
     resumeMessages?: AgentMessage[],
@@ -60,6 +61,7 @@ export class AgentStartDispatchProjection {
       resume_messages_count: resumeMessages?.length ?? 0,
       unread_channels_count: unreadSummary ? Object.keys(unreadSummary).length : 0,
       resume_prompt_present: Boolean(resumePrompt),
+      resume_prompt_kind: resumePrompt?.kind ?? "none",
       queue_depth: snapshot.queueDepth,
       queue_age_ms: this.starts.queueAgeMs(agentId, this.clockNow()),
       active_starts: snapshot.activeStarts,

@@ -1,5 +1,6 @@
 import type { AgentConfig, AgentMessage, TraceContext } from "@botiverse/raft-shared";
 import type { RecoveryGrant } from "./runtimeOutcomeOutbox";
+import type { StartResumePrompt } from "./startResumePrompt";
 
 export type AgentStartQueueItem = {
   agentId: string;
@@ -10,7 +11,7 @@ export type AgentStartQueueItem = {
   wakeMessageTransient?: boolean;
   resumeMessages?: AgentMessage[];
   unreadSummary?: Record<string, number>;
-  resumePrompt?: string;
+  resumePrompt?: StartResumePrompt;
   launchId?: string;
   // RFC 071: the recovery grant of the admitted human start this start is
   // (bound to `launchId`); absent for every automatic start.

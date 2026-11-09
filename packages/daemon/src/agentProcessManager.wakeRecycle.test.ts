@@ -23,6 +23,9 @@ import { onTestFinished, test } from "vitest";
 import type { ChildProcess } from "node:child_process";
 import { asAxSurfaceText, type AgentConfig, type AxSurfaceText, type MachineToServerMessage } from "@botiverse/raft-shared";
 import { AgentProcessManager } from "./agentProcessManager";
+import { callerResumePrompt, noticeResumePrompt } from "./startResumePrompt";
+import { createAgentAppInboxStore, type AgentAppInboxStore } from "./agentAppInbox";
+import { REMINDER_AGENT_INBOX_REGISTRY } from "./apps/reminder/inboxDefinition";
 import { installManagedRunnerCredentialFetch } from "./testing/managedRunnerCredentialFetch";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent } from "./drivers/index";
 import { drainAgentManagerForTests, releaseAgentManagerForTests } from "./testing/agentManagerTeardown";
@@ -128,11 +131,12 @@ async function writeSessionTranscript(
 }
 
 async function withManager(
-  fn: (ctx: { driver: FakeClaudeDriver; manager: AgentProcessManager; dataDir: string; sent: MachineToServerMessage[] }) => Promise<void>,
+  fn: (ctx: { driver: FakeClaudeDriver; manager: AgentProcessManager; dataDir: string; sent: MachineToServerMessage[]; appInbox: AgentAppInboxStore }) => Promise<void>,
 ): Promise<void> {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-wake-recycle-test-"));
   const sent: MachineToServerMessage[] = [];
   const driver = new FakeClaudeDriver();
+  const appInbox = createAgentAppInboxStore({ registry: REMINDER_AGENT_INBOX_REGISTRY });
   const manager = new AgentProcessManager(
     (msg) => sent.push(msg),
     "sk_machine_test",
@@ -141,14 +145,27 @@ async function withManager(
       serverUrl: "https://daemon.example.com",
       driverResolver: () => driver,
       runtimeSessionHomeDir: dataDir,
+      appInboxForAgent: () => appInbox,
     },
   );
   try {
-    await fn({ driver, manager, dataDir, sent });
+    await fn({ driver, manager, dataDir, sent, appInbox });
   } finally {
     await releaseAgentManagerForTests(manager);
     await rm(dataDir, { recursive: true, force: true });
   }
+}
+
+
+function mintReminderAppItem(store: AgentAppInboxStore, revision: string) {
+  const minted = store.mint({
+    appId: "system.reminder",
+    notificationClass: "due",
+    sourceRef: { kind: "reminder", id: "11111111-1111-4111-8111-111111111111", revision },
+  });
+  assert.equal(minted.ok, true);
+  if (!minted.ok) throw new Error("failed to mint the reminder app item");
+  return minted.item;
 }
 
 const HOUR_MS = 3_600_000;
@@ -462,5 +479,88 @@ test("Codex cold-idle sweep stops a completed session and preserves restart stat
     assert.equal(ctx.driver.processes[0]!.killed, true);
     assert.equal(ap.gatedSteering.expectedTerminationReason, "cold_idle_recycle");
     assert.equal((ctx.manager as any).lifecycleRecords.getRestartSnapshot(agentId)?.sessionId, sessionId);
+  });
+});
+
+// An App Inbox notice is the daemon's own prompt, not a caller's: it says
+// something is waiting, not "keep this session". The wake recycle must
+// therefore stay in charge, and the notice must still reach the new session
+// as its last input.
+test("an App Inbox notice does not pin a cold, large session: the wake recycles and the notice is the new session's last input", async () => {
+  // The restart mints a runner credential; answer the mint here so it does
+  // not reach the network during the test.
+  onTestFinished(installManagedRunnerCredentialFetch());
+  await withManager(async (ctx) => {
+    const sessionId = "session-notice-recycle";
+    const agentId = "agent-notice-recycle";
+    // Start warm, then age the transcript so the session looks cold and large.
+    await writeSessionTranscript(ctx.dataDir, sessionId, { lastActivityAtMs: Date.now() - 60_000, contextTokens: 500_000 });
+    await ctx.manager.startAgent(agentId, makeConfig({ sessionId, envVars: { RAFT_WAKE_RECYCLE: "1" } }));
+    await writeSessionTranscript(ctx.dataDir, sessionId, { lastActivityAtMs: Date.now() - 3 * HOUR_MS, contextTokens: 500_000 });
+    const ap = (ctx.manager as any).agents.get(agentId);
+    ap.sessionId = sessionId;
+    ap.gatedSteering = { ...ap.gatedSteering, isIdle: true };
+    ap.runtimeProgress.noteInternalProgress(Date.now() - 3 * HOUR_MS);
+
+    // The cold-idle sweep stops the process and keeps the restart snapshot:
+    // this is the state a reminder wake finds.
+    await (ctx.manager as any).sweepColdIdleRuntimes();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(ctx.driver.processes[0]!.killed, true, "the cold idle process was stopped");
+    assert.ok((ctx.manager as any).lifecycleRecords.getRestartSnapshot(agentId), "the restart snapshot is kept");
+
+    const item = mintReminderAppItem(ctx.appInbox, "1");
+    assert.equal(await ctx.manager.notifyAgentAppInbox(agentId, item), true);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(ctx.driver.spawnCalls.length, 2, "the notice woke the agent");
+    const spawn = ctx.driver.spawnCalls[1]!;
+    assert.equal(spawn.config.sessionId, null, "the notice must not pin the old session: it is recycled");
+    assert.match(spawn.prompt, /App items pending: 1/, "the notice text is still delivered");
+    assert.match(
+      spawn.prompt,
+      /App items pending: 1[^]*$/,
+      "the notice is the last input of the new session",
+    );
+  });
+});
+
+test("a caller's resume prompt still pins the session even when it is cold and large", async () => {
+  await withManager(async (ctx) => {
+    const sessionId = "session-caller-pins";
+    await writeSessionTranscript(ctx.dataDir, sessionId, { lastActivityAtMs: Date.now() - 3 * HOUR_MS, contextTokens: 500_000 });
+
+    await ctx.manager.startAgent(
+      "agent-caller-pins",
+      makeConfig({ sessionId, envVars: { RAFT_WAKE_RECYCLE: "1" } }),
+      undefined,
+      undefined,
+      callerResumePrompt("Continue where you left off."),
+    );
+
+    assert.equal(ctx.driver.spawnCalls.length, 1);
+    const spawn = ctx.driver.spawnCalls[0]!;
+    assert.equal(spawn.config.sessionId, sessionId, "a caller's prompt keeps the prior session");
+    assert.match(spawn.prompt, /Continue where you left off\./);
+  });
+});
+
+test("an App Inbox notice does not recycle a session whose context is still small", async () => {
+  await withManager(async (ctx) => {
+    const sessionId = "session-notice-small";
+    await writeSessionTranscript(ctx.dataDir, sessionId, { lastActivityAtMs: Date.now() - 3 * HOUR_MS, contextTokens: 50_000 });
+
+    await ctx.manager.startAgent(
+      "agent-notice-small",
+      makeConfig({ sessionId, envVars: { RAFT_WAKE_RECYCLE: "1" } }),
+      undefined,
+      undefined,
+      noticeResumePrompt("[Raft Inbox notice: App items pending: 1]"),
+    );
+
+    assert.equal(ctx.driver.spawnCalls.length, 1);
+    const spawn = ctx.driver.spawnCalls[0]!;
+    assert.equal(spawn.config.sessionId, sessionId, "a small context is resumed, notice or not");
+    assert.match(spawn.prompt, /App items pending: 1/);
   });
 });

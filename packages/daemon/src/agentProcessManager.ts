@@ -183,6 +183,7 @@ import {
 import { isCodexToolArgumentParseErrorChunk } from "./codexToolArgumentParseSignature";
 import { materializeProviderConnectionForSpawn } from "./providerConnectionLaunch";
 import { applyStartupMemoryBlock, buildStartupMemoryBlock, resolveStartupMemoryBlockConfig } from "./startupMemoryBlock";
+import { isCallerResumePrompt, noticeResumePrompt, resumePromptText, type StartResumePrompt } from "./startResumePrompt";
 import { COLD_IDLE_SWEEP_MS, applyWakeRecycleBriefing, describeAppliedWakeRecycle, planWakeSessionRecycle, selectColdIdleRecycleStops } from "./wakeSessionRecycle";
 import { RuntimeProgressState } from "./runtimeProgressState";
 import {
@@ -725,7 +726,7 @@ type AgentProcessTimer = ReturnType<typeof setTimeout>;
 export type AgentProcessStartupContext = {
   wakeMessage: AgentMessage | undefined;
   unreadSummary: Record<string, number> | undefined;
-  resumePrompt: string | undefined;
+  resumePrompt: StartResumePrompt | undefined;
 };
 
 export type AgentProcessStartupState =
@@ -1432,7 +1433,7 @@ function buildRuntimeInputTraceAttrs(opts: {
   source: string;
   prompt: string;
   standingPrompt?: string;
-  resumePrompt?: string;
+  resumePrompt?: StartResumePrompt;
   messages?: AgentMessage[];
   unreadSummary?: Record<string, number>;
   sessionIdPresent: boolean;
@@ -1443,7 +1444,8 @@ function buildRuntimeInputTraceAttrs(opts: {
     runtime_input_prompt_bytes_bucket: bucketBytes(opts.prompt),
     runtime_input_standing_prompt_bytes_bucket: bucketBytes(opts.standingPrompt),
     runtime_input_resume_prompt_present: Boolean(opts.resumePrompt),
-    runtime_input_resume_prompt_bytes_bucket: bucketBytes(opts.resumePrompt),
+    runtime_input_resume_prompt_kind: opts.resumePrompt?.kind ?? "none",
+    runtime_input_resume_prompt_bytes_bucket: bucketBytes(resumePromptText(opts.resumePrompt)),
     runtime_input_session_present: opts.sessionIdPresent,
     runtime_input_native_standing_prompt_present: opts.nativeStandingPrompt,
     runtime_input_unread_channels_count: opts.unreadSummary ? Object.keys(opts.unreadSummary).length : 0,
@@ -3224,7 +3226,7 @@ export class AgentProcessManager {
     }));
   }
 
-  private startLaunchSource(config: AgentConfig, wakeMessage?: AgentMessage, resumePrompt?: string): string {
+  private startLaunchSource(config: AgentConfig, wakeMessage?: AgentMessage, resumePrompt?: StartResumePrompt): string {
     if (config.runtimeProfileControl && !wakeMessage) return "runtime_profile";
     if (config.sessionId || resumePrompt) return "session_resume";
     if (wakeMessage) return "wake_message";
@@ -3903,7 +3905,7 @@ export class AgentProcessManager {
         cached.config,
         undefined,
         undefined,
-        notice,
+        noticeResumePrompt(notice),
         cached.launchId || undefined,
       ));
       recordNotice("restart_requested", "ok", "idle");
@@ -4078,7 +4080,7 @@ export class AgentProcessManager {
    * outbox); every internal caller (restart, cold start, ...) passes none and
    * is checked as an automatic start.
    */
-  async startAgent(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent?: TraceContext | null, catchupBatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null) {
+  async startAgent(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: StartResumePrompt, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent?: TraceContext | null, catchupBatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null) {
     // Any start settles a parked server wake: the pending app-inbox items are
     // replayed to the new process by the ordinary start path.
     this.pendingServerWakes.delete(agentId);
@@ -4311,7 +4313,7 @@ export class AgentProcessManager {
   // Wraps one spawn attempt in a short span. The spawn span is passed down
   // by value and is not made active, because the new process outlives it and
   // its later events must not attach to this span.
-  private async startAgentNow(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent: TraceContext | null = null, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null) {
+  private async startAgentNow(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: StartResumePrompt, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent: TraceContext | null = null, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null) {
     const spawnSpan = this.tracer.startSpan("daemon.agent.spawn", {
       parent: traceParent,
       surface: "daemon",
@@ -4356,7 +4358,7 @@ export class AgentProcessManager {
     }
   }
 
-  private async spawnAgentProcess(spawnTraceparent: string, agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: string, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null) {
+  private async spawnAgentProcess(spawnTraceparent: string, agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: StartResumePrompt, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null) {
     if (this.agents.has(agentId)) {
       this.recordDaemonEvent("daemon.agent.spawn.skipped", {
         ...this.agentStartDispatch.traceAttrs(agentId, config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient, resumeMessages, startDispatchId),
@@ -4528,7 +4530,7 @@ export class AgentProcessManager {
     });
     // RFC 070 phase 1: at a cold wake with a large prior context, retire the
     // session (drop driver `--resume`) but keep the ladder's resume semantics.
-    const wakeRecycle = await planWakeSessionRecycle({ config: runtimeConfig, hasResumePrompt: Boolean(resumePrompt), homeDir: this.runtimeSessionHomeDir, idleRecycle: driver.idleRecycle ?? null });
+    const wakeRecycle = await planWakeSessionRecycle({ config: runtimeConfig, hasResumePrompt: isCallerResumePrompt(resumePrompt), homeDir: this.runtimeSessionHomeDir, idleRecycle: driver.idleRecycle ?? null });
     if (wakeRecycle.action === "resume") {
       // RFC 070 observability: the recycle's resume reason (flag off, warm
       // cache, small context, unreadable transcript, ...) was a local log line
@@ -4602,7 +4604,7 @@ export class AgentProcessManager {
         : formatRuntimeProfileControlStartupInput(runtimeConfig.runtimeProfileControl, driver);
       promptSource = "runtime_profile_control";
     } else if (isResume && resumePrompt) {
-      prompt = adoptAxSurfaceText(resumePrompt);
+      prompt = adoptAxSurfaceText(resumePromptText(resumePrompt) ?? "");
       promptSource = "resume_prompt";
     } else if (wakeMessage) {
       const transientWakeMessage = wakeMessageTransient === true;

@@ -1,6 +1,7 @@
 /** Isolated real Codex app-server + Raft manager. Opt in explicitly: it uses
  * subscription quota, copies auth into a temporary HOME, and never contacts
  * a Raft server. The old rollout is seeded with synthetic actions. */
+import { callerResumePrompt } from "./startResumePrompt";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, copyFile, chmod, writeFile, appendFile, readdir, rm, symlink } from "node:fs/promises";
 import os from "node:os";
@@ -42,7 +43,7 @@ live("isolated Codex sweep stops then wakes a fresh session with a briefing", { 
   try {
     const config: any = { name: "isolated", displayName: "Isolated", description: "Isolated test agent", model: "gpt-6.1-terra", runtime: "codex", reasoningEffort: null, constructedWakeContext: true, envVars: { HOME: home, CODEX_HOME: path.join(home, ".codex"), PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`, RAFT_CODEX_WAKE_RECYCLE: "1", RAFT_CODEX_WAKE_RECYCLE_MIN_CONTEXT_TOKENS: "1", RAFT_CODEX_WAKE_RECYCLE_MIN_IDLE_MS: "1000" }, sessionId: null, serverUrl: "http://127.0.0.1:9", authToken: "fake-token", agentCredentialKey: "fake-agent-token", agentCredentialId: null };
     const marker = "violet-koala-2846";
-    await manager.startAgent("isolated", config, undefined, undefined, "Reply READY. Do not use tools.");
+    await manager.startAgent("isolated", config, undefined, undefined, callerResumePrompt("Reply READY. Do not use tools."));
     await wait(() => { const ap = (manager as any).agents.get("isolated"); return Boolean(ap?.sessionId && ap.gatedSteering.isIdle); }, "first Codex turn");
     const first = (manager as any).agents.get("isolated");
     const oldId = first.sessionId as string;

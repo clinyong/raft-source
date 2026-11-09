@@ -68,6 +68,7 @@ import {
   APP_SOURCE_TRACE_IDENTITY_KEYS,
 } from "@botiverse/raft-shared/src/appRuntimeTrace";
 import { AgentProcessManager, classifySpawnFailure, StaleDispatchError, type RuntimeProcessGate } from "./agentProcessManager";
+import { callerResumePrompt } from "./startResumePrompt";
 import { getDriver } from "./drivers/index";
 import type { RuntimeProbeUnavailableReason } from "./drivers/types";
 import { readCommandVersion, resolveCommandOnPath } from "./drivers/probe";
@@ -4355,7 +4356,9 @@ export class DaemonCore {
         config,
         wakeMessage,
         msg.unreadSummary,
-        msg.resumePrompt,
+        // A resume prompt that arrives from the Server is a caller's: somebody
+        // asked to continue this session.
+        msg.resumePrompt === undefined ? undefined : callerResumePrompt(msg.resumePrompt),
         msg.launchId,
         wakeMessageTransient,
         msg.resumeMessages,
