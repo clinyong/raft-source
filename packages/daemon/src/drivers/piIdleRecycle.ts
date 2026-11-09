@@ -43,7 +43,11 @@ export function createPiIdleRecycle(snapshot: () => PiObservation): IdleRecycleS
     // trusts the stale copy never recovers.
     probeIdle: () => {
       const observation = snapshot();
-      if (observation.reason) return null;
+      // The idle fact and the token fact are independent. A reason such as
+      // "context_unavailable" only says the token count could not be read
+      // (the 2026-11-09 stall logged exactly that), and it says nothing
+      // about whether the session is working. An idle session is reported as
+      // idle whatever the reason is.
       if (typeof observation.isIdle !== "boolean") return null;
       return { isIdle: observation.isIdle };
     },

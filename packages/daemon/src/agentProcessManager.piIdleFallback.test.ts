@@ -252,3 +252,42 @@ test("Pi idle while the daemon recorded busy: the daemon state is corrected, the
     assert.match(infoText, /Pi idle delivery fallback/, "the fallback path logs an INFO line to the runner log");
   });
 });
+
+test("a busy Pi session is checked again later, and the later check delivers", async () => {
+  vi.useFakeTimers();
+  await withManager(async ({ driver, manager }) => {
+    await startBusyPiWithQueuedMessage({ driver, manager }, "agent-pi-5", "delivered on the second check");
+    driver.liveIdle = { isIdle: false };
+
+    (manager as any).schedulePiIdleDeliveryFallback("agent-pi-5", "test");
+    await vi.advanceTimersByTimeAsync(FALLBACK_DELAY_MS + 1_000);
+    assert.equal(driver.processes[0]!.stdinWrites.length, 0, "a busy session is left alone");
+    assert.equal((manager as any).isApmIdle(getProcess(manager, "agent-pi-5")), false, "the daemon keeps its own state");
+
+    // The turn ends after the first check: the message must not be stranded
+    // because the check that mattered came a moment too early.
+    driver.liveIdle = { isIdle: true };
+    await vi.advanceTimersByTimeAsync(FALLBACK_DELAY_MS + 1_000);
+    assert.equal(driver.processes[0]!.stdinWrites.length, 1, "the later check delivered the message");
+  });
+});
+
+test("the fallback stays quiet when there is nothing to deliver", async () => {
+  vi.useFakeTimers();
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-pi-6", makeConfig({ sessionId: "session-pi-6" }));
+    const ap = getProcess(manager, "agent-pi-6");
+    ap.sessionId = "session-pi-6";
+    ap.sessionReadyForDelivery = true;
+    (manager as any).commitApmIdleState("agent-pi-6", ap, false);
+    driver.liveIdle = { isIdle: false };
+    const info = vi.spyOn(logger, "info").mockImplementation(() => {});
+
+    (manager as any).schedulePiIdleDeliveryFallback("agent-pi-6", "test");
+    await vi.advanceTimersByTimeAsync(FALLBACK_DELAY_MS + 1_000);
+
+    const infoText = info.mock.calls.map((call) => String(call[0])).join("\n");
+    assert.doesNotMatch(infoText, /Pi idle delivery fallback/, "no work means no log line");
+    assert.equal(driver.processes[0]!.stdinWrites.length, 0, "and nothing is delivered");
+  });
+});

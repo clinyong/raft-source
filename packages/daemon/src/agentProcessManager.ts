@@ -2462,11 +2462,21 @@ export class AgentProcessManager {
     const probe = ap.driver.idleRecycle?.probeIdle?.() ?? null;
     const daemonIdle = this.isApmIdle(ap);
     const untoldWork = this.hasUntoldInboxWork(ap);
+    // Nothing to deliver: stay quiet. A long tool call would otherwise put a
+    // line in the runner log every 30 seconds.
+    if (!untoldWork) return false;
     logger.info(
       `[Agent ${agentId}] Pi idle delivery fallback check (source=${source}, piIdle=${probe ? probe.isIdle : "unknown"}, daemonIdle=${daemonIdle}, untoldWork=${untoldWork})`,
     );
-    if (!probe || !probe.isIdle) return false;
-    if (!untoldWork) return false;
+    // The runtime cannot answer: stop here rather than check forever.
+    if (!probe) return false;
+    if (!probe.isIdle) {
+      // The session is still working. One check is not enough: the turn may
+      // end after this check, and a delivery missed in that window would
+      // strand the message again. Check again later.
+      this.schedulePiIdleDeliveryFallback(agentId, source);
+      return false;
+    }
     if (!ap.driver.supportsStdinNotification || !ap.sessionId) return false;
     if (!daemonIdle) {
       logger.warn(
