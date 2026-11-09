@@ -7,6 +7,8 @@ type PiObservation = {
   threshold: number | null;
   transcriptPath?: string;
   reason?: string;
+  /** The Pi session's own idle state, read from the live session. */
+  isIdle?: boolean;
 };
 
 /**
@@ -34,6 +36,17 @@ export function createPiIdleRecycle(snapshot: () => PiObservation): IdleRecycleS
       }
     },
     stateSafe: (state) => state.backgroundTasks === 0 && state.outstandingToolUses === 0 && !state.compacting && !state.reviewing,
+    // The live session is the authority on "is Pi working right now". The
+    // daemon keeps its own copy of that state and it can be stale: the
+    // daemon believed Pi was busy long after the session had settled
+    // (2026-11-07 and 2026-11-09 stalls), and a delivery decision that
+    // trusts the stale copy never recovers.
+    probeIdle: () => {
+      const observation = snapshot();
+      if (observation.reason) return null;
+      if (typeof observation.isIdle !== "boolean") return null;
+      return { isIdle: observation.isIdle };
+    },
     checkWork: async () => ({ status: "unknown", reason: "pi_background_work_unverified" }),
     logSkip: () => false,
     wakeGapReason: (idleMs, thresholdMs) => idleMs < thresholdMs ? "pi_idle_below_threshold" : null,

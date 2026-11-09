@@ -575,6 +575,18 @@ function runtimeStartTimeoutMs(): number {
   );
 }
 
+/**
+ * Pi-only idle delivery fallback delay (2026-11-09).
+ *
+ * The daemon decides "is this agent busy?" from its own bookkeeping
+ * (ap.gatedSteering.isIdle). That copy can be stale: on 2026-11-07 and
+ * 2026-11-09 a Pi session had already settled while the daemon still
+ * believed the runtime was working, so queued messages were never delivered
+ * as a new turn and the agent sat silent. This delay is how long the daemon
+ * waits before asking the Pi session itself whether it is idle.
+ */
+const PI_IDLE_DELIVERY_FALLBACK_MS = 30_000;
+
 const SESSION_TRANSCRIPT_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
 
 /**
@@ -797,6 +809,8 @@ interface AgentProcess {
   startDispatchId: string | null;
   startup: AgentProcessStartupState;
   notifications: RuntimeNotificationState;
+  /** Pending Pi idle delivery fallback check (see schedulePiIdleDeliveryFallback). */
+  piIdleFallbackTimer?: NodeJS.Timeout;
   /** Timer that periodically re-sends transient activity (working/thinking) to prevent server stale timeout */
   activityHeartbeat: ActivityHeartbeatTimerState;
   /**
@@ -2406,6 +2420,69 @@ export class AgentProcessManager {
       "async_rejected_idle_delivery_retry",
       "daemon.agent.stdin_delivery.async_rejected.retry",
     );
+  }
+
+  /**
+   * Schedule the Pi idle delivery fallback: one delayed check per agent.
+   *
+   * A later trigger does not stack a second timer on top of a pending one;
+   * the pending check re-reads the live state when it fires, so a message
+   * that arrives during the delay is still covered.
+   */
+  private schedulePiIdleDeliveryFallback(agentId: string, source: string): void {
+    const ap = this.agents.get(agentId);
+    if (!ap || ap.config.runtime !== "pi") return;
+    if (!ap.sessionId) return;
+    if (ap.piIdleFallbackTimer) return;
+    const timer = setTimeout(() => {
+      ap.piIdleFallbackTimer = undefined;
+      this.runPiIdleDeliveryFallback(agentId, source);
+    }, PI_IDLE_DELIVERY_FALLBACK_MS);
+    timer.unref?.();
+    ap.piIdleFallbackTimer = timer;
+  }
+
+  /**
+   * The delayed check itself.
+   *
+   * Pi's live session state is authoritative; the daemon's own idle copy is
+   * a cache of it. When the two disagree the daemon copy is corrected and
+   * the disagreement is logged: that disagreement is the evidence the
+   * 2026-11-09 investigation could not find, so it has to reach
+   * runner.log and not only the trace sink.
+   *
+   * The delivery itself reuses the ordinary idle path (an idle write starts
+   * a new turn) and its dedupe: a message that was already told to the
+   * session is not told again, and a message the agent deliberately left
+   * unread is not treated as pending work.
+   */
+  private runPiIdleDeliveryFallback(agentId: string, source: string): boolean {
+    const ap = this.agents.get(agentId);
+    if (!ap || ap.config.runtime !== "pi") return false;
+    const probe = ap.driver.idleRecycle?.probeIdle?.() ?? null;
+    const daemonIdle = this.isApmIdle(ap);
+    const untoldWork = this.hasUntoldInboxWork(ap);
+    logger.info(
+      `[Agent ${agentId}] Pi idle delivery fallback check (source=${source}, piIdle=${probe ? probe.isIdle : "unknown"}, daemonIdle=${daemonIdle}, untoldWork=${untoldWork})`,
+    );
+    if (!probe || !probe.isIdle) return false;
+    if (!untoldWork) return false;
+    if (!ap.driver.supportsStdinNotification || !ap.sessionId) return false;
+    if (!daemonIdle) {
+      logger.warn(
+        `[Agent ${agentId}] Pi reports idle but the daemon recorded busy; correcting the daemon idle state (source=${source}, outstandingToolUses=${ap.gatedSteering.outstandingToolUses}, pendingNotifications=${ap.notifications.pendingCount}, inbox=${ap.inbox.length})`,
+      );
+      this.commitApmIdleState(agentId, ap, true);
+    }
+    const messages = ap.notifications.filterUncontributedMessages(ap.inbox, ap.sessionId);
+    if (messages.length === 0) return false;
+    ap.notifications.clearPending();
+    ap.notifications.clearTimer();
+    const accepted = this.deliverInboxUpdateViaStdin(agentId, ap, messages, "idle", "pi_idle_fallback");
+    logger.info(
+      `[Agent ${agentId}] Pi idle delivery fallback (source=${source}): ${accepted ? `delivered ${messages.length} message(s) as a new turn` : "the runtime rejected the idle write; the messages stay pending"}`,
+    );
+    return accepted;
   }
 
   /**
@@ -6791,6 +6868,10 @@ export class AgentProcessManager {
       // A tracked mention waits for the observed turn boundary. Do not turn
       // recovery into a second busy force-wake lane.
       ap.notifications.clearTimer();
+      // The message now waits for a turn that may never come: the daemon
+      // believes the runtime is busy, and that belief can be stale. The
+      // fallback asks the runtime itself whether it is idle.
+      this.schedulePiIdleDeliveryFallback(agentId, "message_queued");
       this.markTrackedMentionPending(traceContext, queued.duplicate ? "coalesced" : "accepted");
       this.recordDaemonEvent("daemon.agent.delivery.routed", this.deliveryTraceAttrs(agentId, message, {
         outcome: queued.duplicate ? "coalesced_busy_mention" : "queued_busy_mention",
@@ -8607,6 +8688,7 @@ export class AgentProcessManager {
       this.flushCompactionBoundaryMessages(agentId, ap);
     }
     this.commitApmIdleState(agentId, ap, false);
+    this.schedulePiIdleDeliveryFallback(agentId, "compaction_completed");
   }
 
   private interruptCompactionIfActive(
@@ -10055,6 +10137,11 @@ export class AgentProcessManager {
           } else {
             this.flushCompactionBoundaryMessages(agentId, ap);
           }
+          // Either branch can leave the daemon's idle view wrong (the daemon
+          // believes Pi is busy while the session has already settled). The
+          // fallback asks the session itself a moment later, so it does not
+          // depend on which branch ran.
+          this.schedulePiIdleDeliveryFallback(agentId, "compaction_finished");
         }
         break;
 
