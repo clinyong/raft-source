@@ -446,6 +446,7 @@ test("agent-api manifest records request and response contract presence", () => 
 test("agent-api response contracts parse representative envelopes", () => {
   const coverage = { from: "2026-10-17T00:00:00Z", to: "2026-10-18T00:00:00Z", fetchedMessages: 0, exhausted: true, stopReason: "window_end", notRead: [] };
   const samples: Record<AgentApiRouteKey, unknown> = {
+    selfSessionReset: { status: "accepted" },
     raftbenchContext: { runId: "00000000-0000-4000-8000-000000000001", revision: 1, sourceText: "Synthetic source", sources: [], coverage, nextCursor: null },
     raftbenchSubmit: { runId: "00000000-0000-4000-8000-000000000001", revision: 1, status: "complete", receiptId: "00000000-0000-4000-8000-000000000002", coverage },
     feedbackLocatorIngest: {

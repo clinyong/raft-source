@@ -1672,6 +1672,10 @@ function summarizeIncomingMessage(msg: ServerToMachineMessage): string {
       return `(agent=${msg.agentId}, runtime=${msg.config.runtime}, model=${msg.config.model}, session=${msg.config.sessionId || "new"}, wikiPack=${msg.wikiWorkspacePack.packId.slice(0, 12)}${msg.wakeMessage ? ", wake=true" : ""})`;
     case "agent:stop":
       return `(agent=${msg.agentId})`;
+    case "agent:self_session_reset:request":
+    case "agent:self_session_reset:rejected":
+    case "agent:self_session_reset:cancel_result":
+      return `(agent=${msg.agentId})`;
     case "agent:wake:outcome":
       return `(agent=${msg.agentId}, wake=${msg.wakeRequestId.slice(0, 8)}, outcome=${msg.outcome}${msg.reason ? `, reason=${msg.reason}` : ""})`;
     case "agent:reset-workspace":
@@ -4464,6 +4468,21 @@ export class DaemonCore {
         });
         break;
 
+      case "agent:self_session_reset:cancel_result":
+        this.agentManager.handleSelfResetCancelResult(msg.agentId, msg.launchId, msg.notStarted);
+        break;
+
+      case "agent:self_session_reset:rejected":
+        this.agentManager.rejectSelfSessionReset(msg.agentId, msg.launchId);
+        break;
+
+      case "agent:self_session_reset:request":
+        this.connection.send({
+          type: "agent:self_session_reset:ack", agentId: msg.agentId, launchId: msg.launchId, requestId: msg.requestId,
+          result: this.agentManager.requestSelfSessionReset(msg.agentId, msg.launchId),
+        });
+        break;
+
       case "agent:stop":
         logger.info(`[Agent ${msg.agentId}] Stop requested`);
         this.agentManager.stopAgent(msg.agentId);
@@ -5699,6 +5718,7 @@ export class DaemonCore {
     for (const { agentId } of idleAgentSessions) {
       agentsForSnapshot.add(agentId);
     }
+    this.agentManager.replaySelfResetRecovery();
     this.localScheduleRuntime.onConnect();
     for (const agentId of agentsForSnapshot) {
       this.localScheduleRuntime.requestSnapshot(agentId);

@@ -17,6 +17,7 @@ const raftbenchContext = { runId: raftbenchRunId, revision: 1, sourceText: "Cove
 const raftbenchReport = { runId: raftbenchRunId, revision: 1, status: "complete", patterns: [], gaps: [] };
 const raftbenchReceipt = { runId: raftbenchRunId, revision: 1, status: "complete", receiptId: "00000000-0000-4000-8000-000000000002", coverage: raftbenchCoverage };
 const validResponses: Record<AgentApiRouteKey, unknown> = {
+  selfSessionReset: { status: "accepted" },
   raftbenchContext,
   raftbenchSubmit: raftbenchReceipt,
   feedbackLocatorIngest: {
@@ -659,6 +660,7 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
 };
 
 const methodInputs: Record<AgentApiRouteKey, unknown[]> = {
+  selfSessionReset: [],
   raftbenchContext: [{ runId: raftbenchRunId }],
   raftbenchSubmit: [raftbenchReport],
   feedbackLocatorIngest: [{
@@ -831,6 +833,7 @@ test("raw client exposes every contract client binding and sends generated route
   assert.deepEqual(
     requests.map(({ routeKey, method, path, body }) => ({ routeKey, method, path, body })),
     [
+      { routeKey: "selfSessionReset", method: "POST", path: "/internal/agent-api/self/session-reset", body: undefined },
       { routeKey: "raftbenchContext", method: "GET", path: `/internal/agent-api/raftbench/context?runId=${raftbenchRunId}`, body: undefined },
       { routeKey: "raftbenchSubmit", method: "POST", path: "/internal/agent-api/raftbench/submit", body: raftbenchReport },
       {

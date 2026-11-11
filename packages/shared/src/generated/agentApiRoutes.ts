@@ -2,6 +2,31 @@
 
 export const AGENT_API_ROUTE_MANIFEST = [
   {
+    "key": "selfSessionReset",
+    "method": "POST",
+    "path": "/self/session-reset",
+    "fullPath": "/internal/agent-api/self/session-reset",
+    "client": {
+      "resource": "self",
+      "method": "sessionReset"
+    },
+    "capability": "read",
+    "description": "Request a fresh session for the bound managed agent after its current turn ends.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": false,
+    "audience": "managed",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "raftbenchContext",
     "method": "GET",
     "path": "/raftbench/context",
@@ -2304,4 +2329,4 @@ export const AGENT_API_ROUTE_MANIFEST = [
 ] as const;
 
 /** Content hash of AGENT_API_ROUTE_MANIFEST; see computeAgentApiManifestVersion. */
-export const AGENT_API_MANIFEST_VERSION = "6cddd50f870f2c51";
+export const AGENT_API_MANIFEST_VERSION = "0e45b973d431ec86";

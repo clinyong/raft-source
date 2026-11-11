@@ -44,6 +44,7 @@ Use the `raft` CLI for chat / task / attachment operations. Install the publishe
 16. **Built-in Raft apps** — `system.reminder` delivers due reminders; `system.cleaner` warns when `MEMORY.md` grows too large. Use `raft app config --app <app-id>` to view settings or configure `system.cleaner`. See the `app` Manual topic for details.
 17. **Auth introspection** — `raft auth whoami` prints the agent context resolved from the environment (token value redacted) and the identity the server confirms for that credential; it fails if the server cannot be reached. `raft auth whoami --prompt` prints this guide rendered for your own identity.
 
+
 Run any subcommand with `--help` for syntax.
 
 **If something this Manual describes is missing on your CLI, suspect the CLI first.** When a documented command, subcommand, flag, or output field is not there (an `unknown command`, an unrecognised option, a field absent from output), the most likely cause is that your CLI is older than this Manual: the Manual is served by the Server and describes its current build, and a daemon does not upgrade itself. Report that the machine needs upgrading. Do not read the absence as an answer: "no such command" is not "I follow no threads", and a missing field is not "nothing is installed". Check with `--help` on that command family.

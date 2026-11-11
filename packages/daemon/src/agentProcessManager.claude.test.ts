@@ -5541,3 +5541,333 @@ test('idle SDK compaction leaves the next incoming message as an idle delivery',
     assert.equal(driver.encodedCalls.at(-1)?.mode, 'idle');
   });
 });
+
+test("self reset holds inbox input until the requesting launch ends its turn", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const ap = getProcess(manager, "agent-reset");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "wrong-launch"), "stale");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    (manager as any).markSessionReadyForDelivery(ap, "turn_end");
+    await manager.deliverMessage("agent-reset", makeMessage("arrived while the turn was running", { message_id: "queued-1" }));
+    await flush();
+    assert.equal(driver.encodedCalls.length, 0);
+    driver.parsedLines.set("turn-end-reset", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-reset\n"));
+    await flush();
+    assert.equal(driver.encodedCalls.length, 0);
+    assert.equal(ap.inbox.some((m: AgentMessage) => m.message_id === "queued-1"), true);
+    const ready = sent.filter((m) => m.type === "agent:self_session_reset:ready");
+    assert.deepEqual(ready, [{ type: "agent:self_session_reset:ready", agentId: "agent-reset", launchId: "launch-1", sessionId: "session-1" }]);
+  });
+});
+
+test("self reset rejects an already idle launch without blocking later input", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    driver.parsedLines.set("idle-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("idle-turn-end\n"));
+    await flush();
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "idle");
+    await manager.deliverMessage("agent-reset", makeMessage("later", { message_id: "later-1" }));
+    await waitFor(() => driver.encodedCalls.length > 0, "idle delivery after rejected reset");
+  });
+});
+
+test("unknown reset outcome retains messages, retries once and reports failure", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const ap = getProcess(manager, "agent-reset");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    ap.inbox.push(makeMessage("pending", { message_id: "queued-1" }));
+    driver.parsedLines.set("turn-end-reset", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-reset\n"));
+    await flush();
+    (manager as any).clearSelfResetTimer("agent-reset");
+    (manager as any).expireSelfResetTimer("agent-reset", "launch-1", "session-1");
+    assert.equal(sent.filter((m) => m.type === "agent:self_session_reset:cancel").length, 1);
+    (manager as any).clearSelfResetTimer("agent-reset");
+    (manager as any).expireSelfResetTimer("agent-reset", "launch-1", "session-1");
+    assert.equal(sent.filter((m) => m.type === "agent:self_session_reset:recover").length, 1);
+    assert.equal(driver.encodedCalls.length, 0);
+    assert.equal(ap.inbox.some((m: AgentMessage) => m.message_id === "queued-1"), true);
+    (manager as any).clearSelfResetTimer("agent-reset");
+    (manager as any).expireSelfResetTimer("agent-reset", "launch-1", "session-1");
+    assert.equal(sent.filter((m) => m.type === "agent:self_session_reset:failed").length, 1);
+    assert.equal(driver.encodedCalls.length, 0);
+    assert.equal(ap.inbox.some((m: AgentMessage) => m.message_id === "queued-1"), true);
+  });
+});
+
+test("a replacement that has initialized does not time out during a long first turn", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    driver.parsedLines.set("new-session", [{ kind: "session_init", sessionId: "session-2" }]);
+    driver.processes[1].stdout.emit("data", Buffer.from("new-session\n"));
+    await flush();
+    (manager as any).expireSelfResetTimer("agent-reset", "launch-1", "session-1");
+    assert.equal(sent.some((m) => m.type === "agent:self_session_reset:recover" || m.type === "agent:self_session_reset:failed"), false);
+  });
+});
+
+test("confirmed pre-clear timeout resumes the old launch with its queued message", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const ap = getProcess(manager, "agent-reset");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    ap.inbox.push(makeMessage("pending", { message_id: "queued-1" }));
+    driver.parsedLines.set("turn-end-reset", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-reset\n"));
+    await flush();
+    (manager as any).clearSelfResetTimer("agent-reset");
+    (manager as any).expireSelfResetTimer("agent-reset", "launch-1", "session-1");
+    assert.equal(sent.filter((m) => m.type === "agent:self_session_reset:cancel").length, 1);
+    manager.handleSelfResetCancelResult("agent-reset", "launch-1", true);
+    (manager as any).flushIdleInboxDeliveryRetry("agent-reset", "self_reset_rejected", "daemon.agent.self_reset.resume");
+    assert.equal(driver.encodedCalls.length, 1);
+    assert.match(driver.encodedCalls[0]!.text, /general/);
+    assert.equal(sent.some((m) => m.type === "agent:self_session_reset:recover"), false);
+  });
+});
+
+test("request is cancelled if its launch exits before turn end", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.processes[0].emit("exit", 1, null);
+    driver.processes[0].emit("close", 1, null);
+    await flush();
+    assert.equal(sent.some((m) => m.type === "agent:self_session_reset:ready"), false);
+    assert.equal(sent.some((m) => m.type === "agent:self_session_reset:failed" && m.reason === "launch_exited"), true);
+  });
+});
+
+test("uncertain reset refuses a later launch that would resume the old session", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("turn-end-reset", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end-reset\n"));
+    await flush();
+    await manager.stopAgent("agent-reset", { wait: true });
+    await assert.rejects(
+      manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-2"),
+      /cannot start on the old session or process/,
+    );
+  });
+});
+
+test("transient input held during self reset reaches only the replacement session", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("transient marker", { message_id: "transient-1" }), { transient: true });
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    assert.equal(driver.encodedCalls.length, 0);
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    driver.parsedLines.set("new-session", [{ kind: "session_init", sessionId: "session-2" }]);
+    driver.parsedLines.set("new-turn-end", [{ kind: "turn_end", sessionId: "session-2" }]);
+    driver.processes[1].stdout.emit("data", Buffer.from("new-session\nnew-turn-end\n"));
+    await waitFor(() => driver.encodedCalls.length === 1, "deferred transient delivery");
+    assert.equal(driver.encodedCalls[0]!.sessionId, "session-2");
+    assert.match(driver.encodedCalls[0]!.text, /transient marker/);
+    await flush();
+    assert.equal(driver.encodedCalls.length, 1);
+  });
+});
+
+test("self reset carries the old local inbox to the fresh launch without duplicating its wake", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    const queued = makeMessage("queued marker", { message_id: "queued-1", seq: 7 });
+    await manager.deliverMessage("agent-reset", queued);
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), queued, undefined, undefined, "launch-2");
+    const ap = getProcess(manager, "agent-reset");
+    assert.equal(ap.inbox.filter((m: AgentMessage) => m.message_id === "queued-1").length, 1);
+    assert.equal(driver.encodedCalls.length, 0);
+  });
+});
+
+test("self reset carries local inbox even when the fresh start has no server catch-up", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("queued marker", { message_id: "queued-1", seq: 7 }));
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.deliverMessage("agent-reset", makeMessage("arrived between launches", { message_id: "queued-2", seq: 8 }));
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    assert.match(driver.spawnCalls[1]!.prompt, /general|queued marker/);
+    assert.match(driver.spawnCalls[1]!.prompt, /2 messages pending your read/);
+    assert.equal(driver.encodedCalls.length, 0);
+  });
+});
+
+test("self reset keeps the carried inbox when a replacement stops before its first turn ends", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("queued marker", { message_id: "queued-1", seq: 7 }));
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    assert.match(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
+test("self reset drops a carried message after the replacement reads its body", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    const queued = makeMessage("queued marker", { message_id: "queued-1", seq: 7 });
+    await manager.deliverMessage("agent-reset", queued);
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [queued], source: "agent_api_history" });
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    assert.doesNotMatch(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
+test("self reset removes catch-up bodies only after replacement model progress", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("carried body", { message_id: "queued-1", seq: 7 }));
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    const catchup = makeMessage("server catch-up", { message_id: "catchup-1", seq: 8 });
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2", false, [catchup]);
+    assert.match(driver.spawnCalls[1]!.prompt, /carried body/);
+    driver.parsedLines.set("new-progress", [{ kind: "text", text: "working" }]);
+    driver.processes[1].stdout.emit("data", Buffer.from("new-progress\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    assert.doesNotMatch(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
+test("self reset retains catch-up bodies if replacement stops before model progress", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("carried body", { message_id: "queued-1", seq: 7 }));
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    const catchup = makeMessage("server catch-up", { message_id: "catchup-1", seq: 8 });
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2", false, [catchup]);
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    assert.match(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
+test("self reset does not confirm stale catch-up bodies when a launch respawns with only a notice", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("carried body", { message_id: "queued-1", seq: 7 }));
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    const catchup = makeMessage("server catch-up", { message_id: "catchup-1", seq: 8 });
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2", false, [catchup]);
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    driver.parsedLines.set("notice-progress", [{ kind: "text", text: "working" }]);
+    driver.processes[2].stdout.emit("data", Buffer.from("notice-progress\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    assert.match(driver.spawnCalls[3]!.prompt, /1 message pending your read/);
+  });
+});
+
+test("self reset discards body confirmation when the same process rebinds to another launch", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("carried body", { message_id: "queued-1", seq: 7 }));
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    const catchup = makeMessage("server catch-up", { message_id: "catchup-1", seq: 8 });
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2", false, [catchup]);
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    driver.parsedLines.set("new-progress", [{ kind: "text", text: "working" }]);
+    driver.processes[1].stdout.emit("data", Buffer.from("new-progress\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-4");
+    assert.match(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
+test("manual recovery starts fresh with memory and the server-retained queued message", async () => {
+  await withManager(async ({ driver, manager, dataDir }) => {
+    const { writeFile } = await import("node:fs/promises");
+    const agentDir = path.join(dataDir, "agent-reset");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(path.join(agentDir, "MEMORY.md"), "memory-marker-self-reset\n");
+    const oldConfig = makeConfig({ sessionId: "session-1", constructedWakeContext: true });
+    await manager.startAgent("agent-reset", oldConfig, undefined, undefined, undefined, "launch-1");
+    const queued = makeMessage("pending marker", { message_id: "queued-1", seq: 7 });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", queued);
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    (manager as any).clearSelfResetTimer("agent-reset");
+    (manager as any).expireSelfResetTimer("agent-reset", "launch-1", "session-1");
+    (manager as any).clearSelfResetTimer("agent-reset");
+    (manager as any).expireSelfResetTimer("agent-reset", "launch-1", "session-1");
+    (manager as any).clearSelfResetTimer("agent-reset");
+    (manager as any).expireSelfResetTimer("agent-reset", "launch-1", "session-1");
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null, constructedWakeContext: true }), queued, undefined, undefined, "launch-2");
+    const fresh = driver.spawnCalls[1]!;
+    assert.equal(fresh.config.sessionId, null);
+    assert.match(fresh.prompt, /memory-marker-self-reset/);
+    assert.match(fresh.prompt, /general|pending marker/);
+    assert.equal(driver.encodedCalls.length, 0, "the old session received no queued input");
+  });
+});
+
+test("self reset rejects runtimes outside Claude and Pi", async () => {
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ runtime: "codex", sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "unsupported");
+  });
+});

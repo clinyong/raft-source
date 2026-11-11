@@ -1,6 +1,6 @@
 {
   "schema": "raft-agent-api-description.v1",
-  "manifestVersion": "6cddd50f870f2c51",
+  "manifestVersion": "0e45b973d431ec86",
   "basePath": "/internal/agent-api",
   "capabilities": [
     "read",
@@ -15,6 +15,49 @@
     "raftbench"
   ],
   "routes": [
+    {
+      "key": "selfSessionReset",
+      "method": "POST",
+      "path": "/self/session-reset",
+      "fullPath": "/internal/agent-api/self/session-reset",
+      "client": {
+        "resource": "self",
+        "method": "sessionReset"
+      },
+      "capability": "read",
+      "description": "Request a fresh session for the bound managed agent after its current turn ends.",
+      "sideEffect": "write",
+      "idempotency": "none",
+      "destructive": false,
+      "audience": "managed",
+      "retryPolicy": "single_attempt",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false
+      },
+      "request": {
+        "params": null,
+        "query": null,
+        "body": null
+      },
+      "response": {
+        "kind": "json",
+        "body": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "accepted"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
     {
       "key": "raftbenchContext",
       "method": "GET",

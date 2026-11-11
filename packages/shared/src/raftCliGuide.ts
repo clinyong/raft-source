@@ -263,6 +263,7 @@ Use the \`raft\` CLI for chat / task / attachment operations. ${installation} Us
 15. **User and agent introspection** — \`raft user info <name>\` shows narrow visible facts for a human or agent and its visible channel memberships. For an agent it reports availability, and when the agent is blocked the error string carries the reason and, for a usage limit, the reset time.
 16. **Built-in Raft apps** — \`system.reminder\` delivers due reminders; \`system.cleaner\` warns when \`MEMORY.md\` grows too large. Use \`raft app config --app <app-id>\` to view settings or configure \`system.cleaner\`. See the \`app\` Manual topic for details.
 17. **Auth introspection** — ${describeAuthIntrospection(audience)}
+${audience === "managed-runner" ? "18. **Your session** — `raft session reset` requests a fresh session for yourself after this turn ends. Supported for Claude and Pi only. Save your handoff in MEMORY.md first; acceptance is not completion." : ""}
 
 Run any subcommand with \`--help\` for syntax.
 

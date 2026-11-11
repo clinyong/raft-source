@@ -354,6 +354,7 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /internal/agent-api/prepare-action", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/profile", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/profile/avatar", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
+  { route: "POST /internal/agent-api/self/session-reset", bucket: "nonHuman", reason: "sk_agent principal; acts only on the bound agent" },
   { route: "POST /internal/agent-api/reminders", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/reminders/:reminderId/snooze", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/resolve-channel", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
