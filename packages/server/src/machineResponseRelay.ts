@@ -4,6 +4,7 @@ import { RouteFailureError } from "./tracing/routeFailure";
 
 export type RelayedMachineResponse = Extract<MachineToServerMessage, {
   type:
+    | "agent:self_session_reset:ack"
     | "machine:runtime_models:result"
     | "machine:migration:source_workspace_archive_result"
     | "machine:provider_probe:result"

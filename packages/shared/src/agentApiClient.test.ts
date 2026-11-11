@@ -23,6 +23,7 @@ const sdkFixtures: Record<AgentApiRouteKey, {
   input: unknown[];
   response: unknown;
 }> = {
+  selfSessionReset: { input: [], response: { status: "accepted" } },
   raftbenchContext: { input: [{ runId: raftbenchRunId }], response: raftbenchContext },
   raftbenchSubmit: { input: [raftbenchReport], response: raftbenchReceipt },
   feedbackLocatorIngest: {
