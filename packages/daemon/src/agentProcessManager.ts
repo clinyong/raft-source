@@ -3618,6 +3618,7 @@ export class AgentProcessManager {
     );
     this.runtimeProcessBindingFence.rebindLaunch(agentId, ap, nextLaunchId);
     this.runtimeProcessBindingFence.rebindSession(agentId, ap, nextSessionId, "server_start_rebind");
+    this.selfReset.launchRebound(agentId, previousLaunchId, nextLaunchId);
     ap.launchId = nextLaunchId;
     ap.startDispatchId = start.startDispatchId ?? ap.startDispatchId;
     ap.sessionId = nextSessionId;
@@ -5077,7 +5078,7 @@ export class AgentProcessManager {
     };
     this.startingInboxes.drainOnSpawn(agentId);
     this.agents.set(agentId, agentProcess);
-    if (resumeCatchupDeliveredAsInput) this.selfReset.stageBodies(agentId, effectiveLaunchId, resumeCatchupInputMessages);
+    this.selfReset.stageBodies(agentId, effectiveLaunchId, resumeCatchupDeliveredAsInput ? resumeCatchupInputMessages : []);
     this.markTrackedMentionsToldAtStart(agentId, processInstanceId, firstInputMessages);
     if (this.lifecycleRecords.stopEpochChanged(agentId, startStopEpoch)) {
       // RFC 071: the runtime has not been started, so no child exists.

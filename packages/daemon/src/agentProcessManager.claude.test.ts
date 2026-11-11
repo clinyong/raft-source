@@ -5792,6 +5792,49 @@ test("self reset retains catch-up bodies if replacement stops before model progr
   });
 });
 
+test("self reset does not confirm stale catch-up bodies when a launch respawns with only a notice", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("carried body", { message_id: "queued-1", seq: 7 }));
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    const catchup = makeMessage("server catch-up", { message_id: "catchup-1", seq: 8 });
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2", false, [catchup]);
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    driver.parsedLines.set("notice-progress", [{ kind: "text", text: "working" }]);
+    driver.processes[2].stdout.emit("data", Buffer.from("notice-progress\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    assert.match(driver.spawnCalls[3]!.prompt, /1 message pending your read/);
+  });
+});
+
+test("self reset discards body confirmation when the same process rebinds to another launch", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await manager.deliverMessage("agent-reset", makeMessage("carried body", { message_id: "queued-1", seq: 7 }));
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    const catchup = makeMessage("server catch-up", { message_id: "catchup-1", seq: 8 });
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2", false, [catchup]);
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    driver.parsedLines.set("new-progress", [{ kind: "text", text: "working" }]);
+    driver.processes[1].stdout.emit("data", Buffer.from("new-progress\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-4");
+    assert.match(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
 test("manual recovery starts fresh with memory and the server-retained queued message", async () => {
   await withManager(async ({ driver, manager, dataDir }) => {
     const { writeFile } = await import("node:fs/promises");

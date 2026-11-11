@@ -283,9 +283,13 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
   }
   stageBodies(agentId: string, launchId: string | null, messages: readonly T[]): void {
     const record = this.records.get(agentId);
-    if (!record || !launchId) return;
+    if (!record) return;
     const ids = new Set(messages.flatMap((message) => message.message_id ? [message.message_id] : []));
-    record.pendingBodies = ids.size ? { launchId, ids } : null;
+    record.pendingBodies = launchId && ids.size ? { launchId, ids } : null;
+  }
+  launchRebound(agentId: string, previousLaunchId: string | null, nextLaunchId: string | null): void {
+    const record = this.records.get(agentId);
+    if (record && previousLaunchId !== nextLaunchId) record.pendingBodies = null;
   }
   confirmBodyProgress(agentId: string, launchId: string | null): void {
     const record = this.records.get(agentId);
