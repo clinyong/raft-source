@@ -2236,6 +2236,16 @@ function route<const T extends Omit<AgentApiContractRoute, "fullPath">>(input: T
 }
 
 export const agentApiContract = {
+  selfSessionReset: route({
+    key: "selfSessionReset",
+    method: "POST",
+    path: "/self/session-reset",
+    client: { resource: "self", method: "sessionReset" },
+    capability: "read",
+    description: "Request a fresh session for the bound managed agent after its current turn ends.",
+    request: {},
+    response: { body: z.object({ status: z.literal("accepted") }) },
+  }),
   raftbenchContext: route({
     key: "raftbenchContext",
     method: "GET",
@@ -3574,6 +3584,7 @@ export type AgentApiFeedbackLocatorListQuery = z.infer<typeof agentApiFeedbackLo
 export type AgentApiFeedbackLocatorListResponse = z.infer<typeof agentApiFeedbackLocatorListResponseSchema>;
 
 export type AgentApiRequestParamsByRoute = {
+  selfSessionReset: never;
   raftbenchContext: never;
   raftbenchSubmit: never;
   feedbackLocatorIngest: never;
@@ -3669,6 +3680,7 @@ export type AgentApiRequestParamsByRoute = {
 };
 
 export type AgentApiRequestQueryByRoute = {
+  selfSessionReset: never;
   raftbenchContext: RaftbenchContextQuery;
   raftbenchSubmit: never;
   feedbackLocatorIngest: never;
@@ -3764,6 +3776,7 @@ export type AgentApiRequestQueryByRoute = {
 };
 
 export type AgentApiRequestBodyByRoute = {
+  selfSessionReset: never;
   raftbenchContext: never;
   raftbenchSubmit: RaftbenchReport;
   feedbackLocatorIngest: AgentApiFeedbackLocatorIngestBody;
@@ -3859,6 +3872,7 @@ export type AgentApiRequestBodyByRoute = {
 };
 
 export type AgentApiResponseByRoute = {
+  selfSessionReset: { status: "accepted" };
   raftbenchContext: RaftbenchContextResponse;
   raftbenchSubmit: RaftbenchSubmitResponse;
   feedbackLocatorIngest: AgentApiFeedbackLocatorAcceptance;

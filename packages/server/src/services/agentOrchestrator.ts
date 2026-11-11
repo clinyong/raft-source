@@ -2946,6 +2946,10 @@ export class AgentOrchestrator extends EventEmitter {
   private activityDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private agentStateCache = new Map<string, CachedAgentState>();
   private resetInProgress = new Map<string, "restart" | "session" | "full">();
+  private readonly selfResetReadyLaunches = new Map<string, string>();
+  private readonly selfResetRecoveryLaunches = new Map<string, string>();
+  private readonly selfResetCancelledLaunches = new Map<string, string>();
+  private readonly selfResetOperations = new Map<string, Promise<void>>();
   private lastReadyOnlineBroadcastAt = new Map<string, number>();
   private lifecycleEventsByAgent = new Map<string, AgentLifecycleRingBuffer>();
   private staleActivityTimer: unknown | null = null;
@@ -10139,6 +10143,80 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      case "agent:self_session_reset:ready": {
+        const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, msg.agentId, msg.type);
+        if (!agent) break;
+        if (!msg.sessionId || agent.sessionId !== msg.sessionId
+          || !this.shouldAcceptLifecycleEvent(machineId, agent, msg.type, msg.launchId)) {
+          await this.sendToMachine(machineId, { type: "agent:self_session_reset:rejected", agentId: msg.agentId, launchId: msg.launchId });
+          break;
+        }
+        if (this.selfResetCancelledLaunches.get(msg.agentId) === msg.launchId) {
+          await this.sendToMachine(machineId, { type: "agent:self_session_reset:rejected", agentId: msg.agentId, launchId: msg.launchId });
+          break;
+        }
+        if (this.selfResetReadyLaunches.get(msg.agentId) === msg.launchId) break;
+        this.selfResetReadyLaunches.set(msg.agentId, msg.launchId);
+        const operation = this.resetAgent(msg.agentId, "session");
+        this.selfResetOperations.set(msg.agentId, operation);
+        try { await operation; } finally {
+          if (this.selfResetOperations.get(msg.agentId) === operation) this.selfResetOperations.delete(msg.agentId);
+        }
+        break;
+      }
+
+      case "agent:self_session_reset:cancel": {
+        const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, msg.agentId, msg.type);
+        if (!agent) break;
+        const notStarted = this.selfResetReadyLaunches.get(msg.agentId) !== msg.launchId
+          && this.selfResetRecoveryLaunches.get(msg.agentId) !== msg.launchId
+          && agent.sessionId === msg.sessionId
+          && this.shouldAcceptLifecycleEvent(machineId, agent, msg.type, msg.launchId);
+        if (notStarted) {
+          this.selfResetCancelledLaunches.set(msg.agentId, msg.launchId);
+          const detail = `Self session reset timed out before clearing; the original session can resume (${new Date(this.clock.now()).toISOString()}).`;
+          await this.rememberRuntimeError(msg.agentId, this.buildRuntimeErrorState({ detail, launchId: msg.launchId }));
+          this.broadcastActivity(msg.agentId, "error", detail, "runtime_error", []);
+        }
+        await this.sendToMachine(machineId, { type: "agent:self_session_reset:cancel_result", agentId: msg.agentId, launchId: msg.launchId, notStarted });
+        break;
+      }
+
+      case "agent:self_session_reset:recover": {
+        const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, msg.agentId, msg.type);
+        if (!agent || (agent.sessionId !== null && agent.sessionId !== msg.sessionId)) break;
+        if (this.selfResetRecoveryLaunches.get(msg.agentId) === msg.launchId) break;
+        this.selfResetRecoveryLaunches.set(msg.agentId, msg.launchId);
+        await this.selfResetOperations.get(msg.agentId)?.catch(() => {});
+        const current = await this.getAuthoritativeAgentForDelivery(msg.agentId);
+        if (!current || current.machineId !== machineId || (current.sessionId !== null && current.sessionId !== msg.sessionId)) break;
+        // A replacement launch that may still be starting must not be killed
+        // by a late recovery request. Retry only after it is known not to run.
+        if (current.expectedLaunchId && current.expectedLaunchId !== msg.launchId && current.runtimeState !== "not_running") break;
+        await this.resetAgent(msg.agentId, "session");
+        break;
+      }
+
+      case "agent:self_session_reset:failed": {
+        const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, msg.agentId, msg.type);
+        if (!agent || (agent.sessionId !== null && agent.sessionId !== msg.sessionId)) break;
+        const reason = msg.reason === "launch_exited"
+          ? "Self session reset cancelled because the requesting launch exited"
+          : "Self session reset failed; restart this agent manually";
+        const detail = `${reason} (${new Date(this.clock.now()).toISOString()}).`;
+        await this.rememberRuntimeError(msg.agentId, this.buildRuntimeErrorState({ detail, launchId: msg.launchId }));
+        this.broadcastActivity(msg.agentId, "error", detail, "runtime_error", []);
+        break;
+      }
+
+      case "agent:self_session_reset:ack": {
+        const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, msg.agentId, msg.type);
+        if (!agent) break;
+        void this.getMachineResponseRelay().forward(machineId, msg,
+          (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+        break;
+      }
+
       case "agent:runtime_profile:migration:ack": {
         const span = this.tracer.startSpan("server.runtime_profile.control.inject_ack", {
           parent: parseTraceparent(msg.traceparent),
@@ -14714,6 +14792,23 @@ export class AgentOrchestrator extends EventEmitter {
         nextStatus: failed?.status ?? null,
       });
     }
+  }
+
+  /** Request a reset only for the authenticated agent's stated launch. The
+   * daemon checks that launch against its live process before accepting. */
+  async requestSelfSessionReset(agentId: string, launchId: string) {
+    const agent = await this.loadAgentForStart(agentId);
+    if (!agent?.machineId) throw new Error("agent has no assigned computer");
+    const requestId = crypto.randomUUID();
+    const response = await this.getMachineResponseRelay().request({
+      requestId, machineId: agent.machineId, agentId, type: "agent:self_session_reset:ack",
+    }, 15_000, () => this.sendRequiredToMachine(agent.machineId!, {
+      type: "agent:self_session_reset:request", agentId, launchId, requestId,
+    }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    if (response.type !== "agent:self_session_reset:ack" || response.launchId !== launchId) {
+      throw new Error("unexpected self reset response");
+    }
+    return response.result;
   }
 
   // Agent workspace file browsing

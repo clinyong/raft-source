@@ -66,6 +66,7 @@ const managedWrite: AgentApiRouteMeta = { sideEffect: "write", idempotency: "non
 const managedNaturalDestructive: AgentApiRouteMeta = { sideEffect: "write", idempotency: "natural", destructive: true, audience: "managed" };
 
 export const AGENT_API_ROUTE_META = {
+  selfSessionReset: managedWrite,
   raftbenchContext: { ...read, audience: "external" },
   raftbenchSubmit: { ...naturalWrite, audience: "external" },
   feedbackLocatorIngest: naturalWrite,

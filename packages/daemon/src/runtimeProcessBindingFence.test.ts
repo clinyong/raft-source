@@ -51,3 +51,27 @@ test("a replaced process streaming output records one rejection per window, with
   fence.send("a", stale, { mode: "idle", text: "x", sessionId: "session" }, "stdin_idle_delivery");
   assert.equal(records.filter((r) => r.direction === "input").length, 2);
 });
+
+test("handoff guard blocks every input source before the runtime receives bytes", () => {
+  let writes = 0;
+  let paused = true;
+  const current = process("current");
+  Object.assign(current.runtime, { send: () => { writes += 1; return { ok: true, acceptedAs: "prompt" }; } });
+  const fence = new RuntimeProcessBindingFence({
+    getCurrentProcess: () => current,
+    recordTrace: () => {},
+    shouldBlockInput: () => paused,
+  });
+  fence.bind(current.runtime, {
+    agentId: "a", serverId: "s", machineId: "m", configuredRuntimeId: "codex", driverId: "codex",
+    initialLaunchId: "launch", activeLaunchId: "launch", startSessionId: "session", activeSessionId: "session",
+    processInstanceId: current.processInstanceId,
+  });
+  for (const source of ["app_inbox_notice", "busy_stdin_notification", "stdin_idle_delivery", "stdin_idle_delivery_retry", "future_entry"]) {
+    assert.equal(fence.send("a", current, { mode: "idle", text: "x", sessionId: "session" }, source).ok, false);
+  }
+  assert.equal(writes, 0);
+  paused = false;
+  assert.equal(fence.send("a", current, { mode: "idle", text: "x", sessionId: "session" }, "stdin_idle_delivery").ok, true);
+  assert.equal(writes, 1);
+});

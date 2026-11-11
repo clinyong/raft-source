@@ -393,6 +393,7 @@ export function createAgentApiClient(client: CliAgentApiHttpClient, agentId: str
 export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, options?: { signal?: AbortSignal }) {
   const agentApi = createSharedAgentApiClient(rawTransportForClient(client, options));
   return {
+    self: { sessionReset: () => requestClientAsApiResponse(agentApi.self.sessionReset()) },
     agent: {
       context: () =>
         requestClientAsApiResponse(agentApi.agent.context()),

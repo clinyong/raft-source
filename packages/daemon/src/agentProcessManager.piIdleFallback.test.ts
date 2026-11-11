@@ -291,3 +291,21 @@ test("the fallback stays quiet when there is nothing to deliver", async () => {
     assert.equal(driver.processes[0]!.stdinWrites.length, 0, "and nothing is delivered");
   });
 });
+
+test("Pi fallback cannot write queued messages to a launch awaiting self reset", async () => {
+  vi.useFakeTimers();
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-pi-1" }), undefined, undefined, undefined, "launch-pi-1");
+    const ap = getProcess(manager, "agent-reset");
+    ap.sessionReadyForDelivery = true;
+    (manager as any).commitApmIdleState("agent-reset", ap, false);
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-pi-1"), "accepted");
+    ap.inbox.push(makeMessage("queued", { message_id: "queued-1" }));
+    ap.notifications.add();
+    driver.liveIdle = { isIdle: true };
+    (manager as any).schedulePiIdleDeliveryFallback("agent-reset", "test");
+    await vi.advanceTimersByTimeAsync(FALLBACK_DELAY_MS + 1_000);
+    assert.equal(driver.processes[0]!.stdinWrites.length, 0);
+    assert.equal(ap.inbox.some((m: AgentMessage) => m.message_id === "queued-1"), true);
+  });
+});

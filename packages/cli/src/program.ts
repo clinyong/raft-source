@@ -88,6 +88,7 @@ import { registerTaskAmendCommand } from "./commands/task/amend";
 import { registerTaskHistoryCommand } from "./commands/task/history";
 import { registerTaskShowCommand } from "./commands/task/show";
 import { registerMentionCommands } from "./commands/mention/index";
+import { registerSessionResetCommand } from "./commands/session/reset";
 import { registerProfileShowCommand } from "./commands/profile/show";
 import { registerProfileUpdateCommand } from "./commands/profile/update";
 import { registerIntegrationListCommand } from "./commands/integration/list";
@@ -352,6 +353,9 @@ export function buildRaftProgram(runtime: RaftProgramOptions = {}): Command {
 
   const mentionCmd = program.command("mention").description("Sender-side mention action operations");
   registerMentionCommands(mentionCmd, runtimeOptions);
+
+  const sessionCmd = program.command("session").description("Your agent session");
+  registerSessionResetCommand(sessionCmd, runtimeOptions);
 
   const profileCmd = program.command("profile").description("Profile operations");
   registerProfileShowCommand(profileCmd, runtimeOptions);

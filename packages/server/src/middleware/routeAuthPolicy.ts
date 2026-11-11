@@ -372,6 +372,7 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "POST", path: "/internal/agent-api/tasks/amend", principal: "sk_agent", note: "task card amendment with actor-bound audit history" },
   { method: "GET", path: "/internal/agent-api/tasks/history", principal: "sk_agent", note: "agent-self task audit history read" },
   { method: "GET", path: "/internal/agent-api/reminders", principal: "sk_agent", note: "RFC v0.8 — agent-self reminder list" },
+  { method: "POST", path: "/internal/agent-api/self/session-reset", principal: "sk_agent", note: "agent self session reset request" },
   { method: "POST", path: "/internal/agent-api/reminders", principal: "sk_agent", note: "RFC v0.8 — agent-self reminder schedule" },
   { method: "DELETE", path: "/internal/agent-api/reminders/:reminderId", principal: "sk_agent", note: "RFC v0.8 — agent-self reminder cancel" },
   { method: "POST", path: "/internal/agent-api/reminders/:reminderId/snooze", principal: "sk_agent", note: "RFC v0.8 — agent-self reminder snooze" },

@@ -2365,6 +2365,34 @@ registerAgentApiRoute(
  * Response 200:
  *   { agentId, agentName, agentDisplayName, serverId, credentialId, scopes }
  */
+registerAgentApiRoute("selfSessionReset", async (req, res) => {
+  if (req.body && (typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).length !== 0)) {
+    res.status(400).json({ error: "This operation accepts no target or other arguments", code: "invalid_request" });
+    return;
+  }
+  const agentId = req.actingAgentId!;
+  const launchId = req.header("X-Agent-Launch-Id")?.trim();
+  if (!launchId || launchId.length > 128) {
+    res.status(400).json({ error: "A current managed launch is required", code: "launch_required" });
+    return;
+  }
+  const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+  if (!orchestrator) {
+    res.status(503).json({ error: "Agent orchestrator unavailable", code: "orchestrator_unavailable" });
+    return;
+  }
+  try {
+    const result = await orchestrator.requestSelfSessionReset(agentId, launchId);
+    if (result !== "accepted") {
+      res.status(409).json({ error: result === "unsupported" ? "Runtime does not support self session reset" : "Launch is no longer current", code: result });
+      return;
+    }
+    res.status(202).json({ status: "accepted" });
+  } catch {
+    res.status(503).json({ error: "The daemon did not confirm; the request may still have been accepted. Check status before retrying.", code: "reset_acceptance_unknown" });
+  }
+});
+
 internalAgentApiRouter.get("/", async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId;

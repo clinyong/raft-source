@@ -62,6 +62,8 @@ type RuntimeBindingTrace = (
 export interface RuntimeProcessBindingFenceOptions {
   getCurrentProcess(agentId: string): RuntimeBindingProcess | null;
   recordTrace: RuntimeBindingTrace;
+  /** Prevent writes while a lifecycle handoff owns this launch. */
+  shouldBlockInput?(agentId: string, process: RuntimeBindingProcess): boolean;
   /** Test seam; production reads Date.now(). */
   now?: () => number;
 }
@@ -97,6 +99,7 @@ export class RuntimeProcessBindingFence {
   private readonly bindings = new WeakMap<RuntimeSession, RuntimeProcessBinding>();
   private readonly getCurrentProcess: RuntimeProcessBindingFenceOptions["getCurrentProcess"];
   private readonly recordTrace: RuntimeBindingTrace;
+  private readonly shouldBlockInput: NonNullable<RuntimeProcessBindingFenceOptions["shouldBlockInput"]>;
   private readonly now: () => number;
 
   private readonly outputRejections = new WeakMap<RuntimeSession, Map<string, OutputRejectionWindow>>();
@@ -104,6 +107,7 @@ export class RuntimeProcessBindingFence {
   constructor(options: RuntimeProcessBindingFenceOptions) {
     this.getCurrentProcess = options.getCurrentProcess;
     this.recordTrace = options.recordTrace;
+    this.shouldBlockInput = options.shouldBlockInput ?? (() => false);
     this.now = options.now ?? Date.now;
   }
 
@@ -215,6 +219,10 @@ export class RuntimeProcessBindingFence {
         input.sessionId,
       );
       return this.rejectedResult("session_mismatch");
+    }
+    if (this.shouldBlockInput(agentId, process)) {
+      this.recordTrace("daemon.agent.runtime_input.handoff_blocked", { agent_id: agentId, source });
+      return { ok: false, reason: "busy_rejected", error: "session handoff in progress" };
     }
     return requireImmediateRuntimeSendResult(process.runtime.send(input), source);
   }

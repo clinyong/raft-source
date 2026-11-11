@@ -1,3 +1,4 @@
+import { blocksOldLaunchDelivery, reduceSelfSessionReset, type SelfSessionResetState } from "./selfSessionReset";
 import type { AgentApiHistoryConsumptionScope } from "@botiverse/raft-shared";
 import { finishToolCall, noteToolCallStart } from "./toolCallOutcome";
 import { TurnSummaryTracker, turnOutcomeForActivity, turnTriggerFromMessages } from "./turnSummaryTracker";
@@ -1541,7 +1542,142 @@ type RuntimeTurnTraceOutcome =
 
 export class AgentProcessManager {
   private agents = new Map<string, AgentProcess>();
+  private readonly selfSessionResets = new Map<string, SelfSessionResetState>();
+  private readonly selfResetOldSessions = new Map<string, string>();
+  private readonly selfResetFailureReasons = new Map<string, "restart_timeout" | "launch_exited">();
+  private readonly selfResetTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly selfResetCancelPending = new Set<string>();
+  private readonly selfResetTransient = new Map<string, AgentMessage[]>();
+  // Kept across the old process's stop and a failed replacement start. The
+  // Server remains the durable owner of ordinary inbox messages.
+  private readonly selfResetHeldInbox = new Map<string, AgentMessage[]>();
   private readonly lifecycleRecords = new AgentLifecycleRecords<RuntimeErrorDeliveryBackoffState, RuntimeErrorFingerprintFenceState>();
+
+  /** Register only against the running launch. The caller must report that
+   * acceptance means pending, not that a replacement has started. */
+  requestSelfSessionReset(agentId: string, launchId: string): "accepted" | "unsupported" | "stale" {
+    const ap = this.agents.get(agentId);
+    if (!ap || !ap.launchId || ap.launchId !== launchId || !ap.sessionId) return "stale";
+    if (ap.config.runtime !== "claude" && ap.config.runtime !== "pi") return "unsupported";
+    let state = this.selfSessionResets.get(agentId) ?? { kind: "none" };
+    if (state.kind === "failed" && state.sessionCleared === false && state.launchId !== launchId) {
+      state = reduceSelfSessionReset(state, { kind: "launch_changed", launchId });
+    }
+    if (state.kind !== "none" && (state.launchId !== launchId || state.kind === "failed")) return "stale";
+    this.selfResetOldSessions.set(agentId, ap.sessionId);
+    this.selfSessionResets.set(agentId, reduceSelfSessionReset(state, { kind: "request", launchId }));
+    return "accepted";
+  }
+
+  private cancelRequestedSelfReset(agentId: string, ap: AgentProcess): void {
+    const reset = this.selfSessionResets.get(agentId);
+    if (reset?.kind !== "requested" || reset.launchId !== ap.launchId || !ap.sessionId) return;
+    this.selfSessionResets.set(agentId, reduceSelfSessionReset(reset, { kind: "abort", launchId: reset.launchId }));
+    this.selfResetFailureReasons.set(agentId, "launch_exited");
+    logger.error(`[Agent ${agentId}] Self session reset failed: launch=${reset.launchId} step=requesting_launch_exited`);
+    this.sendToServer({ type: "agent:self_session_reset:failed", agentId, launchId: reset.launchId, sessionId: ap.sessionId, reason: "launch_exited" });
+  }
+
+  private clearSelfResetTimer(agentId: string): void {
+    const timer = this.selfResetTimers.get(agentId);
+    if (timer) clearTimeout(timer);
+    this.selfResetTimers.delete(agentId);
+  }
+
+  private armSelfResetTimer(agentId: string, launchId: string, oldSessionId: string, delayMs = 120_000): void {
+    this.clearSelfResetTimer(agentId);
+    const timer = setTimeout(() => this.expireSelfResetTimer(agentId, launchId, oldSessionId), delayMs);
+    timer.unref?.();
+    this.selfResetTimers.set(agentId, timer);
+  }
+
+  private expireSelfResetTimer(agentId: string, launchId: string, oldSessionId: string): void {
+    this.selfResetTimers.delete(agentId);
+    const state = this.selfSessionResets.get(agentId);
+    if (!state || state.kind === "none" || state.launchId !== launchId) return;
+    if (state.kind === "clearing" && !this.selfResetCancelPending.has(agentId)) {
+      this.selfResetCancelPending.add(agentId);
+      this.sendToServer({ type: "agent:self_session_reset:cancel", agentId, launchId, sessionId: oldSessionId });
+      this.armSelfResetTimer(agentId, launchId, oldSessionId, 5_000);
+    } else if (state.kind === "clearing") {
+      this.selfResetCancelPending.delete(agentId);
+      const unknown = reduceSelfSessionReset(state, { kind: "abort", launchId });
+      const retry = reduceSelfSessionReset(unknown, { kind: "retry_start", launchId });
+      this.selfSessionResets.set(agentId, retry);
+      this.sendToServer({ type: "agent:self_session_reset:recover", agentId, launchId, sessionId: oldSessionId });
+      this.armSelfResetTimer(agentId, launchId, oldSessionId);
+    } else if (state.kind === "uncertain" && state.retries === 1) {
+      this.selfSessionResets.set(agentId, reduceSelfSessionReset(state, { kind: "abort", launchId }));
+      this.selfResetFailureReasons.set(agentId, "restart_timeout");
+      logger.error(`[Agent ${agentId}] Self session reset failed: launch=${launchId} step=replacement_start_timeout`);
+      this.sendToServer({ type: "agent:self_session_reset:failed", agentId, launchId, sessionId: oldSessionId, reason: "restart_timeout" });
+    }
+  }
+
+  handleSelfResetCancelResult(agentId: string, launchId: string, notStarted: boolean): void {
+    const state = this.selfSessionResets.get(agentId);
+    const sessionId = this.selfResetOldSessions.get(agentId);
+    if (!state || state.kind !== "clearing" || state.launchId !== launchId || !sessionId || !this.selfResetCancelPending.has(agentId)) return;
+    this.clearSelfResetTimer(agentId);
+    if (notStarted) {
+      this.selfResetCancelPending.delete(agentId);
+      this.rejectSelfSessionReset(agentId, launchId);
+    } else {
+      // Leave the pending flag set so expiry takes the conservative recovery path.
+      this.expireSelfResetTimer(agentId, launchId, sessionId);
+    }
+  }
+
+  /** Re-send only the recovery request or failure report after a reconnect. */
+  replaySelfResetRecovery(): void {
+    for (const [agentId, state] of this.selfSessionResets) {
+      const sessionId = this.selfResetOldSessions.get(agentId);
+      if (!sessionId || state.kind === "none") continue;
+      if (state.kind === "uncertain" && state.retries === 1) {
+        this.sendToServer({ type: "agent:self_session_reset:recover", agentId, launchId: state.launchId, sessionId });
+      } else if (state.kind === "failed" && this.selfResetFailureReasons.has(agentId)) {
+        this.sendToServer({ type: "agent:self_session_reset:failed", agentId, launchId: state.launchId, sessionId, reason: this.selfResetFailureReasons.get(agentId)! });
+      }
+    }
+  }
+
+  private flushSelfResetTransient(agentId: string): void {
+    const ap = this.agents.get(agentId);
+    const state = this.selfSessionResets.get(agentId);
+    if (!ap || !this.isApmIdle(ap) || !this.canDeliverToRuntimeSession(ap)
+      || (state && ap.launchId && blocksOldLaunchDelivery(state, ap.launchId))) return;
+    const queue = this.selfResetTransient.get(agentId);
+    const message = queue?.shift();
+    if (!message) return;
+    if (queue!.length === 0) this.selfResetTransient.delete(agentId);
+    Promise.resolve(this.deliverMessage(agentId, message, { transient: true })).then((accepted) => {
+      if (!accepted) {
+        const pending = this.selfResetTransient.get(agentId) ?? [];
+        pending.unshift(message);
+        this.selfResetTransient.set(agentId, pending);
+      }
+    }).catch(() => {
+      const pending = this.selfResetTransient.get(agentId) ?? [];
+      pending.unshift(message);
+      this.selfResetTransient.set(agentId, pending);
+    });
+  }
+
+  /** Server confirms no clear took place; the old launch may safely resume. */
+  rejectSelfSessionReset(agentId: string, launchId: string): void {
+    const state = this.selfSessionResets.get(agentId);
+    if (!state || state.kind !== "clearing" || state.launchId !== launchId) return;
+    this.selfSessionResets.set(agentId, reduceSelfSessionReset(state, { kind: "clear_rejected", launchId }));
+    logger.error(`[Agent ${agentId}] Self session reset failed: launch=${launchId} step=clear_not_started`);
+    this.clearSelfResetTimer(agentId);
+    this.selfResetCancelPending.delete(agentId);
+    this.selfResetOldSessions.delete(agentId);
+    const ap = this.agents.get(agentId);
+    if (ap?.launchId === launchId && ap.inbox.length > 0) {
+      this.scheduleIdleInboxDeliveryRetry(agentId, ap, ap.inbox.length, "self_reset_rejected", "daemon.agent.self_reset.resume");
+    }
+    this.flushSelfResetTransient(agentId);
+  }
 
   /**
    * Where activity facts go (RFC 069 §7). The legacy sink frames them as
@@ -1635,6 +1771,14 @@ export class AgentProcessManager {
   private readonly runtimeExitTraceAttrs = new WeakMap<RuntimeSession, Record<string, unknown>>();
   private readonly runtimeProcessBindingFence = new RuntimeProcessBindingFence({
     getCurrentProcess: (agentId) => this.agents.get(agentId) ?? null,
+    shouldBlockInput: (agentId, process) => {
+      const state = this.selfSessionResets.get(agentId);
+      if (!state || state.kind === "none") return false;
+      if (process.launchId && blocksOldLaunchDelivery(state, process.launchId)) return true;
+      const oldSessionId = this.selfResetOldSessions.get(agentId);
+      return Boolean(oldSessionId && process.sessionId === oldSessionId
+        && state.kind !== "requested" && !(state.kind === "failed" && state.sessionCleared === false));
+    },
     recordTrace: (...args) => this.recordDaemonEvent(...args),
     now: () => this.clockNow(),
   });
@@ -2461,6 +2605,8 @@ export class AgentProcessManager {
   private runPiIdleDeliveryFallback(agentId: string, source: string): boolean {
     const ap = this.agents.get(agentId);
     if (!ap || ap.config.runtime !== "pi") return false;
+    const reset = this.selfSessionResets.get(agentId);
+    if (reset && ap.launchId && blocksOldLaunchDelivery(reset, ap.launchId)) return false;
     const probe = ap.driver.idleRecycle?.probeIdle?.() ?? null;
     const daemonIdle = this.isApmIdle(ap);
     const untoldWork = this.hasUntoldInboxWork(ap);
@@ -4168,6 +4314,17 @@ export class AgentProcessManager {
    * is checked as an automatic start.
    */
   async startAgent(agentId: string, config: AgentConfig, wakeMessage?: AgentMessage, unreadSummary?: Record<string, number>, resumePrompt?: StartResumePrompt, launchId?: string, wakeMessageTransient = false, resumeMessages?: AgentMessage[], startDispatchId?: string, traceParent?: TraceContext | null, catchupBatchId?: string, recoveryGrant: RecoveryGrant | null = null, claimedConnectionEpochId: string | null = null) {
+    // A retry or manual start after an uncertain clear must never resume the
+    // old session. Also do not rebind a new launch onto its still-live process.
+    const reset = this.selfSessionResets.get(agentId);
+    const oldSessionId = this.selfResetOldSessions.get(agentId);
+    if (reset && reset.kind !== "none" && reset.kind !== "requested"
+      && !(reset.kind === "failed" && reset.sessionCleared === false)
+      && launchId !== reset.launchId
+      && ((oldSessionId && config.sessionId === oldSessionId)
+        || this.agents.get(agentId)?.launchId === reset.launchId)) {
+      throw new Error("Self session reset cannot start on the old session or process");
+    }
     // Any start settles a parked server wake: the pending app-inbox items are
     // replayed to the new process by the ordinary start path.
     this.pendingServerWakes.delete(agentId);
@@ -4664,7 +4821,20 @@ export class AgentProcessManager {
     let startingInboxDeliveredAsInput = false;
     let resumeCatchupDeliveredAsInput = false;
     let renderedStartupThreadContextMessages: AgentMessage[] = [];
-    const startingInboxMessages = this.startingInboxes.values(agentId);
+    const heldInbox = this.selfResetHeldInbox.get(agentId) ?? [];
+    const carriedIds = new Set<string>();
+    if (wakeMessage?.message_id) carriedIds.add(wakeMessage.message_id);
+    // resumeMessages are ignored when a wake or resume prompt is present.
+    if (!wakeMessage && !resumePrompt) {
+      for (const message of resumeMessages ?? []) if (message.message_id) carriedIds.add(message.message_id);
+    }
+    const startingInboxMessages = [...this.startingInboxes.values(agentId)];
+    for (const message of startingInboxMessages) if (message.message_id) carriedIds.add(message.message_id);
+    for (const message of heldInbox) {
+      if (message.message_id && carriedIds.has(message.message_id)) continue;
+      startingInboxMessages.push(message);
+      if (message.message_id) carriedIds.add(message.message_id);
+    }
     // task #1221: a start that follows a start-failure block carries the
     // messages refused as wakes during it, including for a session-less agent
     // (the server only sends resumeMessages then, or for a resumed session).
@@ -5221,6 +5391,7 @@ export class AgentProcessManager {
         // This happens when a process is replaced (e.g. restart on new message),
         // new process is added to the map, then the old process's exit handler fires.
         if (ap.runtime !== runtime) return;
+        this.cancelRequestedSelfReset(agentId, ap);
         ap.notifications.clearTimer();
         this.disposeAgentProcessTimers(ap, { includeCompactionWatchdog: false });
         this.closeRuntimeReadinessTransition(ap, "terminal");
@@ -6337,6 +6508,7 @@ export class AgentProcessManager {
       return;
     }
 
+    this.cancelRequestedSelfReset(agentId, ap);
     // task #1277: a start still resolving or spawning for this process is
     // cancelled here; the attempt itself discards its result (never commits).
     ap.launchAbort?.abort();
@@ -6346,7 +6518,20 @@ export class AgentProcessManager {
     cleanupLaunchProxies(agentId);
     this.revokeManagedRunnerCredential(agentId, ap.config, ap.launchId);
     this.agents.delete(agentId);
-    this.recordInboxDroppedOnExit(agentId, ap, silent ? "silent_stop" : "explicit_stop", ap.inbox.splice(0));
+    const resetAtStop = this.selfSessionResets.get(agentId);
+    if (resetAtStop && resetAtStop.kind !== "none" && resetAtStop.kind !== "requested"
+      && !(resetAtStop.kind === "failed" && resetAtStop.sessionCleared === false)) {
+      const held = this.selfResetHeldInbox.get(agentId) ?? [];
+      const ids = new Set(held.map((message) => message.message_id).filter(Boolean));
+      for (const message of ap.inbox.splice(0)) {
+        if (message.message_id && ids.has(message.message_id)) continue;
+        held.push(message);
+        if (message.message_id) ids.add(message.message_id);
+      }
+      if (held.length) this.selfResetHeldInbox.set(agentId, held);
+    } else {
+      this.recordInboxDroppedOnExit(agentId, ap, silent ? "silent_stop" : "explicit_stop", ap.inbox.splice(0));
+    }
     if (!silent) {
       // Activity clientSeq belongs to the ingest generation, not one runtime
       // child. Launchless Stop/Start keeps daemonInstanceId, so resetting here
@@ -6593,6 +6778,16 @@ export class AgentProcessManager {
     if (!this.deliveryReceivedAtMs.has(message)) this.deliveryReceivedAtMs.set(message, this.clockNow());
     const transientDelivery = this.isTransientDelivery(message);
     const ap = this.agents.get(agentId);
+    const reset = this.selfSessionResets.get(agentId);
+    if (transientDelivery && reset && reset.kind !== "none"
+      && !(reset.kind === "failed" && reset.sessionCleared === false)
+      && (!ap || !ap.launchId || blocksOldLaunchDelivery(reset, ap.launchId)
+        || ap.sessionId === this.selfResetOldSessions.get(agentId) || !this.canDeliverToRuntimeSession(ap))) {
+      const queue = this.selfResetTransient.get(agentId) ?? [];
+      if (!queue.includes(message)) queue.push(message);
+      this.selfResetTransient.set(agentId, queue);
+      return true;
+    }
     const trackedBegin = this.beginTrackedMentionDelivery(agentId, message, ap, traceContext);
     if (trackedBegin === "rejected") return false;
     if (trackedBegin === "duplicate_pending") return true;
@@ -6626,6 +6821,14 @@ export class AgentProcessManager {
       // task #9: a tracked mention accepted here reaches a process only through
       // the start it joins; it is settled at that process's first turn end.
       if (trackedBegin === "accepted") this.markTrackedMentionPending(traceContext);
+      if (reset && reset.kind !== "none" && reset.kind !== "requested"
+        && !(reset.kind === "failed" && reset.sessionCleared === false)
+        && !this.agentStarts.hasStarting(agentId) && !this.agentStarts.hasQueued(agentId)) {
+        const held = this.selfResetHeldInbox.get(agentId) ?? [];
+        if (!held.some((item) => item.message_id && item.message_id === message.message_id)) held.push(message);
+        this.selfResetHeldInbox.set(agentId, held);
+        return true;
+      }
       if (this.agentStarts.hasStarting(agentId) || this.agentStarts.hasQueued(agentId)) {
         if (transientDelivery) {
           const queuedStart = this.agentStarts.getQueued(agentId);
@@ -7238,6 +7441,7 @@ export class AgentProcessManager {
   }
 
   async stopAll() {
+    for (const agentId of this.selfResetTimers.keys()) this.clearSelfResetTimer(agentId);
     // Clear idle configs so no auto-restarts happen during shutdown.
     // Use silent: true so agents stay "active" in DB — on daemon reconnect,
     // the server's ready handler will auto-restart them.
@@ -10213,7 +10417,27 @@ export class AgentProcessManager {
         // turn end after terminal cleanup never qualifies), sent after this
         // turn's agent:session frame below.
         let turnCompleted: AgentRuntimeOutcome | null = null;
+        let resetReadyLaunchId: string | null = null;
         if (ap) {
+          const previousReset = this.selfSessionResets.get(agentId);
+          const oldResetSessionId = this.selfResetOldSessions.get(agentId);
+          const completedSessionId = turnEndSessionId ?? ap.sessionId;
+          if (previousReset && previousReset.kind !== "none" && ap.launchId && ap.launchId !== previousReset.launchId
+            && oldResetSessionId && completedSessionId && completedSessionId !== oldResetSessionId
+            && ap.turnOutcome.runtimeErrors === 0 && !classifyStickyTerminalFailure(ap)) {
+            this.clearSelfResetTimer(agentId);
+            this.selfResetCancelPending.delete(agentId);
+            this.selfSessionResets.delete(agentId);
+            this.selfResetOldSessions.delete(agentId);
+            this.selfResetFailureReasons.delete(agentId);
+            this.selfResetHeldInbox.delete(agentId);
+          }
+          const reset = this.selfSessionResets.get(agentId);
+          if (reset && ap.launchId) {
+            const next = reduceSelfSessionReset(reset, { kind: "turn_end", launchId: ap.launchId });
+            this.selfSessionResets.set(agentId, next);
+            if (reset.kind === "requested" && next.kind === "paused") resetReadyLaunchId = ap.launchId;
+          }
           if (turnEndSessionId) {
             this.runtimeProcessBindingFence.rebindSession(agentId, ap, turnEndSessionId, "turn_end");
             ap.sessionId = turnEndSessionId;
@@ -10233,7 +10457,7 @@ export class AgentProcessManager {
             this.clearRuntimeErrorDeliveryBackoffWithTrace(agentId, ap, "turn_end_unclassified_runtime_error");
           }
           const reduction = reduceApmGatedTurnEnd(ap.gatedSteering, {
-            inboxLength: stickyTerminalFailure ? 0 : ap.inbox.length,
+            inboxLength: stickyTerminalFailure || resetReadyLaunchId ? 0 : ap.inbox.length,
             supportsStdinNotification: ap.driver.supportsStdinNotification,
             hasSession: this.canDeliverToRuntimeSession(ap),
             canDeliverWithoutSession: !ap.driver.requiresSessionInitForDelivery,
@@ -10262,7 +10486,8 @@ export class AgentProcessManager {
               }
             }
           } else {
-            this.settleUndeliveredTrackedMentionsAtTurnEnd(agentId, ap);
+            // Handoff keeps queued mentions pending for the replacement launch.
+            if (!resetReadyLaunchId) this.settleUndeliveredTrackedMentionsAtTurnEnd(agentId, ap);
             // No pending messages — mark idle, process stays alive waiting for stdin
             if (stickyTerminalFailure) {
               this.broadcastActivity(agentId, "error", stickyTerminalFailure.detail, [], undefined, "runtime_error");
@@ -10303,6 +10528,17 @@ export class AgentProcessManager {
           this.sendRuntimeProfileReport(agentId, "turn_end");
         }
         if (ap && turnCompleted) this.sendRuntimeOutcome(agentId, ap, turnCompleted);
+        if (!resetReadyLaunchId) this.flushSelfResetTransient(agentId);
+        if (resetReadyLaunchId) {
+          const state = this.selfSessionResets.get(agentId);
+          if (state) this.selfSessionResets.set(agentId, reduceSelfSessionReset(state, { kind: "clear_started", launchId: resetReadyLaunchId }));
+          const resetSessionId = turnEndSessionId ?? ap?.sessionId ?? null;
+          if (resetSessionId) {
+            this.selfResetOldSessions.set(agentId, resetSessionId);
+            this.armSelfResetTimer(agentId, resetReadyLaunchId, resetSessionId);
+          }
+          this.sendToServer({ type: "agent:self_session_reset:ready", agentId, launchId: resetReadyLaunchId, sessionId: resetSessionId });
+        }
         break;
 
       case "error": {

@@ -805,6 +805,9 @@ export type ServerToMachineMessage =
    * server; older daemons ignore it.
    */
   | { type: "machine:host_identity:request" }
+  | { type: "agent:self_session_reset:request"; agentId: string; launchId: string; requestId: string }
+  | { type: "agent:self_session_reset:rejected"; agentId: string; launchId: string }
+  | { type: "agent:self_session_reset:cancel_result"; agentId: string; launchId: string; notStarted: boolean }
   /**
    * RFC 071 outbox: the server applied (or deliberately ignored) one outbox
    * entry. A normal entry is named by `(daemonInstanceId, clientSeq)`; a gap
@@ -1402,6 +1405,11 @@ export type MachineToServerMessage =
   | { type: "agent:activity"; agentId: string; activity?: string; activityKind?: AgentActivityKind; detail: string; detailKind?: AgentActivityDetailKind; entries?: DaemonTrajectoryEntry[]; launchId?: string; daemonInstanceId?: string; probeId?: string; clientSeq?: number; producerFactId?: string; observedAtMs?: number; isHeartbeat?: boolean; runtimeError?: RuntimeErrorActivityDiagnostic; deliveryConsumption?: DeliveryConsumptionActivityDiagnostic; spawnFailure?: SpawnFailureActivityDiagnostic; providerRequest?: import("./providerRequestActivity").ProviderRequestActivity }
   | { type: "agent:session"; agentId: string; sessionId: string; launchId?: string }
   | { type: "agent:session:invalidate"; agentId: string; sessionId: string; launchId?: string; reason: "missing" | "provider_replay_rejected" }
+  | { type: "agent:self_session_reset:ready"; agentId: string; launchId: string; sessionId: string | null }
+  | { type: "agent:self_session_reset:recover"; agentId: string; launchId: string; sessionId: string }
+  | { type: "agent:self_session_reset:cancel"; agentId: string; launchId: string; sessionId: string }
+  | { type: "agent:self_session_reset:failed"; agentId: string; launchId: string; sessionId: string; reason: "restart_timeout" | "launch_exited" }
+  | { type: "agent:self_session_reset:ack"; agentId: string; launchId: string; requestId: string; result: "accepted" | "unsupported" | "stale" }
   | { type: "agent:runtime_profile"; agentId: string; facts: AgentRuntimeProfileReport; launchId?: string; traceparent?: string; source?: RuntimeProfileReportSource }
   | { type: "agent:runtime_profile:migration:ack"; agentId: string; migrationKey: string; launchId?: string; traceparent?: string }
   | { type: "agent:runtime_profile:migration_done"; agentId: string; migrationKey: string; launchId?: string; traceparent?: string }
