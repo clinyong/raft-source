@@ -96,6 +96,7 @@ type ResetRecord<T> = {
   cancelPending: boolean;
   transient: T[];
   heldInbox: T[];
+  pendingBodies: { launchId: string; ids: Set<string> } | null;
 };
 
 /** All reset-owned data is scoped to one record per agent. */
@@ -247,7 +248,7 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
   private ensure(agentId: string): ResetRecord<T> {
     let record = this.records.get(agentId);
     if (!record) {
-      record = { state: { kind: "none" }, oldSessionId: null, failureReason: null, timer: null, cancelPending: false, transient: [], heldInbox: [] };
+      record = { state: { kind: "none" }, oldSessionId: null, failureReason: null, timer: null, cancelPending: false, transient: [], heldInbox: [], pendingBodies: null };
       this.records.set(agentId, record);
     }
     return record;
@@ -279,6 +280,19 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     const before = record.heldInbox.length;
     record.heldInbox = record.heldInbox.filter((message) => !consumed(message));
     return before - record.heldInbox.length;
+  }
+  stageBodies(agentId: string, launchId: string | null, messages: readonly T[]): void {
+    const record = this.records.get(agentId);
+    if (!record || !launchId) return;
+    const ids = new Set(messages.flatMap((message) => message.message_id ? [message.message_id] : []));
+    record.pendingBodies = ids.size ? { launchId, ids } : null;
+  }
+  confirmBodyProgress(agentId: string, launchId: string | null): void {
+    const record = this.records.get(agentId);
+    const staged = record?.pendingBodies;
+    if (!record || !staged || staged.launchId !== launchId) return;
+    this.suppressHeld(agentId, (message) => Boolean(message.message_id && staged.ids.has(message.message_id)));
+    record.pendingBodies = null;
   }
   hold(agentId: string, messages: readonly T[]): void {
     const held = this.ensure(agentId).heldInbox;

@@ -5077,6 +5077,7 @@ export class AgentProcessManager {
     };
     this.startingInboxes.drainOnSpawn(agentId);
     this.agents.set(agentId, agentProcess);
+    if (resumeCatchupDeliveredAsInput) this.selfReset.stageBodies(agentId, effectiveLaunchId, resumeCatchupInputMessages);
     this.markTrackedMentionsToldAtStart(agentId, processInstanceId, firstInputMessages);
     if (this.lifecycleRecords.stopEpochChanged(agentId, startStopEpoch)) {
       // RFC 071: the runtime has not been started, so no child exists.
@@ -10029,6 +10030,7 @@ export class AgentProcessManager {
       // itself, so the turn span opens here. Other events never open a turn.
       // Open before counting so this first event is kept in the new counters.
       if (isModelWorkEvent(event.kind)) {
+        if (event.kind !== "tool_output") this.selfReset.confirmBodyProgress(agentId, ap.launchId);
         this.startRuntimeTrace(agentId, ap, "runtime-progress");
       }
       noteRuntimeTraceCounter(ap.runtimeTraceCounters, event);
