@@ -2384,7 +2384,9 @@ registerAgentApiRoute("selfSessionReset", async (req, res) => {
   try {
     const result = await orchestrator.requestSelfSessionReset(agentId, launchId);
     if (result !== "accepted") {
-      res.status(409).json({ error: result === "unsupported" ? "Runtime does not support self session reset" : "Launch is no longer current", code: result });
+      const error = result === "unsupported" ? "Runtime does not support self session reset"
+        : result === "idle" ? "The requesting turn has already ended" : "Launch is no longer current";
+      res.status(409).json({ error, code: result });
       return;
     }
     res.status(202).json({ status: "accepted" });
