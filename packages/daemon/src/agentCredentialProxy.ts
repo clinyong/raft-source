@@ -1963,9 +1963,11 @@ async function loadRecentTargetMessages(
  * Apply the freshness state machine's consumption effects.
  *
  * Exported for the daemon tests: what each effect proves about the model's
- * reading is the point of task #74 (the preflight context reaches the model
- * with the API response, so it is a conclusive read — not a merely rendered
- * one), and pinning it here keeps that decision at the step that delivers it.
+ * reading is the point of task #74, and pinning it here keeps that decision at
+ * the step that delivers it. What the preflight context proves is ATTENTION,
+ * not a read: it is the freshness guard's preview window (truncated for a long
+ * message), so the agent may never have seen the body. A body read starts at
+ * the step that hands a body over — the send — not here.
  */
 export async function applyAgentInboxStateMachineEffects(
   coordinator: AgentProxyInboxCoordinator,
@@ -1981,10 +1983,13 @@ export async function applyAgentInboxStateMachineEffects(
       messages: effect.messages,
       boundarySeq: effect.boundarySeq,
       source: effect.source,
-      // The preflight context reaches the model with the API response, like
-      // `server_held_context`: the read is conclusive, so it may also suppress
-      // the held inbox of a session handoff.
-      readEvidence: "consumed",
+      // The preflight context is the freshness guard's held window: a PREVIEW
+      // rendered so the agent can decide whether to send, and truncated when
+      // the message is long. It is the send that hands a body over, not this.
+      // Counting it as a read dropped the message at a session handoff (the
+      // replacement never saw it), so it proves attention only — "may repeat,
+      // never lose". This also keeps it from clearing a held inbox.
+      readEvidence: "none",
     });
   }
 }

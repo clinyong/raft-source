@@ -5535,11 +5535,12 @@ function deliverIdleWithJoinContext(ledger: AgentVisibleDeliveryLedger, message:
   ledger.recordConsumed("agent-1", { messages: [message], source: "stdin_idle_delivery", contextId });
 }
 
-// task #74: the preflight context reaches the model with the API response, so
-// the read is conclusive (it may also suppress the held inbox of a handoff).
-// It used to be pinned by the held-inbox source-name list; the step that
-// delivers it now states it, and this test pins that statement.
-test("a preflight-context consumption is a conclusive read (task #74)", async () => {
+// task #74/#75: the preflight context is a PREVIEW — the freshness guard's
+// held window, rendered so the agent can decide whether to send. It is not the
+// step that hands a body over, so it proves attention, not a read: the
+// replacement must still receive the message at a handoff. (#74 marked it
+// `consumed`, which silently dropped the message after a session reset.)
+test("a preflight-context consumption is not a body read (task #74)", async () => {
   const seen: { source: string; readEvidence?: string }[] = [];
   const coordinator = {
     consumeVisibleMessages: (input: { source: string; readEvidence?: string }) => {
@@ -5552,7 +5553,11 @@ test("a preflight-context consumption is a conclusive read (task #74)", async ()
     messages: [{ id: "m-preflight-1", seq: 1 } as any],
     source: "side_effect_preflight_context",
   }]);
-  assert.deepEqual(seen, [{ source: "side_effect_preflight_context", readEvidence: "consumed" }]);
+  assert.deepEqual(
+    seen,
+    [{ source: "side_effect_preflight_context", readEvidence: "none" }],
+    "a preview proves attention only, so the message survives a handoff",
+  );
 });
 
 test("task #360 sample 1: a thread reply delivered in full is forwarded as an exact seen seq above the boundary", async () => {
