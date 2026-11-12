@@ -5183,11 +5183,11 @@ export class AgentProcessManager {
       this.ackInjectedRuntimeProfileMessages(agentId, startingInboxMessages, agentProcess.launchId);
     } else if (wakeMessage && !wakeMessageTransient) {
       // This path reached the recording without a body-rendering branch: the
-      // prompt carried the resume prompt (or the profile control that does
-      // NOT embed the content). Whether the model read the wake depends on
-      // what was rendered, so the source says it: a rendered body is a read,
-      // an announcement is not — and an announcement must not survive a
-      // handoff as a read fact.
+      // prompt carried the resume prompt (which never embeds the wake body)
+      // or a daemon-release profile control prompt (which does embed it).
+      // Whether the model read the wake depends on what was rendered, so the
+      // source says it: a rendered body is a read, an announcement is not —
+      // and an announcement must not survive a handoff as a read fact.
       this.consumeVisibleMessages(agentId, {
         messages: [wakeMessage],
         source: wakeBodyRendered ? "spawn_wake_message" : "spawn_wake_notice",
