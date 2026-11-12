@@ -5842,6 +5842,29 @@ test("self reset keeps the read position of a startup catch-up body", async () =
   });
 });
 
+test("self reset keeps the read position of a release-notice wake", async () => {
+  await withManager(async ({ driver, manager }) => {
+    // A runtime-profile daemon release notice: the wake's body is embedded in
+    // the profile control prompt, so the model read it.
+    const notice = makeMessage("release notice body", { message_id: "runtime-profile-daemon-release-test", seq: 8 });
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), notice, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const ap = getProcess(manager, "agent-reset");
+    await manager.deliverMessage("agent-reset", notice);
+    await flush();
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === notice.message_id).length,
+      0,
+      "a release notice body the outgoing session read must not be queued again",
+    );
+  });
+});
+
 test("self reset consumes the handoff stop when the old process is already gone", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");

@@ -4736,6 +4736,12 @@ export class AgentProcessManager {
     let promptSource: string;
     let wakeMessageDeliveredAsInboxUpdate = false;
     let wakeMessageDeliveredWithThreadContext = false;
+    // Whether the wake's BODY reached the prompt. The runtime profile control
+    // wraps the message content, so that path renders the body too; the
+    // resume-prompt start does not. The distinction decides whether the wake
+    // counts as read (and may survive a session handoff) or as an attention
+    // signal (which must not).
+    let wakeBodyRendered = false;
     let startingInboxDeliveredAsInput = false;
     let resumeCatchupDeliveredAsInput = false;
     let renderedStartupThreadContextMessages: AgentMessage[] = [];
@@ -4821,9 +4827,13 @@ export class AgentProcessManager {
       if (transientWakeMessage) {
         prompt = formatSystemNoticeRuntimeInput(projectedWakeMessage, driver);
       } else if (runtimeProfileControlPrompt) {
+        // The profile control prompt embeds the message content, so the wake's
+        // body did reach the model.
+        wakeBodyRendered = true;
         prompt = runtimeProfileControlPrompt;
       } else if (wakeMessageProjection.renderedContextMessages.length > 0) {
         wakeMessageDeliveredWithThreadContext = true;
+        wakeBodyRendered = true;
         renderedStartupThreadContextMessages = wakeMessageProjection.renderedContextMessages;
         const pendingInboxNotice = startingInboxMessages.length > 0
           ? formatInboxUpdateRuntimeInput(startingInboxMessages, driver, startingInboxMessages.length)
@@ -5172,12 +5182,16 @@ export class AgentProcessManager {
       this.consumeVisibleMessages(agentId, { messages: startingInboxMessages, source: "spawn_starting_inbox_update" });
       this.ackInjectedRuntimeProfileMessages(agentId, startingInboxMessages, agentProcess.launchId);
     } else if (wakeMessage && !wakeMessageTransient) {
-      // The wake's body was NOT rendered on this path: the prompt carries the
-      // runtime profile control, or the resume prompt, instead (the body
-      // branch above is the one that renders it). The model has NOT read this
-      // message — it is an attention signal, and it must not survive a
+      // This path reached the recording without a body-rendering branch: the
+      // prompt carried the resume prompt (or the profile control that does
+      // NOT embed the content). Whether the model read the wake depends on
+      // what was rendered, so the source says it: a rendered body is a read,
+      // an announcement is not — and an announcement must not survive a
       // handoff as a read fact.
-      this.consumeVisibleMessages(agentId, { messages: [wakeMessage], source: "spawn_wake_notice" });
+      this.consumeVisibleMessages(agentId, {
+        messages: [wakeMessage],
+        source: wakeBodyRendered ? "spawn_wake_message" : "spawn_wake_notice",
+      });
       this.ackInjectedRuntimeProfileMessages(agentId, [wakeMessage], agentProcess.launchId);
     }
 

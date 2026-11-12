@@ -99,7 +99,7 @@ const EXIT_REASONS = [
 ] as const;
 const VISIBLE_CONSUMED_SOURCES = [
   "agent_api_inbox_check", "agent_api_history", "agent_api_events_local", "agent_api_events_server", "agent_api_send_commit",
-  "spawn_wake_message", "spawn_resume_catchup_inbox", "spawn_starting_inbox_update",
+  "spawn_wake_message", "spawn_wake_notice", "spawn_resume_catchup_inbox", "spawn_starting_inbox_update",
   "stdin_thread_context_delivery", "busy_stdin_notification", "stdin_idle_delivery", "stdin_busy_delivery",
 ] as const;
 const TURN_REASONS = [
