@@ -5754,6 +5754,53 @@ test("self reset drops a carried message after the replacement reads its body", 
   });
 });
 
+test("self reset keeps the read position across the handoff", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
+    // The outgoing session reads the message: the read position now covers it.
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    // The server re-sends the message the outgoing session already read. The
+    // read position survived the handoff, so it is dropped instead of being
+    // queued for a session that has already seen it.
+    await manager.deliverMessage("agent-reset", alreadyRead);
+    await flush();
+    const queued = getProcess(manager, "agent-reset").inbox.filter((m: AgentMessage) => m.message_id === "read-1");
+    assert.equal(queued.length, 0, "a message the outgoing session already read must not be queued again");
+  });
+});
+
+test("self reset hands the replacement only what the outgoing session had not read", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    // The read position of this conversation is already at seq 7.
+    (manager as any).consumeVisibleMessages("agent-reset", {
+      messages: [], target: "#general", boundarySeq: 7, source: "verified_contiguous_content_consumption",
+    });
+    // The queue still holds one message from before the read position and one
+    // from after it.
+    const beforePosition = makeMessage("before read position marker", { message_id: "read-1", seq: 7 });
+    const afterPosition = makeMessage("after read position marker", { message_id: "queued-1", seq: 8 });
+    getProcess(manager, "agent-reset").inbox.push(beforePosition, afterPosition);
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const prompt = driver.spawnCalls[1]!.prompt;
+    assert.doesNotMatch(prompt, /read-1/, "a message before the read position is not handed over");
+    assert.match(prompt, /queued-1/, "a message after the read position is handed over");
+    assert.match(prompt, /1 message pending your read/);
+  });
+});
+
 test("self reset removes catch-up bodies only after replacement model progress", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
