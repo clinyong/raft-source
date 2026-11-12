@@ -475,11 +475,11 @@ test("keepOnlyBodyFacts keeps the read position itself", () => {
 
 test("keepOnlyBodyFacts drops a wake that never rendered its body", () => {
   const ledger = new AgentVisibleDeliveryLedger();
-  // The runtime-profile-control wake renders the profile control, not the
-  // wake's body: the model has not read it.
+  // A wake whose body was never rendered (the prompt carried the profile
+  // control or the resume prompt instead): the model has not read it.
   ledger.recordConsumed("agent-1", {
     messages: [{ seq: 12, message_id: "m-12", channel_type: "channel", channel_name: "general" }],
-    source: "spawn_wake_runtime_profile_control",
+    source: "spawn_wake_notice",
   });
   // The wake that DOES render its body is a read.
   ledger.recordConsumed("agent-1", {
@@ -498,5 +498,23 @@ test("keepOnlyBodyFacts drops a wake that never rendered its body", () => {
     ledger.isModelSeen("agent-1", "#general", { message_id: "m-13" }),
     true,
     "a wake whose body was rendered is a read and survives the handoff",
+  );
+});
+
+test("keepOnlyBodyFacts drops a wake the resume-prompt start announced", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  // A start that carries a resume prompt renders the resume prompt, not the
+  // wake's body — the wake is announced, never read.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 14, message_id: "m-14", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_notice",
+  });
+
+  ledger.keepOnlyBodyFacts("agent-1");
+
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-14" }),
+    false,
+    "a wake announced next to a resume prompt is not a read",
   );
 });

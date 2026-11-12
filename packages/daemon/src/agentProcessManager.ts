@@ -3029,7 +3029,7 @@ export class AgentProcessManager {
     // rows, but they must not advance the per-target high-water boundary because
     // sparse delivery of a high-seq @mention does not prove older seqs in that
     // target were consumed. The ledger therefore treats daemon attention
-    // sources (`spawn_wake_runtime_profile_control`, `stdin_*_delivery`,
+    // sources (`spawn_wake_notice`, `stdin_*_delivery`,
     // `agent_api_events_local`, server views, self-authored commits, and
     // future/unknown strings) as exact-id-only unless the source explicitly
     // represents rendered or contiguous full-body content consumption.
@@ -5172,11 +5172,12 @@ export class AgentProcessManager {
       this.consumeVisibleMessages(agentId, { messages: startingInboxMessages, source: "spawn_starting_inbox_update" });
       this.ackInjectedRuntimeProfileMessages(agentId, startingInboxMessages, agentProcess.launchId);
     } else if (wakeMessage && !wakeMessageTransient) {
-      // This is the runtime-profile-control wake: the prompt carries the
-      // profile control, NOT the wake's body (the body branch above is the
-      // one that renders it). So the model has NOT read this message — it is
-      // an attention signal, and it must not survive a handoff as a read fact.
-      this.consumeVisibleMessages(agentId, { messages: [wakeMessage], source: "spawn_wake_runtime_profile_control" });
+      // The wake's body was NOT rendered on this path: the prompt carries the
+      // runtime profile control, or the resume prompt, instead (the body
+      // branch above is the one that renders it). The model has NOT read this
+      // message — it is an attention signal, and it must not survive a
+      // handoff as a read fact.
+      this.consumeVisibleMessages(agentId, { messages: [wakeMessage], source: "spawn_wake_notice" });
       this.ackInjectedRuntimeProfileMessages(agentId, [wakeMessage], agentProcess.launchId);
     }
 
