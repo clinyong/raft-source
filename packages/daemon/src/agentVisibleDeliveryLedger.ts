@@ -159,6 +159,29 @@ function canAdvanceBoundaryForTarget(source: string, target: string): boolean {
 }
 
 /**
+ * Sources whose rendering put the message BODY in front of the model. A source
+ * outside this set is an attention signal: the message was queued, announced,
+ * or written by the agent itself — nobody read its body.
+ *
+ * Why the distinction exists (task #71): at a session handoff the read
+ * position has to survive so the replacement does not re-read what the
+ * outgoing session read. But an attention signal must NOT survive it: the
+ * server re-pushes those messages, and the delivery gate consults the id set
+ * as well as the boundary — so a surviving attention id would drop a message
+ * the replacement has never seen. The rule is "may repeat, never lose": a
+ * duplicate is one more look, a lost message is a message nobody answers.
+ */
+const BODY_CONSUMPTION_SOURCES = new Set<string>([
+  "agent_api_history",
+  "agent_api_events_local",
+  "agent_api_events_server",
+  "server_held_context",
+  "side_effect_preflight_context",
+  "thread_join_context_rendered",
+  "verified_contiguous_content_consumption",
+]);
+
+/**
  * Owns the daemon's agent-visible delivery ledger.
  *
  * The ledger is the single boundary where APM turns "the model has seen this"
@@ -196,13 +219,47 @@ export class AgentVisibleDeliveryLedger {
   private readonly boundaryByAgent = new Map<string, Map<string, number>>();
   private readonly messageIdsByAgent = new Map<string, Map<string, Set<string>>>();
   private readonly exactSeqsByAgent = new Map<string, Map<string, Set<number>>>();
+  // The subset of the facts above that a BODY render proved: the ids and seqs
+  // whose content the model actually saw. Attention signals (queued, announced)
+  // are recorded in the general sets only.
+  private readonly bodyIdsByAgent = new Map<string, Map<string, Set<string>>>();
+  private readonly bodySeqsByAgent = new Map<string, Map<string, Set<number>>>();
   private readonly contextScopeByAgent = new Map<string, ContextScope>();
 
   clearAgent(agentId: string): void {
     this.boundaryByAgent.delete(agentId);
     this.messageIdsByAgent.delete(agentId);
     this.exactSeqsByAgent.delete(agentId);
+    this.bodyIdsByAgent.delete(agentId);
+    this.bodySeqsByAgent.delete(agentId);
     this.contextScopeByAgent.delete(agentId);
+  }
+
+  /**
+   * Narrow the agent's read position to what a body render proved, for a
+   * session handoff. The high-water boundary stays (only body consumption
+   * advances it); the id and exact-seq sets keep only their body-proven
+   * entries. Everything an attention signal left behind is dropped, so the
+   * server's re-push of a merely-notified message still reaches the
+   * replacement.
+   */
+  keepOnlyBodyFacts(agentId: string): void {
+    const ids = this.messageIdsByAgent.get(agentId);
+    if (ids) {
+      const bodies = this.bodyIdsByAgent.get(agentId);
+      for (const [target, set] of ids) {
+        const bodySet = bodies?.get(target);
+        for (const id of [...set]) if (!bodySet?.has(id)) set.delete(id);
+      }
+    }
+    const seqs = this.exactSeqsByAgent.get(agentId);
+    if (seqs) {
+      const bodies = this.bodySeqsByAgent.get(agentId);
+      for (const [target, set] of seqs) {
+        const bodySet = bodies?.get(target);
+        for (const seq of [...set]) if (!bodySet?.has(seq)) set.delete(seq);
+      }
+    }
   }
 
   /**
@@ -338,6 +395,9 @@ export class AgentVisibleDeliveryLedger {
         for (const id of bucket.ids) targetIds.add(id);
       }
       if (bucket.seqs.size > 0) this.recordExactSeqs(agentId, target, bucket.seqs);
+      if (BODY_CONSUMPTION_SOURCES.has(input.source)) {
+        this.recordBodyFacts(agentId, target, bucket);
+      }
       this.assertConsumedInvariants("recordConsumed", agentId, target, bucket, {
         advancesBoundary,
         previousBoundary,
@@ -385,6 +445,36 @@ export class AgentVisibleDeliveryLedger {
       this.exactSeqsByAgent.set(agentId, map);
     }
     addCappedExactSeqs(map, target, seqs);
+  }
+
+  /** Record the ids and seqs a body render proved, per target. */
+  private recordBodyFacts(agentId: string, target: string, bucket: VisibleBucket): void {
+    if (bucket.ids.size > 0) {
+      let map = this.bodyIdsByAgent.get(agentId);
+      if (!map) {
+        map = new Map<string, Set<string>>();
+        this.bodyIdsByAgent.set(agentId, map);
+      }
+      let set = map.get(target);
+      if (!set) {
+        set = new Set<string>();
+        map.set(target, set);
+      }
+      for (const id of bucket.ids) set.add(id);
+    }
+    if (bucket.seqs.size > 0) {
+      let map = this.bodySeqsByAgent.get(agentId);
+      if (!map) {
+        map = new Map<string, Set<number>>();
+        this.bodySeqsByAgent.set(agentId, map);
+      }
+      let set = map.get(target);
+      if (!set) {
+        set = new Set<number>();
+        map.set(target, set);
+      }
+      for (const seq of bucket.seqs) set.add(seq);
+    }
   }
 
   /** A new context id starts an empty scope: the previous context's facts are gone from the model. */

@@ -5776,6 +5776,28 @@ test("self reset keeps the read position across the handoff", async () => {
   });
 });
 
+test("self reset re-delivers a message the outgoing session was only notified about", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const noticed = makeMessage("noticed only marker", { message_id: "notice-1", seq: 9 });
+    // The outgoing session got a NOTICE about the message — it was queued and
+    // announced, nobody read its body.
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [noticed], source: "spawn_wake_message" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    // The server re-pushes it. The replacement MUST receive it: a notice is not
+    // a read, and "may repeat" is acceptable while "may lose" is not.
+    await manager.deliverMessage("agent-reset", noticed);
+    await flush();
+    const queued = getProcess(manager, "agent-reset").inbox.filter((m: AgentMessage) => m.message_id === "notice-1");
+    assert.equal(queued.length, 1, "a message the outgoing session was only notified about must reach the replacement");
+  });
+});
+
 test("self reset hands the replacement only what the outgoing session had not read", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");

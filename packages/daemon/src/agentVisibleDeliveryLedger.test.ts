@@ -421,3 +421,53 @@ test("clearAgent drops the context scope too", () => {
   ledger.clearAgent("agent-1");
   assert.equal(ledger.freshnessView("agent-1", { contextId: "ctx-1" }).getBoundary(THREAD), undefined);
 });
+
+test("keepOnlyBodyFacts keeps what a body render proved and drops attention-only facts", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  // A body render: the model saw the message.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 10, message_id: "m-10", channel_type: "channel", channel_name: "general" }],
+    source: "agent_api_history",
+  });
+  // An attention signal: the message was queued and announced, nobody read it.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 11, message_id: "m-11", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_message",
+  });
+  assert.equal(ledger.isModelSeen("agent-1", "#general", { message_id: "m-11" }), true, "both are seen before the handoff");
+
+  ledger.keepOnlyBodyFacts("agent-1");
+
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-10" }),
+    true,
+    "a message whose body the model read stays seen across the handoff",
+  );
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-11" }),
+    false,
+    "a message that was only queued is forgotten, so a re-push still reaches the replacement",
+  );
+  assert.equal(
+    ledger.getExactSeenSeqs("agent-1", "#general").includes(11),
+    false,
+    "the exact seq of an attention-only message is forgotten too",
+  );
+  assert.equal(
+    ledger.getExactSeenSeqs("agent-1", "#general").includes(10),
+    true,
+    "the exact seq of a body-proven message survives",
+  );
+});
+
+test("keepOnlyBodyFacts keeps the read position itself", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  ledger.recordConsumed("agent-1", {
+    messages: [],
+    target: "#general",
+    boundarySeq: 7,
+    source: "verified_contiguous_content_consumption",
+  });
+  ledger.keepOnlyBodyFacts("agent-1");
+  assert.equal(ledger.getBoundary("agent-1", "#general"), 7, "the high-water boundary is body-proven and stays");
+});

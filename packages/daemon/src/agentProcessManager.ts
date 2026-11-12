@@ -6466,6 +6466,19 @@ export class AgentProcessManager {
     const selfResetHandoff = this.selfReset.holdsInbox(agentId);
     if (selfResetHandoff) {
       this.selfReset.hold(agentId, ap.inbox.splice(0));
+      // A self reset keeps the read position: it is a HANDOFF, not an ending.
+      // The replacement session continues the same work, so what the outgoing
+      // session READ has to survive it — otherwise every message it already
+      // read comes back to the replacement, which is the replay the self reset
+      // is meant to avoid.
+      //
+      // Only the part that a body render proved survives. An attention signal
+      // (the message was queued or announced, nobody read it) must NOT: the
+      // delivery gate consults the id set as well as the boundary, so a
+      // surviving attention id would drop a message the replacement has never
+      // seen — and "may repeat" is acceptable while "may lose" is not.
+      // (Done here, outside the silent branch: a handoff may stop either way.)
+      this.agentVisibleDelivery.keepOnlyBodyFacts(agentId);
     } else {
       this.recordInboxDroppedOnExit(agentId, ap, silent ? "silent_stop" : "explicit_stop", ap.inbox.splice(0));
     }
@@ -6482,13 +6495,13 @@ export class AgentProcessManager {
       // A silent respawn under the SAME launchId must KEEP the set,
       // else a not-yet-boundary-covered set-only id could be re-delivered and
       // miss dedup → re-wakeup (CL-CC2-4 boundary-aware-pruning precondition).
-      // A self reset keeps it too, for the same reason: it is a HANDOFF, not an
-      // ending. The replacement session continues the same work, so the read
-      // position (the model-seen boundary and the exact ids) has to survive it —
-      // otherwise every message the outgoing session already read comes back to
-      // the replacement, which is the replay the self reset is meant to avoid.
-      if (!selfResetHandoff) this.agentVisibleDelivery.clearAgent(agentId);
-      // Spawn-fail backoff state: explicit stop = fresh launch = reset counter (otherwise
+      // A self reset keeps the read position too, for the same reason: it is a
+      // HANDOFF, not an ending. The replacement session continues the same
+      // work, so what the outgoing session READ has to survive it — otherwise
+      // every message it already read comes back to the replacement, which is
+      // the replay the self reset is meant to avoid. The handoff keeps only
+      // the body-proven part of it (see above); a user-driven stop clears it.
+      if (!selfResetHandoff) this.agentVisibleDelivery.clearAgent(agentId);      // Spawn-fail backoff state: explicit stop = fresh launch = reset counter (otherwise
       // a deliberate user-driven restart sees stale backoff and gets gated). Silent stop
       // preserves to prevent stop/start churn from bypassing the cap (same CC1 reasoning).
       this.resetSpawnFailBackoff(agentId, "suppressed");
