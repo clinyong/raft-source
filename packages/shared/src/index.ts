@@ -1409,7 +1409,7 @@ export type MachineToServerMessage =
   | { type: "agent:self_session_reset:recover"; agentId: string; launchId: string; sessionId: string }
   | { type: "agent:self_session_reset:cancel"; agentId: string; launchId: string; sessionId: string }
   | { type: "agent:self_session_reset:failed"; agentId: string; launchId: string; sessionId: string; reason: "restart_timeout" | "launch_exited" }
-  | { type: "agent:self_session_reset:ack"; agentId: string; launchId: string; requestId: string; result: "accepted" | "unsupported" | "stale" | "idle" }
+  | { type: "agent:self_session_reset:ack"; agentId: string; launchId: string; requestId: string; result: "accepted" | "unsupported" | "reset_in_progress" | "stale_launch" | "idle" }
   | { type: "agent:runtime_profile"; agentId: string; facts: AgentRuntimeProfileReport; launchId?: string; traceparent?: string; source?: RuntimeProfileReportSource }
   | { type: "agent:runtime_profile:migration:ack"; agentId: string; migrationKey: string; launchId?: string; traceparent?: string }
   | { type: "agent:runtime_profile:migration_done"; agentId: string; migrationKey: string; launchId?: string; traceparent?: string }

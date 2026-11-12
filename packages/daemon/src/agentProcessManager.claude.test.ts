@@ -5560,7 +5560,7 @@ test("self reset holds inbox input until the requesting launch ends its turn", a
   await withManager(async ({ driver, manager, sent }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     const ap = getProcess(manager, "agent-reset");
-    assert.equal(manager.requestSelfSessionReset("agent-reset", "wrong-launch"), "stale");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "wrong-launch"), "stale_launch");
     assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
     assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
     (manager as any).markSessionReadyForDelivery(ap, "turn_end");
