@@ -362,6 +362,8 @@ function renderThreadPackage(ledger: AgentVisibleDeliveryLedger, contextId: stri
     target: THREAD,
     messages: seqs.map((seq) => ({ seq, message_id: `m-${seq}`, channel_type: "thread", channel_name: "abcd1234", parent_channel_name: "general", parent_channel_type: "channel" })),
     source: "thread_join_context_rendered",
+    readEvidence: "rendered",
+    boundaryEvidence: "thread",
     contextId,
   });
   ledger.recordConsumed("agent-1", {
@@ -428,6 +430,7 @@ test("keepOnlyBodyFacts keeps what a body render proved and drops attention-only
   ledger.recordConsumed("agent-1", {
     messages: [{ seq: 10, message_id: "m-10", channel_type: "channel", channel_name: "general" }],
     source: "agent_api_history",
+    readEvidence: "consumed",
   });
   // An attention signal: the starting inbox rendered a pending notice about
   // the message, nobody read its body.
@@ -468,6 +471,7 @@ test("keepOnlyBodyFacts keeps the read position itself", () => {
     target: "#general",
     boundarySeq: 7,
     source: "verified_contiguous_content_consumption",
+    boundaryEvidence: "contiguous",
   });
   ledger.keepOnlyBodyFacts("agent-1");
   assert.equal(ledger.getBoundary("agent-1", "#general"), 7, "the high-water boundary is body-proven and stays");
@@ -485,6 +489,7 @@ test("keepOnlyBodyFacts drops a wake that never rendered its body", () => {
   ledger.recordConsumed("agent-1", {
     messages: [{ seq: 13, message_id: "m-13", channel_type: "channel", channel_name: "general" }],
     source: "spawn_wake_message",
+    readEvidence: "rendered",
   });
 
   ledger.keepOnlyBodyFacts("agent-1");
@@ -517,4 +522,92 @@ test("keepOnlyBodyFacts drops a wake the resume-prompt start announced", () => {
     false,
     "a wake announced next to a resume prompt is not a read",
   );
+});
+
+// task #74: the caller states what it knows about the model's reading. The
+// source name is a diagnostic label and decides nothing: one name covers
+// several behaviours, which is how a wake that was only announced came to
+// count as a read.
+test("the read evidence decides, not the source name (task #74)", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  // Same source name, two different steps: one rendered the body, the other
+  // only announced the message.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 20, message_id: "m-20", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_message",
+    readEvidence: "rendered",
+  });
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 21, message_id: "m-21", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_message",
+    readEvidence: "none",
+  });
+
+  ledger.keepOnlyBodyFacts("agent-1");
+
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-20" }),
+    true,
+    "the step that rendered the body proved a read, so it survives the handoff",
+  );
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-21" }),
+    false,
+    "the step that only announced it proved no read, so a re-push still reaches the replacement",
+  );
+});
+
+// task #74: a notice-only path must never produce a body-read record, or the
+// handoff would keep a fact nobody established.
+test("a notice-only path produces no body-read record (task #74)", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 30, message_id: "m-30", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_starting_inbox_update",
+    readEvidence: "none",
+  });
+
+  ledger.keepOnlyBodyFacts("agent-1");
+
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-30" }),
+    false,
+    "a starting-inbox notice is not a read, so the message stays deliverable",
+  );
+});
+
+// task #73: the id sets used to grow with the agent's whole consumed traffic
+// until a stop or a daemon restart, because the handoff no longer clears
+// them. They are capped now, keeping the newest.
+test("the ledger caps the message ids per target, keeping the newest (task #73)", async () => {
+  const { MAX_MESSAGE_IDS_PER_TARGET } = await import("./agentVisibleDeliveryLedger");
+  const ledger = new AgentVisibleDeliveryLedger();
+  const total = MAX_MESSAGE_IDS_PER_TARGET + 10;
+  ledger.recordConsumed("agent-1", {
+    messages: Array.from({ length: total }, (_, i) => ({ seq: i + 1, message_id: `m-${i + 1}`, channel_type: "channel", channel_name: "general" })),
+    source: "agent_api_events_local",
+    readEvidence: "consumed",
+  });
+  const ids = ledger.getMessageIdSet("agent-1", "#general");
+  assert.equal(ids?.size, MAX_MESSAGE_IDS_PER_TARGET, "the id set is capped");
+  assert.equal(ids?.has("m-1"), false, "the oldest id was evicted");
+  assert.equal(ids?.has("m-11"), true, "the newest ids are kept");
+  assert.equal(ids?.has(`m-${total}`), true);
+});
+
+// task #73: a context id can outlive many sessions (runtimes that never report
+// a compaction reuse it), so the context-scoped id set needs the same cap.
+test("the context-scoped ids are capped too (task #73)", async () => {
+  const { MAX_MESSAGE_IDS_PER_TARGET } = await import("./agentVisibleDeliveryLedger");
+  const ledger = new AgentVisibleDeliveryLedger();
+  const total = MAX_MESSAGE_IDS_PER_TARGET + 10;
+  ledger.recordConsumed("agent-1", {
+    messages: Array.from({ length: total }, (_, i) => ({ seq: i + 1, message_id: `m-${i + 1}`, channel_type: "channel", channel_name: "general" })),
+    source: "agent_api_events_local",
+    readEvidence: "consumed",
+    contextId: "ctx-1",
+  });
+  const view = ledger.freshnessView("agent-1", { contextId: "ctx-1" });
+  assert.equal(view.isModelSeen("#general", { message_id: "m-1" }), false, "the oldest id fell out of the context scope");
+  assert.equal(view.isModelSeen("#general", { message_id: `m-${total}` }), true, "the newest id is kept");
 });

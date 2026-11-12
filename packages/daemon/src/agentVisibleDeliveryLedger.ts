@@ -144,12 +144,42 @@ function addCappedExactSeqs(map: Map<string, Set<number>>, target: string, seqs:
   }
 }
 
-function canAdvanceBoundaryForTarget(source: string, target: string): boolean {
+/**
+ * How much of the model's consumption the caller can prove.
+ *
+ * The boundary is a CONTIGUOUS claim ("everything up to this seq was
+ * consumed"), so it can never be derived from a single message: only the
+ * caller knows whether what it consumed was contiguous. It used to be
+ * guessed from the source NAME (`verified_contiguous_content_consumption`,
+ * `thread_join_context_rendered`), which meant a source name had to carry
+ * two different meanings at once. The caller now states it explicitly.
+ */
+export type AgentVisibleDeliveryBoundaryEvidence = "none" | "contiguous" | "thread";
+
+/**
+ * What the caller knows about the model's reading of the messages (task #74).
+ *
+ * - `none`: an attention signal. The message was queued, announced, or
+ *   written by the agent itself — nobody read its body.
+ * - `rendered`: the bodies were put in front of the model (the prompt carried
+ *   them). The model may have read them, but the daemon has not seen the
+ *   model act on them.
+ * - `consumed`: the runtime consumed the messages (an API read, a history
+ *   pull). The read is conclusive.
+ *
+ * The distinction used to be guessed from the source name, which is how one
+ * source name ended up meaning two different things and how a wake that was
+ * only announced came to count as a read. The step that hands the bodies over
+ * states it instead.
+ */
+export type AgentVisibleDeliveryReadEvidence = "none" | "rendered" | "consumed";
+
+function canAdvanceBoundaryForTarget(evidence: AgentVisibleDeliveryBoundaryEvidence, target: string): boolean {
   // Model-seen boundary contract: daemon delivery/queue/wake signals prove
   // attention, not contiguous content consumption. A sparse high-seq mention
   // must never advance the high-water boundary and hide older unseen rows.
-  if (source === "verified_contiguous_content_consumption") return true;
-  if (source === "thread_join_context_rendered") {
+  if (evidence === "contiguous") return true;
+  if (evidence === "thread") {
     // A rendered thread-join package shows the parent/root message and recent
     // thread replies. The recent replies are contiguous only within the thread
     // target; the parent message is an exact visible row, not proof that the
@@ -158,34 +188,6 @@ function canAdvanceBoundaryForTarget(source: string, target: string): boolean {
   }
   return false;
 }
-
-/**
- * Sources whose rendering put the message BODY in front of the model. A source
- * outside this set is an attention signal: the message was queued, announced,
- * or written by the agent itself — nobody read its body.
- *
- * Why the distinction exists (task #71): at a session handoff the read
- * position has to survive so the replacement does not re-read what the
- * outgoing session read. But an attention signal must NOT survive it: the
- * server re-pushes those messages, and the delivery gate consults the id set
- * as well as the boundary — so a surviving attention id would drop a message
- * the replacement has never seen. The rule is "may repeat, never lose": a
- * duplicate is one more look, a lost message is a message nobody answers.
- */
-const BODY_CONSUMPTION_SOURCES = new Set<string>([
-  "agent_api_history",
-  "agent_api_events_local",
-  "agent_api_events_server",
-  "server_held_context",
-  "side_effect_preflight_context",
-  "thread_join_context_rendered",
-  "verified_contiguous_content_consumption",
-  // The startup catch-up renders the message BODIES into the first input
-  // (formatConcreteMessagesRuntimeInput), and the wake renders its own body
-  // the same way; only the starting-inbox notice is a notice.
-  "spawn_resume_catchup_inbox",
-  "spawn_wake_message",
-]);
 
 /**
  * Owns the daemon's agent-visible delivery ledger.
@@ -220,6 +222,41 @@ const BODY_CONSUMPTION_SOURCES = new Set<string>([
  * per-send cap on `seenExactSeqs`; the newest seqs are kept.
  */
 export const MAX_EXACT_SEEN_SEQS_PER_TARGET = 2_500;
+
+/**
+ * Cap on message ids kept per target (task #73).
+ *
+ * The id sets exist so the delivery gate can recognise a message it already
+ * handed to the model. They used to grow with the agent's whole consumed
+ * traffic until a stop or a daemon restart, because the handoff no longer
+ * clears them. The cap keeps the most recent ids: an evicted id can only
+ * cause the server's re-push of that one message to arrive again (a repeat),
+ * never a loss.
+ */
+export const MAX_MESSAGE_IDS_PER_TARGET = 2_500;
+
+/**
+ * Add ids to a target's id set, keeping the most recently ADDED ids once the
+ * cap is hit. A Set preserves insertion order, so the tail is the newest; an
+ * id that is added again keeps its original position and is not refreshed.
+ * The worst that costs is one repeat: an id that fell out of the window is no
+ * longer recognised, so the server's re-push of that message arrives again.
+ *
+ * Returns the ids the cap evicted. An evicted id can only cost one repeat:
+ * the server's re-push of that message is no longer recognised as already
+ * handed to the model. It can never cost a message.
+ */
+function addCappedMessageIds(targetIds: Set<string>, ids: Iterable<string>): Set<string> {
+  const evicted = new Set<string>();
+  for (const id of ids) targetIds.add(id);
+  if (targetIds.size > MAX_MESSAGE_IDS_PER_TARGET) {
+    const kept = new Set([...targetIds].slice(-MAX_MESSAGE_IDS_PER_TARGET));
+    for (const id of targetIds) if (!kept.has(id)) evicted.add(id);
+    targetIds.clear();
+    for (const id of kept) targetIds.add(id);
+  }
+  return evicted;
+}
 
 export class AgentVisibleDeliveryLedger {
   private readonly boundaryByAgent = new Map<string, Map<string, number>>();
@@ -348,7 +385,28 @@ export class AgentVisibleDeliveryLedger {
    */
   recordConsumed(
     agentId: string,
-    input: { historyScope?: AgentApiHistoryConsumptionScope; target?: string; messages: AgentProxyVisibleMessage[]; boundarySeq?: number; source: AgentVisibleDeliveryConsumeSource; contextId?: string | null },
+    input: {
+      historyScope?: AgentApiHistoryConsumptionScope;
+      target?: string;
+      messages: AgentProxyVisibleMessage[];
+      boundarySeq?: number;
+      source: AgentVisibleDeliveryConsumeSource;
+      contextId?: string | null;
+      /**
+       * What the caller knows about the model's reading (task #74). The step
+       * that hands the bodies over states it; the source name never does.
+       *
+       * `rendered` (or `consumed`) means THIS call put the message bodies in
+       * front of the model. `none` means an attention signal: queued,
+       * announced, or written by the agent itself — nobody read its body. At
+       * a session handoff the body facts survive and the attention facts do
+       * not, so a wrong `rendered` would drop a message the replacement has
+       * never seen. The rule is "may repeat, never lose".
+       */
+      readEvidence?: AgentVisibleDeliveryReadEvidence;
+      /** What the caller can prove about contiguity; defaults to no evidence. */
+      boundaryEvidence?: AgentVisibleDeliveryBoundaryEvidence;
+    },
   ): AgentVisibleDeliveryConsumption | null {
     if (input.messages.length === 0 && (!input.target || typeof input.boundarySeq !== "number")) return null;
     const explicitTarget = input.target ? canonicalVisibleTarget(input.target) : undefined;
@@ -406,24 +464,24 @@ export class AgentVisibleDeliveryLedger {
     const boundaryAdvancingTargets = new Set<string>();
     for (const [target, bucket] of byTarget) {
       const previousBoundary = this.getBoundary(agentId, target);
-      const advancesBoundary = canAdvanceBoundaryForTarget(input.source, target);
+      const advancesBoundary = canAdvanceBoundaryForTarget(input.boundaryEvidence ?? "none", target);
       if (advancesBoundary) {
         boundaryAdvancingTargets.add(target);
         const highWaterSeq = Math.max(bucket.maxSeq, bucket.boundarySeq);
         const boundaryMap = this.boundaryMap(agentId);
         boundaryMap.set(target, Math.max(previousBoundary ?? 0, highWaterSeq));
       }
-      if (bucket.ids.size > 0) {
-        const targetIds = this.messageIdSet(agentId, target);
-        for (const id of bucket.ids) targetIds.add(id);
-      }
+      const evictedIds = bucket.ids.size > 0
+        ? addCappedMessageIds(this.messageIdSet(agentId, target), bucket.ids)
+        : undefined;
       if (bucket.seqs.size > 0) this.recordExactSeqs(agentId, target, bucket.seqs);
-      if (BODY_CONSUMPTION_SOURCES.has(input.source)) {
+      if (input.readEvidence !== undefined && input.readEvidence !== "none") {
         this.recordBodyFacts(agentId, target, bucket);
       }
       this.assertConsumedInvariants("recordConsumed", agentId, target, bucket, {
         advancesBoundary,
         previousBoundary,
+        ...(evictedIds && evictedIds.size > 0 ? { evictedIds } : {}),
       });
     }
     if (input.contextId) this.recordContextScope(agentId, input.contextId, byTarget, boundaryAdvancingTargets);
@@ -483,7 +541,7 @@ export class AgentVisibleDeliveryLedger {
         set = new Set<string>();
         map.set(target, set);
       }
-      for (const id of bucket.ids) set.add(id);
+      addCappedMessageIds(set, bucket.ids);
     }
     if (bucket.seqs.size > 0) {
       let map = this.bodySeqsByAgent.get(agentId);
@@ -520,7 +578,10 @@ export class AgentVisibleDeliveryLedger {
           ids = new Set<string>();
           scope.ids.set(target, ids);
         }
-        for (const id of bucket.ids) ids.add(id);
+        // The same cap as the process-wide id set: a context id can outlive
+        // many sessions (runtimes that never report a compaction reuse it),
+        // so this collection must not grow with the traffic either.
+        addCappedMessageIds(ids, bucket.ids);
       }
       if (bucket.seqs.size > 0) addCappedExactSeqs(scope.exactSeqs, target, bucket.seqs);
     }
@@ -550,7 +611,7 @@ export class AgentVisibleDeliveryLedger {
     agentId: string,
     target: string,
     bucket: VisibleBucket,
-    options: { advancesBoundary: boolean; previousBoundary: number | undefined },
+    options: { advancesBoundary: boolean; previousBoundary: number | undefined; evictedIds?: ReadonlySet<string> },
   ): void {
     const boundary = this.getBoundary(agentId, target);
     if (!options.advancesBoundary && boundary !== options.previousBoundary) {
@@ -571,6 +632,9 @@ export class AgentVisibleDeliveryLedger {
     if (bucket.ids.size > 0) {
       const targetIds = this.getMessageIdSet(agentId, target);
       for (const id of bucket.ids) {
+        // The id cap may have evicted this very id (a batch larger than the
+        // cap). The eviction costs a repeat, never a message.
+        if (options.evictedIds?.has(id) === true) continue;
         if (targetIds?.has(id) !== true) {
           throw new Error(`Agent visible delivery ledger invariant violation after ${context}: missing consumed message id for ${agentId} ${target}`);
         }

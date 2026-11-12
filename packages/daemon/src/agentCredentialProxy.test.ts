@@ -24,6 +24,7 @@ import {
   __setAgentCredentialProxyServerFactoryForTest,
   __setThirdPartyEventDeliveryReportRetryBaseMsForTest,
   __setThirdPartyEventLeaseMsForTest,
+  applyAgentInboxStateMachineEffects,
   bodySizeBucket,
   registerAgentCredentialProxy,
   unregisterAgentCredentialProxyForLaunch,
@@ -5522,10 +5523,37 @@ async function sendThroughLedgerBackedProxy(
 function deliverIdleWithJoinContext(ledger: AgentVisibleDeliveryLedger, message: AgentMessage, contextId?: string): void {
   // Mirrors the idle stdin delivery: the rendered package, then the reply itself.
   for (const [target, contextMessages] of groupThreadJoinContextReceiptMessages([message])) {
-    ledger.recordConsumed("agent-1", { target, messages: contextMessages, source: "thread_join_context_rendered", contextId });
+    ledger.recordConsumed("agent-1", {
+      target,
+      messages: contextMessages,
+      source: "thread_join_context_rendered",
+      readEvidence: "rendered",
+      boundaryEvidence: "thread",
+      contextId,
+    });
   }
   ledger.recordConsumed("agent-1", { messages: [message], source: "stdin_idle_delivery", contextId });
 }
+
+// task #74: the preflight context reaches the model with the API response, so
+// the read is conclusive (it may also suppress the held inbox of a handoff).
+// It used to be pinned by the held-inbox source-name list; the step that
+// delivers it now states it, and this test pins that statement.
+test("a preflight-context consumption is a conclusive read (task #74)", async () => {
+  const seen: { source: string; readEvidence?: string }[] = [];
+  const coordinator = {
+    consumeVisibleMessages: (input: { source: string; readEvidence?: string }) => {
+      seen.push({ source: input.source, readEvidence: input.readEvidence });
+    },
+  } as any;
+  await applyAgentInboxStateMachineEffects(coordinator, [{
+    type: "consume_visible_messages",
+    target: "#general",
+    messages: [{ id: "m-preflight-1", seq: 1 } as any],
+    source: "side_effect_preflight_context",
+  }]);
+  assert.deepEqual(seen, [{ source: "side_effect_preflight_context", readEvidence: "consumed" }]);
+});
 
 test("task #360 sample 1: a thread reply delivered in full is forwarded as an exact seen seq above the boundary", async () => {
   const ledger = new AgentVisibleDeliveryLedger();
