@@ -2051,6 +2051,17 @@ export class AgentProcessManager {
   }
 
   /**
+   * Whether the model already READ this message's body. The read position is
+   * the ledger's high-water boundary plus the body-proven ids/seqs; an
+   * attention signal (the message was merely queued or announced) does not
+   * count, because the server re-pushes those and the replacement has to
+   * receive them.
+   */
+  private isMessageAlreadyRead(agentId: string, message: AgentMessage): boolean {
+    return this.agentVisibleDelivery.isBodyModelSeen(agentId, formatAgentMessageVisibleTarget(message), message);
+  }
+
+  /**
    * The RFC 072 context signal the CLI also honours (`enabledContextSignal`):
    * under passive AX, the id of the model context this process is in (null
    * when it could not be published); otherwise none, and evidence stays
@@ -3018,7 +3029,7 @@ export class AgentProcessManager {
     // rows, but they must not advance the per-target high-water boundary because
     // sparse delivery of a high-seq @mention does not prove older seqs in that
     // target were consumed. The ledger therefore treats daemon attention
-    // sources (`spawn_wake_message`, `stdin_*_delivery`,
+    // sources (`spawn_wake_notice`, `stdin_*_delivery`,
     // `agent_api_events_local`, server views, self-authored commits, and
     // future/unknown strings) as exact-id-only unless the source explicitly
     // represents rendered or contiguous full-body content consumption.
@@ -4725,6 +4736,12 @@ export class AgentProcessManager {
     let promptSource: string;
     let wakeMessageDeliveredAsInboxUpdate = false;
     let wakeMessageDeliveredWithThreadContext = false;
+    // Whether the wake's BODY reached the prompt. The runtime profile control
+    // wraps the message content, so that path renders the body too; the
+    // resume-prompt start does not. The distinction decides whether the wake
+    // counts as read (and may survive a session handoff) or as an attention
+    // signal (which must not).
+    let wakeBodyRendered = false;
     let startingInboxDeliveredAsInput = false;
     let resumeCatchupDeliveredAsInput = false;
     let renderedStartupThreadContextMessages: AgentMessage[] = [];
@@ -4737,15 +4754,48 @@ export class AgentProcessManager {
     }
     const startingInboxMessages = [...this.startingInboxes.values(agentId)];
     for (const message of startingInboxMessages) if (message.message_id) carriedIds.add(message.message_id);
+    // A carried message the outgoing session already read is not handed over:
+    // the replacement continues the same work, so the read position is the
+    // handoff's starting line (task #71). The delivery gate in deliverMessage
+    // drops such a message when the SERVER re-sends it, but the carried queue
+    // bypasses that gate — it was accepted before the reset — so it is filtered
+    // here. Without this the new session sees the same message twice: once
+    // from the carry-over, once from the re-send.
+    let carriedAlreadyRead = 0;
     for (const message of heldInbox) {
       if (message.message_id && carriedIds.has(message.message_id)) continue;
+      if (this.isMessageAlreadyRead(agentId, message)) {
+        carriedAlreadyRead++;
+        continue;
+      }
       startingInboxMessages.push(message);
       if (message.message_id) carriedIds.add(message.message_id);
+    }
+    if (carriedAlreadyRead > 0) {
+      this.recordDaemonEvent("daemon.agent.self_reset.carried_inbox_skipped", {
+        agentId,
+        skipped_count: carriedAlreadyRead,
+        reason: "already_read",
+      });
     }
     // task #1221: a start that follows a start-failure block carries the
     // messages refused as wakes during it, including for a session-less agent
     // (the server only sends resumeMessages then, or for a resumed session).
-    const resumeCatchupMessages = !wakeMessage && !resumePrompt ? (resumeMessages ?? []) : [];
+    // Those messages come from the SERVER's unread chain, so they can include
+    // rows the outgoing session already read (the server's read position lags
+    // the model's). The same read position applies here: a message the model
+    // already read is not handed to the replacement again (task #71).
+    const resumeCatchupCandidates = !wakeMessage && !resumePrompt ? (resumeMessages ?? []) : [];
+    const resumeCatchupMessages = resumeCatchupCandidates.filter(
+      (message) => !this.isMessageAlreadyRead(agentId, message),
+    );
+    if (resumeCatchupMessages.length !== resumeCatchupCandidates.length) {
+      this.recordDaemonEvent("daemon.agent.resume_catchup_skipped", {
+        agentId,
+        skipped_count: resumeCatchupCandidates.length - resumeCatchupMessages.length,
+        reason: "already_read",
+      });
+    }
     const resumeCatchupInputMessages = resumeCatchupMessages.length > 0
       ? [...resumeCatchupMessages, ...startingInboxMessages]
       : [];
@@ -4777,9 +4827,13 @@ export class AgentProcessManager {
       if (transientWakeMessage) {
         prompt = formatSystemNoticeRuntimeInput(projectedWakeMessage, driver);
       } else if (runtimeProfileControlPrompt) {
+        // The profile control prompt embeds the message content, so the wake's
+        // body did reach the model.
+        wakeBodyRendered = true;
         prompt = runtimeProfileControlPrompt;
       } else if (wakeMessageProjection.renderedContextMessages.length > 0) {
         wakeMessageDeliveredWithThreadContext = true;
+        wakeBodyRendered = true;
         renderedStartupThreadContextMessages = wakeMessageProjection.renderedContextMessages;
         const pendingInboxNotice = startingInboxMessages.length > 0
           ? formatInboxUpdateRuntimeInput(startingInboxMessages, driver, startingInboxMessages.length)
@@ -5128,7 +5182,16 @@ export class AgentProcessManager {
       this.consumeVisibleMessages(agentId, { messages: startingInboxMessages, source: "spawn_starting_inbox_update" });
       this.ackInjectedRuntimeProfileMessages(agentId, startingInboxMessages, agentProcess.launchId);
     } else if (wakeMessage && !wakeMessageTransient) {
-      this.consumeVisibleMessages(agentId, { messages: [wakeMessage], source: "spawn_wake_message" });
+      // This path reached the recording without a body-rendering branch: the
+      // prompt carried the resume prompt (which never embeds the wake body)
+      // or a daemon-release profile control prompt (which does embed it).
+      // Whether the model read the wake depends on what was rendered, so the
+      // source says it: a rendered body is a read, an announcement is not —
+      // and an announcement must not survive a handoff as a read fact.
+      this.consumeVisibleMessages(agentId, {
+        messages: [wakeMessage],
+        source: wakeBodyRendered ? "spawn_wake_message" : "spawn_wake_notice",
+      });
       this.ackInjectedRuntimeProfileMessages(agentId, [wakeMessage], agentProcess.launchId);
     }
 
@@ -6410,6 +6473,13 @@ export class AgentProcessManager {
         });
       }
       this.assertStartPendingDeliveryInvariants(silent ? "silent-stop-no-process" : "stop-no-process");
+      // The stop may be the one the reset triggered even though the process
+      // is already gone: the expectation has to be consumed here, or a later
+      // user stop would take the handoff branch and keep a read position the
+      // user meant to forget.
+      if (this.selfReset.consumesHandoffStop(agentId)) {
+        this.agentVisibleDelivery.keepOnlyBodyFacts(agentId);
+      }
       if (!silent) {
         logger.info(`[Agent ${agentId}] Stop requested but no running process was found${droppedCount > 0 ? ` (dropped ${droppedCount} pending message(s))` : ""}`);
       }
@@ -6426,6 +6496,16 @@ export class AgentProcessManager {
     cleanupLaunchProxies(agentId);
     this.revokeManagedRunnerCredential(agentId, ap.config, ap.launchId);
     this.agents.delete(agentId);
+    // A self reset hands the work to a replacement session instead of ending
+    // it. The two paths differ in what they may forget.
+    //
+    // The handoff is recognised by its REASON — the stop the reset itself
+    // triggered, which the coordinator expects exactly once after it asked
+    // the server to clear the session — and not by the reset window. A user
+    // stop inside that window (the replacement stopped before its first turn
+    // ended) is an ending: the user means "forget everything", so the read
+    // position goes with it.
+    const selfResetHandoff = this.selfReset.consumesHandoffStop(agentId);
     if (this.selfReset.holdsInbox(agentId)) {
       this.selfReset.hold(agentId, ap.inbox.splice(0));
     } else {
@@ -6444,7 +6524,22 @@ export class AgentProcessManager {
       // A silent respawn under the SAME launchId must KEEP the set,
       // else a not-yet-boundary-covered set-only id could be re-delivered and
       // miss dedup → re-wakeup (CL-CC2-4 boundary-aware-pruning precondition).
-      this.agentVisibleDelivery.clearAgent(agentId);
+      // A self reset keeps the read position too, for the same reason: it is a
+      // HANDOFF, not an ending. The replacement session continues the same
+      // work, so what the outgoing session READ has to survive it — otherwise
+      // every message it already read comes back to the replacement, which is
+      // the replay the self reset is meant to avoid.
+      //
+      // Only the part that a body render proved survives. An attention signal
+      // (the message was queued or announced, nobody read it) must NOT: the
+      // delivery gate consults the id set as well as the boundary, so a
+      // surviving attention id would drop a message the replacement has never
+      // seen — and "may repeat" is acceptable while "may lose" is not.
+      if (selfResetHandoff) {
+        this.agentVisibleDelivery.keepOnlyBodyFacts(agentId);
+      } else {
+        this.agentVisibleDelivery.clearAgent(agentId);
+      }
       // Spawn-fail backoff state: explicit stop = fresh launch = reset counter (otherwise
       // a deliberate user-driven restart sees stale backoff and gets gated). Silent stop
       // preserves to prevent stop/start churn from bypassing the cap (same CC1 reasoning).

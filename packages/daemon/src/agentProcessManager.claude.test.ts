@@ -270,6 +270,13 @@ function getProcess(manager: AgentProcessManager, agentId: string): any {
   return (manager as any).agents.get(agentId);
 }
 
+/** Whether this message reached the model's input surface (the runtime). */
+function deliveredToModel(driver: FakeClaudeDriver, message: { message_id?: string; content?: string }): boolean {
+  return driver.encodedCalls.some((call) =>
+    (Boolean(message.message_id) && call.text.includes(message.message_id!))
+    || (Boolean(message.content) && call.text.includes(message.content!)));
+}
+
 function makeSessionReadyDeliveryRetryScheduler() {
   const clock = new FakeClock();
   return {
@@ -5751,6 +5758,220 @@ test("self reset drops a carried message after the replacement reads its body", 
     await manager.stopAgent("agent-reset");
     await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
     assert.doesNotMatch(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
+test("self reset keeps the read position across the handoff", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
+    // The outgoing session reads the message: the read position now covers it.
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const ap = getProcess(manager, "agent-reset");
+    // The server re-sends the message the outgoing session already read. The
+    // read position survived the handoff, so it never reaches the model again.
+    await manager.deliverMessage("agent-reset", alreadyRead);
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === "read-1").length,
+      0,
+      "a message the outgoing session already read must not be queued for the replacement",
+    );
+    assert.equal(
+      deliveredToModel(driver, alreadyRead),
+      false,
+      "a message the outgoing session already read must not reach the replacement",
+    );
+  });
+});
+
+test("self reset re-delivers a message the outgoing session was only notified about", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const noticed = makeMessage("noticed only marker", { message_id: "notice-1", seq: 9 });
+    // The outgoing session got a NOTICE about the message — the starting
+    // inbox rendered a pending notice, nobody read its body.
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [noticed], source: "spawn_starting_inbox_update" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const ap = getProcess(manager, "agent-reset");
+    // The server re-pushes it. The replacement MUST receive it: a notice is not
+    // a read, and "may repeat" is acceptable while "may lose" is not.
+    await manager.deliverMessage("agent-reset", noticed);
+    await flush();
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === "notice-1").length,
+      1,
+      "a message the outgoing session was only notified about must reach the replacement",
+    );
+  });
+});
+
+test("self reset keeps the read position of a startup catch-up body", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const catchup = makeMessage("catch-up body marker", { message_id: "catch-1", seq: 7 });
+    // The startup catch-up renders the message BODIES into the first input,
+    // so the session read them.
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [catchup], source: "spawn_resume_catchup_inbox" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const ap = getProcess(manager, "agent-reset");
+    await manager.deliverMessage("agent-reset", catchup);
+    await flush();
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === "catch-1").length,
+      0,
+      "a catch-up body the outgoing session read must not be queued again",
+    );
+  });
+});
+
+test("self reset keeps the read position of a release-notice wake", async () => {
+  await withManager(async ({ driver, manager }) => {
+    // A runtime-profile daemon release notice: the wake's body is embedded in
+    // the profile control prompt, so the model read it.
+    const notice = makeMessage("release notice body", { message_id: "runtime-profile-daemon-release-test", seq: 8 });
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), notice, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const ap = getProcess(manager, "agent-reset");
+    await manager.deliverMessage("agent-reset", notice);
+    await flush();
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === notice.message_id).length,
+      0,
+      "a release notice body the outgoing session read must not be queued again",
+    );
+  });
+});
+
+test("self reset consumes the handoff stop when the old process is already gone", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    // The old runtime exits before the reset's stop arrives.
+    driver.processes[0].emit("exit", 0, null);
+    driver.processes[0].emit("close", 0, null);
+    await flush();
+    // The reset's stop finds no process. It still consumes the expectation, so
+    // the next stop is the user's and forgets the read position.
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    const ap = getProcess(manager, "agent-reset");
+    await manager.deliverMessage("agent-reset", alreadyRead);
+    await flush();
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === "read-1").length,
+      1,
+      "a user stop forgets the read position even when the reset's stop found no process",
+    );
+  });
+});
+
+test("self reset forgets the read position when the user stops the replacement", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    // The user stops the replacement before its first turn ends. That is an
+    // ending, not a handoff: everything is forgotten, the read position too.
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    const ap = getProcess(manager, "agent-reset");
+    await manager.deliverMessage("agent-reset", alreadyRead);
+    await flush();
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === "read-1").length,
+      1,
+      "a user stop forgets the read position, so the message is delivered again",
+    );
+  });
+});
+
+test("self reset does not hand the replacement a resume catch-up message the outgoing session already read", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    // The server's catch-up repeats the message the outgoing session already
+    // read (the server's read position lags the model's). The replacement must
+    // not receive it a second time.
+    await manager.startAgent(
+      "agent-reset",
+      makeConfig({ sessionId: null }),
+      undefined,
+      undefined,
+      undefined,
+      "launch-2",
+      false,
+      [alreadyRead],
+    );
+    const prompt = driver.spawnCalls[1]!.prompt;
+    assert.doesNotMatch(prompt, /already read marker/, "a resume catch-up message the outgoing session already read is not handed over");
+    assert.doesNotMatch(prompt, /read-1/);
+  });
+});
+
+test("self reset hands the replacement only what the outgoing session had not read", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    // The read position of this conversation is already at seq 7.
+    (manager as any).consumeVisibleMessages("agent-reset", {
+      messages: [], target: "#general", boundarySeq: 7, source: "verified_contiguous_content_consumption",
+    });
+    // The queue still holds one message from before the read position and one
+    // from after it.
+    const beforePosition = makeMessage("before read position marker", { message_id: "read-1", seq: 7 });
+    const afterPosition = makeMessage("after read position marker", { message_id: "queued-1", seq: 8 });
+    getProcess(manager, "agent-reset").inbox.push(beforePosition, afterPosition);
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const prompt = driver.spawnCalls[1]!.prompt;
+    assert.doesNotMatch(prompt, /read-1/, "a message before the read position is not handed over");
+    assert.match(prompt, /queued-1/, "a message after the read position is handed over");
+    assert.match(prompt, /1 message pending your read/);
   });
 });
 

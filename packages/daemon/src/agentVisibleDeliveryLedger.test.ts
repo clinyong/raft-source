@@ -421,3 +421,100 @@ test("clearAgent drops the context scope too", () => {
   ledger.clearAgent("agent-1");
   assert.equal(ledger.freshnessView("agent-1", { contextId: "ctx-1" }).getBoundary(THREAD), undefined);
 });
+
+test("keepOnlyBodyFacts keeps what a body render proved and drops attention-only facts", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  // A body render: the model saw the message.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 10, message_id: "m-10", channel_type: "channel", channel_name: "general" }],
+    source: "agent_api_history",
+  });
+  // An attention signal: the starting inbox rendered a pending notice about
+  // the message, nobody read its body.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 11, message_id: "m-11", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_starting_inbox_update",
+  });
+  assert.equal(ledger.isModelSeen("agent-1", "#general", { message_id: "m-11" }), true, "both are seen before the handoff");
+
+  ledger.keepOnlyBodyFacts("agent-1");
+
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-10" }),
+    true,
+    "a message whose body the model read stays seen across the handoff",
+  );
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-11" }),
+    false,
+    "a message that was only queued is forgotten, so a re-push still reaches the replacement",
+  );
+  assert.equal(
+    ledger.getExactSeenSeqs("agent-1", "#general").includes(11),
+    false,
+    "the exact seq of an attention-only message is forgotten too",
+  );
+  assert.equal(
+    ledger.getExactSeenSeqs("agent-1", "#general").includes(10),
+    true,
+    "the exact seq of a body-proven message survives",
+  );
+});
+
+test("keepOnlyBodyFacts keeps the read position itself", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  ledger.recordConsumed("agent-1", {
+    messages: [],
+    target: "#general",
+    boundarySeq: 7,
+    source: "verified_contiguous_content_consumption",
+  });
+  ledger.keepOnlyBodyFacts("agent-1");
+  assert.equal(ledger.getBoundary("agent-1", "#general"), 7, "the high-water boundary is body-proven and stays");
+});
+
+test("keepOnlyBodyFacts drops a wake that never rendered its body", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  // A wake whose body was never rendered (the prompt carried the profile
+  // control or the resume prompt instead): the model has not read it.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 12, message_id: "m-12", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_notice",
+  });
+  // The wake that DOES render its body is a read.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 13, message_id: "m-13", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_message",
+  });
+
+  ledger.keepOnlyBodyFacts("agent-1");
+
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-12" }),
+    false,
+    "a wake whose body was never rendered is not a read, so it may be delivered again",
+  );
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-13" }),
+    true,
+    "a wake whose body was rendered is a read and survives the handoff",
+  );
+});
+
+test("keepOnlyBodyFacts drops a wake the resume-prompt start announced", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  // A start that carries a resume prompt renders the resume prompt, not the
+  // wake's body — the wake is announced, never read.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 14, message_id: "m-14", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_notice",
+  });
+
+  ledger.keepOnlyBodyFacts("agent-1");
+
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-14" }),
+    false,
+    "a wake announced next to a resume prompt is not a read",
+  );
+});
