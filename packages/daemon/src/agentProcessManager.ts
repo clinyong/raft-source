@@ -2051,17 +2051,14 @@ export class AgentProcessManager {
   }
 
   /**
-   * Whether this message sits before the agent's read position for its target
-   * — the high-water boundary of what the model actually consumed there. The
-   * exact-id set is deliberately NOT consulted: it also holds attention
-   * signals (queued, start notice), which do not prove the model read the
-   * body.
+   * Whether the model already READ this message's body. The read position is
+   * the ledger's high-water boundary plus the body-proven ids/seqs; an
+   * attention signal (the message was merely queued or announced) does not
+   * count, because the server re-pushes those and the replacement has to
+   * receive them.
    */
-  private isCarriedMessageBeforeReadPosition(agentId: string, message: AgentMessage): boolean {
-    const boundary = this.getVisibleBoundary(agentId, formatAgentMessageVisibleTarget(message));
-    if (typeof boundary !== "number" || boundary <= 0) return false;
-    const seq = Number(message.seq ?? 0);
-    return Number.isFinite(seq) && seq > 0 && Math.floor(seq) <= boundary;
+  private isMessageAlreadyRead(agentId: string, message: AgentMessage): boolean {
+    return this.agentVisibleDelivery.isBodyModelSeen(agentId, formatAgentMessageVisibleTarget(message), message);
   }
 
   /**
@@ -4751,36 +4748,48 @@ export class AgentProcessManager {
     }
     const startingInboxMessages = [...this.startingInboxes.values(agentId)];
     for (const message of startingInboxMessages) if (message.message_id) carriedIds.add(message.message_id);
-    // A carried message from before the read position is not handed over: the
-    // replacement continues the same work, so the read position is the handoff's
-    // starting line (task #71). The delivery gate in deliverMessage drops such
-    // a message when the SERVER re-sends it, but the carried queue bypasses
-    // that gate — it was accepted before the reset — so it is filtered here.
-    // The position is the ledger's high-water boundary, not its exact-id set:
-    // the id set also holds attention signals (a message merely queued, a start
-    // notice), and those do NOT prove the model read the body — dropping them
-    // would lose messages the replacement still has to see.
-    let carriedBeforeReadPosition = 0;
+    // A carried message the outgoing session already read is not handed over:
+    // the replacement continues the same work, so the read position is the
+    // handoff's starting line (task #71). The delivery gate in deliverMessage
+    // drops such a message when the SERVER re-sends it, but the carried queue
+    // bypasses that gate — it was accepted before the reset — so it is filtered
+    // here. Without this the new session sees the same message twice: once
+    // from the carry-over, once from the re-send.
+    let carriedAlreadyRead = 0;
     for (const message of heldInbox) {
       if (message.message_id && carriedIds.has(message.message_id)) continue;
-      if (this.isCarriedMessageBeforeReadPosition(agentId, message)) {
-        carriedBeforeReadPosition++;
+      if (this.isMessageAlreadyRead(agentId, message)) {
+        carriedAlreadyRead++;
         continue;
       }
       startingInboxMessages.push(message);
       if (message.message_id) carriedIds.add(message.message_id);
     }
-    if (carriedBeforeReadPosition > 0) {
+    if (carriedAlreadyRead > 0) {
       this.recordDaemonEvent("daemon.agent.self_reset.carried_inbox_skipped", {
         agentId,
-        skipped_count: carriedBeforeReadPosition,
-        reason: "before_read_position",
+        skipped_count: carriedAlreadyRead,
+        reason: "already_read",
       });
     }
     // task #1221: a start that follows a start-failure block carries the
     // messages refused as wakes during it, including for a session-less agent
     // (the server only sends resumeMessages then, or for a resumed session).
-    const resumeCatchupMessages = !wakeMessage && !resumePrompt ? (resumeMessages ?? []) : [];
+    // Those messages come from the SERVER's unread chain, so they can include
+    // rows the outgoing session already read (the server's read position lags
+    // the model's). The same read position applies here: a message the model
+    // already read is not handed to the replacement again (task #71).
+    const resumeCatchupCandidates = !wakeMessage && !resumePrompt ? (resumeMessages ?? []) : [];
+    const resumeCatchupMessages = resumeCatchupCandidates.filter(
+      (message) => !this.isMessageAlreadyRead(agentId, message),
+    );
+    if (resumeCatchupMessages.length !== resumeCatchupCandidates.length) {
+      this.recordDaemonEvent("daemon.agent.resume_catchup_skipped", {
+        agentId,
+        skipped_count: resumeCatchupCandidates.length - resumeCatchupMessages.length,
+        reason: "already_read",
+      });
+    }
     const resumeCatchupInputMessages = resumeCatchupMessages.length > 0
       ? [...resumeCatchupMessages, ...startingInboxMessages]
       : [];
@@ -6463,22 +6472,16 @@ export class AgentProcessManager {
     this.agents.delete(agentId);
     // A self reset hands the work to a replacement session instead of ending
     // it. The two paths differ in what they may forget.
-    const selfResetHandoff = this.selfReset.holdsInbox(agentId);
-    if (selfResetHandoff) {
+    //
+    // The handoff is recognised by its REASON — the stop the reset itself
+    // triggered, which the coordinator expects exactly once after it asked
+    // the server to clear the session — and not by the reset window. A user
+    // stop inside that window (the replacement stopped before its first turn
+    // ended) is an ending: the user means "forget everything", so the read
+    // position goes with it.
+    const selfResetHandoff = this.selfReset.consumesHandoffStop(agentId);
+    if (this.selfReset.holdsInbox(agentId)) {
       this.selfReset.hold(agentId, ap.inbox.splice(0));
-      // A self reset keeps the read position: it is a HANDOFF, not an ending.
-      // The replacement session continues the same work, so what the outgoing
-      // session READ has to survive it — otherwise every message it already
-      // read comes back to the replacement, which is the replay the self reset
-      // is meant to avoid.
-      //
-      // Only the part that a body render proved survives. An attention signal
-      // (the message was queued or announced, nobody read it) must NOT: the
-      // delivery gate consults the id set as well as the boundary, so a
-      // surviving attention id would drop a message the replacement has never
-      // seen — and "may repeat" is acceptable while "may lose" is not.
-      // (Done here, outside the silent branch: a handoff may stop either way.)
-      this.agentVisibleDelivery.keepOnlyBodyFacts(agentId);
     } else {
       this.recordInboxDroppedOnExit(agentId, ap, silent ? "silent_stop" : "explicit_stop", ap.inbox.splice(0));
     }
@@ -6499,9 +6502,19 @@ export class AgentProcessManager {
       // HANDOFF, not an ending. The replacement session continues the same
       // work, so what the outgoing session READ has to survive it — otherwise
       // every message it already read comes back to the replacement, which is
-      // the replay the self reset is meant to avoid. The handoff keeps only
-      // the body-proven part of it (see above); a user-driven stop clears it.
-      if (!selfResetHandoff) this.agentVisibleDelivery.clearAgent(agentId);      // Spawn-fail backoff state: explicit stop = fresh launch = reset counter (otherwise
+      // the replay the self reset is meant to avoid.
+      //
+      // Only the part that a body render proved survives. An attention signal
+      // (the message was queued or announced, nobody read it) must NOT: the
+      // delivery gate consults the id set as well as the boundary, so a
+      // surviving attention id would drop a message the replacement has never
+      // seen — and "may repeat" is acceptable while "may lose" is not.
+      if (selfResetHandoff) {
+        this.agentVisibleDelivery.keepOnlyBodyFacts(agentId);
+      } else {
+        this.agentVisibleDelivery.clearAgent(agentId);
+      }
+      // Spawn-fail backoff state: explicit stop = fresh launch = reset counter (otherwise
       // a deliberate user-driven restart sees stale backoff and gets gated). Silent stop
       // preserves to prevent stop/start churn from bypassing the cap (same CC1 reasoning).
       this.resetSpawnFailBackoff(agentId, "suppressed");

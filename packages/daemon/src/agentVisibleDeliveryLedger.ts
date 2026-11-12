@@ -319,6 +319,23 @@ export class AgentVisibleDeliveryLedger {
   }
 
   /**
+   * Whether the model READ this message's body — the high-water boundary
+   * (only body consumption advances it) or a body-proven id/seq. Attention
+   * signals (queued, announced) do NOT count: they say the message was
+   * mentioned, not that anybody read it.
+   */
+  isBodyModelSeen(agentId: string, target: string, message: SeenMessage): boolean {
+    const key = canonicalVisibleTarget(target);
+    const boundary = this.getBoundary(agentId, key);
+    const seq = Number(message.seq ?? 0);
+    if (Number.isFinite(seq) && seq > 0 && typeof boundary === "number" && boundary >= Math.floor(seq)) return true;
+    const id = visibleMessageId(message);
+    if (id.length > 0 && this.bodyIdsByAgent.get(agentId)?.get(key)?.has(id) === true) return true;
+    if (Number.isFinite(seq) && seq > 0 && this.bodySeqsByAgent.get(agentId)?.get(key)?.has(Math.floor(seq)) === true) return true;
+    return false;
+  }
+
+  /**
    * `contextId` is the RFC 072 context id current when the content reached the
    * model under passive AX (see freshnessView); without one the facts are
    * process-wide only.

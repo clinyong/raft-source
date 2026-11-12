@@ -97,6 +97,12 @@ type ResetRecord<T> = {
   transient: T[];
   heldInbox: T[];
   pendingBodies: { launchId: string; ids: Set<string> } | null;
+  /** The stop the reset itself triggered is expected next: the daemon asked
+   * the server to clear the session, and the server stops the agent to do it.
+   * That one stop is a HANDOFF (the read position survives it); any other
+   * stop — the user stopping the agent — is an ending (everything is
+   * forgotten). The reason distinguishes them, not the reset window. */
+  handoffStopExpected: boolean;
 };
 
 /** All reset-owned data is scoped to one record per agent. */
@@ -151,6 +157,8 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
       this.setCancelPending(agentId, false);
       const unknown = reduceSelfSessionReset(state, { kind: "abort", launchId });
       this.setState(agentId, reduceSelfSessionReset(unknown, { kind: "retry_start", launchId }));
+      // The retry clears the session too, so it stops the agent the same way.
+      this.setHandoffStopExpected(agentId, true);
       this.effects.send({ type: "agent:self_session_reset:recover", agentId, launchId, sessionId });
       this.arm(agentId, launchId, sessionId);
     } else if (state.kind === "uncertain" && state.retries === 1) {
@@ -179,6 +187,8 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     this.effects.error(agentId, launchId, "clear_not_started");
     this.clearTimer(agentId);
     this.setCancelPending(agentId, false);
+    // The clear never started, so no stop is coming: nothing is handed off.
+    this.setHandoffStopExpected(agentId, false);
     this.setOldSession(agentId, null);
     this.effects.resume(agentId, launchId);
   }
@@ -241,14 +251,34 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
       this.setOldSession(agentId, sessionId);
       this.arm(agentId, launchId, sessionId);
     }
+    // The server clears the session by stopping the agent: the stop that
+    // follows this call is the reset's own, and it is a handoff.
+    this.setHandoffStopExpected(agentId, true);
     this.effects.send({ type: "agent:self_session_reset:ready", agentId, launchId, sessionId });
+  }
+
+  /**
+   * Whether the stop being handled now is the one the reset triggered. True
+   * exactly once per expected stop: the expectation is consumed here, so a
+   * later stop — the user stopping the replacement before its first turn
+   * ended, say — is not a handoff and may forget everything.
+   */
+  consumesHandoffStop(agentId: string): boolean {
+    const record = this.records.get(agentId);
+    if (!record || !record.handoffStopExpected) return false;
+    record.handoffStopExpected = false;
+    return true;
+  }
+
+  private setHandoffStopExpected(agentId: string, expected: boolean): void {
+    this.ensure(agentId).handoffStopExpected = expected;
   }
 
 
   private ensure(agentId: string): ResetRecord<T> {
     let record = this.records.get(agentId);
     if (!record) {
-      record = { state: { kind: "none" }, oldSessionId: null, failureReason: null, timer: null, cancelPending: false, transient: [], heldInbox: [], pendingBodies: null };
+      record = { state: { kind: "none" }, oldSessionId: null, failureReason: null, timer: null, cancelPending: false, transient: [], heldInbox: [], pendingBodies: null, handoffStopExpected: false };
       this.records.set(agentId, record);
     }
     return record;

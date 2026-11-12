@@ -270,6 +270,13 @@ function getProcess(manager: AgentProcessManager, agentId: string): any {
   return (manager as any).agents.get(agentId);
 }
 
+/** Whether this message reached the model's input surface (the runtime). */
+function deliveredToModel(driver: FakeClaudeDriver, message: { message_id?: string; content?: string }): boolean {
+  return driver.encodedCalls.some((call) =>
+    (Boolean(message.message_id) && call.text.includes(message.message_id!))
+    || (Boolean(message.content) && call.text.includes(message.content!)));
+}
+
 function makeSessionReadyDeliveryRetryScheduler() {
   const clock = new FakeClock();
   return {
@@ -5766,13 +5773,22 @@ test("self reset keeps the read position across the handoff", async () => {
     await flush();
     await manager.stopAgent("agent-reset");
     await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const ap = getProcess(manager, "agent-reset");
     // The server re-sends the message the outgoing session already read. The
-    // read position survived the handoff, so it is dropped instead of being
-    // queued for a session that has already seen it.
+    // read position survived the handoff, so it never reaches the model again.
     await manager.deliverMessage("agent-reset", alreadyRead);
     await flush();
-    const queued = getProcess(manager, "agent-reset").inbox.filter((m: AgentMessage) => m.message_id === "read-1");
-    assert.equal(queued.length, 0, "a message the outgoing session already read must not be queued again");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === "read-1").length,
+      0,
+      "a message the outgoing session already read must not be queued for the replacement",
+    );
+    assert.equal(
+      deliveredToModel(driver, alreadyRead),
+      false,
+      "a message the outgoing session already read must not reach the replacement",
+    );
   });
 });
 
@@ -5789,12 +5805,71 @@ test("self reset re-delivers a message the outgoing session was only notified ab
     await flush();
     await manager.stopAgent("agent-reset");
     await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    const ap = getProcess(manager, "agent-reset");
     // The server re-pushes it. The replacement MUST receive it: a notice is not
     // a read, and "may repeat" is acceptable while "may lose" is not.
     await manager.deliverMessage("agent-reset", noticed);
     await flush();
-    const queued = getProcess(manager, "agent-reset").inbox.filter((m: AgentMessage) => m.message_id === "notice-1");
-    assert.equal(queued.length, 1, "a message the outgoing session was only notified about must reach the replacement");
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === "notice-1").length,
+      1,
+      "a message the outgoing session was only notified about must reach the replacement",
+    );
+  });
+});
+
+test("self reset forgets the read position when the user stops the replacement", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    // The user stops the replacement before its first turn ends. That is an
+    // ending, not a handoff: everything is forgotten, the read position too.
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    const ap = getProcess(manager, "agent-reset");
+    await manager.deliverMessage("agent-reset", alreadyRead);
+    await flush();
+    assert.equal(
+      ap.inbox.filter((m: AgentMessage) => m.message_id === "read-1").length,
+      1,
+      "a user stop forgets the read position, so the message is delivered again",
+    );
+  });
+});
+
+test("self reset does not hand the replacement a resume catch-up message the outgoing session already read", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    // The server's catch-up repeats the message the outgoing session already
+    // read (the server's read position lags the model's). The replacement must
+    // not receive it a second time.
+    await manager.startAgent(
+      "agent-reset",
+      makeConfig({ sessionId: null }),
+      undefined,
+      undefined,
+      undefined,
+      "launch-2",
+      false,
+      [alreadyRead],
+    );
+    const prompt = driver.spawnCalls[1]!.prompt;
+    assert.doesNotMatch(prompt, /already read marker/, "a resume catch-up message the outgoing session already read is not handed over");
+    assert.doesNotMatch(prompt, /read-1/);
   });
 });
 
