@@ -594,3 +594,20 @@ test("the ledger caps the message ids per target, keeping the newest (task #73)"
   assert.equal(ids?.has("m-11"), true, "the newest ids are kept");
   assert.equal(ids?.has(`m-${total}`), true);
 });
+
+// task #73: a context id can outlive many sessions (runtimes that never report
+// a compaction reuse it), so the context-scoped id set needs the same cap.
+test("the context-scoped ids are capped too (task #73)", async () => {
+  const { MAX_MESSAGE_IDS_PER_TARGET } = await import("./agentVisibleDeliveryLedger");
+  const ledger = new AgentVisibleDeliveryLedger();
+  const total = MAX_MESSAGE_IDS_PER_TARGET + 10;
+  ledger.recordConsumed("agent-1", {
+    messages: Array.from({ length: total }, (_, i) => ({ seq: i + 1, message_id: `m-${i + 1}`, channel_type: "channel", channel_name: "general" })),
+    source: "agent_api_events_local",
+    readEvidence: "consumed",
+    contextId: "ctx-1",
+  });
+  const view = ledger.freshnessView("agent-1", { contextId: "ctx-1" });
+  assert.equal(view.isModelSeen("#general", { message_id: "m-1" }), false, "the oldest id fell out of the context scope");
+  assert.equal(view.isModelSeen("#general", { message_id: `m-${total}` }), true, "the newest id is kept");
+});

@@ -578,7 +578,10 @@ export class AgentVisibleDeliveryLedger {
           ids = new Set<string>();
           scope.ids.set(target, ids);
         }
-        for (const id of bucket.ids) ids.add(id);
+        // The same cap as the process-wide id set: a context id can outlive
+        // many sessions (runtimes that never report a compaction reuse it),
+        // so this collection must not grow with the traffic either.
+        addCappedMessageIds(ids, bucket.ids);
       }
       if (bucket.seqs.size > 0) addCappedExactSeqs(scope.exactSeqs, target, bucket.seqs);
     }
