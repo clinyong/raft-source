@@ -429,10 +429,11 @@ test("keepOnlyBodyFacts keeps what a body render proved and drops attention-only
     messages: [{ seq: 10, message_id: "m-10", channel_type: "channel", channel_name: "general" }],
     source: "agent_api_history",
   });
-  // An attention signal: the message was queued and announced, nobody read it.
+  // An attention signal: the starting inbox rendered a pending notice about
+  // the message, nobody read its body.
   ledger.recordConsumed("agent-1", {
     messages: [{ seq: 11, message_id: "m-11", channel_type: "channel", channel_name: "general" }],
-    source: "spawn_wake_message",
+    source: "spawn_starting_inbox_update",
   });
   assert.equal(ledger.isModelSeen("agent-1", "#general", { message_id: "m-11" }), true, "both are seen before the handoff");
 

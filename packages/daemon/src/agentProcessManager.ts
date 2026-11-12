@@ -6454,6 +6454,13 @@ export class AgentProcessManager {
         });
       }
       this.assertStartPendingDeliveryInvariants(silent ? "silent-stop-no-process" : "stop-no-process");
+      // The stop may be the one the reset triggered even though the process
+      // is already gone: the expectation has to be consumed here, or a later
+      // user stop would take the handoff branch and keep a read position the
+      // user meant to forget.
+      if (this.selfReset.consumesHandoffStop(agentId)) {
+        this.agentVisibleDelivery.keepOnlyBodyFacts(agentId);
+      }
       if (!silent) {
         logger.info(`[Agent ${agentId}] Stop requested but no running process was found${droppedCount > 0 ? ` (dropped ${droppedCount} pending message(s))` : ""}`);
       }

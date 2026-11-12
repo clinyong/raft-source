@@ -179,6 +179,11 @@ const BODY_CONSUMPTION_SOURCES = new Set<string>([
   "side_effect_preflight_context",
   "thread_join_context_rendered",
   "verified_contiguous_content_consumption",
+  // The startup catch-up renders the message BODIES into the first input
+  // (formatConcreteMessagesRuntimeInput), and the wake renders its own body
+  // the same way; only the starting-inbox notice is a notice.
+  "spawn_resume_catchup_inbox",
+  "spawn_wake_message",
 ]);
 
 /**
@@ -485,12 +490,10 @@ export class AgentVisibleDeliveryLedger {
         map = new Map<string, Set<number>>();
         this.bodySeqsByAgent.set(agentId, map);
       }
-      let set = map.get(target);
-      if (!set) {
-        set = new Set<number>();
-        map.set(target, set);
-      }
-      for (const seq of bucket.seqs) set.add(seq);
+      // The same cap as the exact-seq history: this collection exists to be
+      // consulted by the handoff filter, and an uncapped one would grow with
+      // the agent's whole consumed traffic.
+      addCappedExactSeqs(map, target, bucket.seqs);
     }
   }
 
