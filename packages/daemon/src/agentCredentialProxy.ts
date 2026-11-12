@@ -205,6 +205,13 @@ export type AgentProxyInboxCoordinator = {
     messages: AgentProxyVisibleMessage[];
     boundarySeq?: number;
     source: "server_held_context" | "agent_api_events_local" | "agent_api_events_server" | "agent_api_history" | "agent_api_send_commit" | "side_effect_preflight_context";
+    /**
+     * What the caller knows about the model's reading (task #74). The API
+     * path that served the bodies states it; the source name never does.
+     */
+    readEvidence?: "none" | "rendered" | "consumed";
+    /** What the caller can prove about contiguity; defaults to no evidence. */
+    boundaryEvidence?: "none" | "contiguous" | "thread";
   }): void;
   recordFreshnessDecision?(input: AgentProxyFreshnessDecision): void;
   /** What the Server said about a forwarded message send: accepted (with its id) or held as a draft. */
@@ -1808,7 +1815,7 @@ async function localAgentApiEventsResponse(
     // can be sparse and is often reached from a wake/@mention signal. Record
     // exact ids for duplicate suppression, but do not advance model-seen
     // high-water; only verified contiguous content consumption may do that.
-    coordinator.consumeVisibleMessages({ messages: consumable, source: "agent_api_events_local" });
+    coordinator.consumeVisibleMessages({ messages: consumable, source: "agent_api_events_local", readEvidence: "consumed" });
   }
   const thirdPartyLease = leasedThirdParty.length > 0 ? leaseThirdPartyEvents(registration, leasedThirdParty) : null;
   coordinator.recordDrainOutcome?.({
@@ -1880,7 +1887,7 @@ function localAgentApiThirdPartyEventsAckResponse(
     return id !== null && acked.has(id);
   });
   if (messages.length > 0) {
-    registration.inboxCoordinator?.consumeVisibleMessages({ messages, source: "agent_api_events_local" });
+    registration.inboxCoordinator?.consumeVisibleMessages({ messages, source: "agent_api_events_local", readEvidence: "consumed" });
   }
   const ackedIds = [...acked];
   if (ackedIds.length > 0) thirdPartyEventDeliveryReporter.report(registration.agentId, ackedIds);
@@ -1966,6 +1973,9 @@ async function applyAgentInboxStateMachineEffects(
       messages: effect.messages,
       boundarySeq: effect.boundarySeq,
       source: effect.source,
+      // The preflight context is rendered into the prompt, so the model read
+      // those bodies.
+      readEvidence: "rendered",
     });
   }
 }
@@ -2173,6 +2183,8 @@ async function consumeVisibleResponse(
       messages: normalizeInboxVisibleMessages(parsed.heldMessages, sendTarget),
       boundarySeq: typeof parsed.seenUpToSeq === "number" ? parsed.seenUpToSeq : undefined,
       source: "server_held_context",
+      // The held context reached the model with the response.
+      readEvidence: "consumed",
     });
     return;
   }
@@ -2194,7 +2206,7 @@ async function consumeVisibleResponse(
     // Server `/events` sync/repair forward is a sparse server view, not
     // contiguous content consumption. Record exact ids for duplicate
     // suppression, but do not advance the model-seen high-water boundary.
-    coordinator.consumeVisibleMessages({ messages, source: "agent_api_events_server" });
+    coordinator.consumeVisibleMessages({ messages, source: "agent_api_events_server", readEvidence: "consumed" });
     coordinator.recordDrainOutcome?.({
       source: "server_events",
       sinceCursorKind: parseAgentApiEventsQuery(targetUrl).sinceCursorKind,
@@ -2210,7 +2222,7 @@ async function consumeVisibleResponse(
     const scope = agentApiHistoryConsumptionScopeSchema.safeParse(parsed.consumption_scope);
     const historyScope = scope.success && scope.data.agent_id === registration.agentId
       && scope.data.target === target ? scope.data : undefined;
-    coordinator.consumeVisibleMessages({ target, messages, boundarySeq: maxInboxMessageSeq(messages), source: "agent_api_history", ...(historyScope && { historyScope }) });
+    coordinator.consumeVisibleMessages({ target, messages, boundarySeq: maxInboxMessageSeq(messages), source: "agent_api_history", readEvidence: "consumed", ...(historyScope && { historyScope }) });
   }
 }
 

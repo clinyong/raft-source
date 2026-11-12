@@ -9407,6 +9407,7 @@ test("existing thread model-seen boundary keeps repeated context out of runtime 
         thread_join_context: undefined,
       })],
       source: "verified_contiguous_content_consumption",
+      boundaryEvidence: "contiguous",
     });
 
     await manager.startAgent(
@@ -13804,7 +13805,7 @@ test("tracked mention wakes an idle per_turn agent whose process already exited"
     assert.equal(mention.acks(), 0, "acked only once the runtime has seen it");
 
     // The restarted turn reads the message (model-seen), then ends.
-    (manager as any).consumeVisibleMessages("agent-1", { messages: [message], source: "verified_contiguous_content_consumption" });
+    (manager as any).consumeVisibleMessages("agent-1", { messages: [message], source: "verified_contiguous_content_consumption", boundaryEvidence: "contiguous" });
     driver.parsedLines.set("per-turn-restart-done", [{ kind: "turn_end", sessionId: "session-1" }]);
     driver.processes[1].stdout.emit("data", Buffer.from("per-turn-restart-done\n"));
     await flush();
@@ -13833,7 +13834,7 @@ test("tracked mention to a busy per_turn agent waits for the next turn instead o
     await waitFor(() => driver.spawnCalls.length === 2, "the queued mention restarts the agent");
     assert.deepEqual(mention.terminal, []);
 
-    (manager as any).consumeVisibleMessages("agent-1", { messages: [message], source: "verified_contiguous_content_consumption" });
+    (manager as any).consumeVisibleMessages("agent-1", { messages: [message], source: "verified_contiguous_content_consumption", boundaryEvidence: "contiguous" });
     driver.parsedLines.set("per-turn-busy-next-done", [{ kind: "turn_end", sessionId: "session-1" }]);
     driver.processes[1].stdout.emit("data", Buffer.from("per-turn-busy-next-done\n"));
     await flush();

@@ -5522,7 +5522,14 @@ async function sendThroughLedgerBackedProxy(
 function deliverIdleWithJoinContext(ledger: AgentVisibleDeliveryLedger, message: AgentMessage, contextId?: string): void {
   // Mirrors the idle stdin delivery: the rendered package, then the reply itself.
   for (const [target, contextMessages] of groupThreadJoinContextReceiptMessages([message])) {
-    ledger.recordConsumed("agent-1", { target, messages: contextMessages, source: "thread_join_context_rendered", contextId });
+    ledger.recordConsumed("agent-1", {
+      target,
+      messages: contextMessages,
+      source: "thread_join_context_rendered",
+      readEvidence: "rendered",
+      boundaryEvidence: "thread",
+      contextId,
+    });
   }
   ledger.recordConsumed("agent-1", { messages: [message], source: "stdin_idle_delivery", contextId });
 }

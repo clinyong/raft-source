@@ -3225,6 +3225,7 @@ test("delivery-gating seam ①: re-delivering an already-consumed seq to a busy 
       boundarySeq: 42,
       messages: [],
       source: "verified_contiguous_content_consumption",
+      boundaryEvidence: "contiguous",
     });
     assert.equal((manager as any).getVisibleBoundary("agent-1", "#general"), 42, "boundary seeded");
 
@@ -3267,6 +3268,7 @@ test("delivery-gating seam ②: re-delivering an already-consumed seq to an idle
       boundarySeq: 7,
       messages: [],
       source: "verified_contiguous_content_consumption",
+      boundaryEvidence: "contiguous",
     });
 
     const inboxBefore = ap.inbox.length;
@@ -3295,6 +3297,7 @@ test("delivery-gating seam ①b: an already-consumed seq re-delivered DURING age
       boundarySeq: 5,
       messages: [],
       source: "verified_contiguous_content_consumption",
+      boundaryEvidence: "contiguous",
     });
     // Agent is mid-start (no ap yet) — this is the during-start push branch that a
     // gate placed only at the idle/busy delivery point would have bypassed.
@@ -3391,6 +3394,7 @@ test("delivery-gating seam ①c: a boundary-dropped already-consumed seq must st
       boundarySeq: 42,
       messages: [],
       source: "verified_contiguous_content_consumption",
+      boundaryEvidence: "contiguous",
     });
     assert.equal((manager as any).getVisibleBoundary("agent-1", "#general"), 42, "boundary seeded");
 
@@ -4039,6 +4043,7 @@ test("CC1 lifecycle: an explicit stopAgent clears the per-agent consume-boundary
       boundarySeq: 42,
       messages: [{ seq: 42, message_id: "m-42", channel_name: "general", channel_type: "channel" }],
       source: "verified_contiguous_content_consumption",
+      boundaryEvidence: "contiguous",
     });
     assert.equal((manager as any).getVisibleBoundary("agent-1", "#general"), 42, "boundary seeded");
     assert.equal(
@@ -4071,6 +4076,7 @@ test("CC1 lifecycle: a silent stopAgent KEEPS the per-agent visible-state (same-
       boundarySeq: 42,
       messages: [{ seq: 42, message_id: "m-42", channel_name: "general", channel_type: "channel" }],
       source: "verified_contiguous_content_consumption",
+      boundaryEvidence: "contiguous",
     });
     assert.equal((manager as any).agentVisibleDelivery.hasAgentState("agent-1"), true, "visible ledger seeded");
 
@@ -5754,7 +5760,7 @@ test("self reset drops a carried message after the replacement reads its body", 
     await flush();
     await manager.stopAgent("agent-reset");
     await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
-    (manager as any).consumeVisibleMessages("agent-reset", { messages: [queued], source: "agent_api_history" });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [queued], source: "agent_api_history", readEvidence: "consumed" });
     await manager.stopAgent("agent-reset");
     await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
     assert.doesNotMatch(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
@@ -5766,7 +5772,7 @@ test("self reset keeps the read position across the handoff", async () => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
     // The outgoing session reads the message: the read position now covers it.
-    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local", readEvidence: "consumed" });
     assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
     driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
     driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
@@ -5824,7 +5830,7 @@ test("self reset keeps the read position of a startup catch-up body", async () =
     const catchup = makeMessage("catch-up body marker", { message_id: "catch-1", seq: 7 });
     // The startup catch-up renders the message BODIES into the first input,
     // so the session read them.
-    (manager as any).consumeVisibleMessages("agent-reset", { messages: [catchup], source: "spawn_resume_catchup_inbox" });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [catchup], source: "spawn_resume_catchup_inbox", readEvidence: "rendered" });
     assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
     driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
     driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
@@ -5869,7 +5875,7 @@ test("self reset consumes the handoff stop when the old process is already gone"
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
-    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local", readEvidence: "consumed" });
     assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
     driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
     driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
@@ -5899,7 +5905,7 @@ test("self reset forgets the read position when the user stops the replacement",
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
-    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local", readEvidence: "consumed" });
     assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
     driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
     driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
@@ -5921,11 +5927,37 @@ test("self reset forgets the read position when the user stops the replacement",
   });
 });
 
+// task #74: the daemon used to decide "the model read this" from the source
+// NAME, so a message the outgoing session read over stdin (a source the name
+// list never mentioned) was forgotten at the handoff and handed to the
+// replacement again. The step that delivered the bodies now states it.
+test("self reset keeps the read position of a message the outgoing session read over stdin", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const ap = getProcess(manager, "agent-reset");
+    const viaStdin = makeMessage("stdin body marker", { message_id: "stdin-1", seq: 7 });
+    const accepted = (manager as any).deliverMessagesViaStdin("agent-reset", ap, [viaStdin], "idle");
+    assert.equal(accepted, true, "the message was handed to the model over stdin");
+    await flush();
+
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+
+    // The server re-pushes the message the outgoing session already read.
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2", false, [viaStdin]);
+    const prompt = driver.spawnCalls[1]!.prompt;
+    assert.doesNotMatch(prompt, /stdin body marker/, "a message the outgoing session read over stdin is not handed over again");
+  });
+});
+
 test("self reset does not hand the replacement a resume catch-up message the outgoing session already read", async () => {
   await withManager(async ({ driver, manager }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     const alreadyRead = makeMessage("already read marker", { message_id: "read-1", seq: 7 });
-    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local" });
+    (manager as any).consumeVisibleMessages("agent-reset", { messages: [alreadyRead], source: "agent_api_events_local", readEvidence: "consumed" });
     assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
     driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
     driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
@@ -5955,7 +5987,7 @@ test("self reset hands the replacement only what the outgoing session had not re
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     // The read position of this conversation is already at seq 7.
     (manager as any).consumeVisibleMessages("agent-reset", {
-      messages: [], target: "#general", boundarySeq: 7, source: "verified_contiguous_content_consumption",
+      messages: [], target: "#general", boundarySeq: 7, source: "verified_contiguous_content_consumption", boundaryEvidence: "contiguous",
     });
     // The queue still holds one message from before the read position and one
     // from after it.

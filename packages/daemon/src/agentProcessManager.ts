@@ -140,7 +140,7 @@ import {
   type LaunchReadinessTransitionState,
   type LaunchActivationTransitionState,
 } from "./launchPhaseTransition";
-import { AgentVisibleDeliveryLedger, formatAgentMessageVisibleTarget, type AgentVisibleFreshnessView } from "./agentVisibleDeliveryLedger";
+import { AgentVisibleDeliveryLedger, formatAgentMessageVisibleTarget, type AgentVisibleDeliveryBoundaryEvidence, type AgentVisibleDeliveryReadEvidence, type AgentVisibleFreshnessView } from "./agentVisibleDeliveryLedger";
 import {
   NATIVE_STANDING_PROMPT_STARTUP_INPUT,
   RUNTIME_PROFILE_DAEMON_NOTICE_MESSAGE_PREFIX,
@@ -2093,10 +2093,15 @@ export class AgentProcessManager {
     messages: readonly AgentMessage[],
   ): void {
     for (const [target, contextMessages] of groupThreadJoinContextReceiptMessages(messages)) {
+      // The rendered package shows the parent message and the recent replies,
+      // so the model read those bodies; within a thread target they are also
+      // contiguous, which is the only thing that may advance a boundary.
       this.consumeVisibleMessages(agentId, {
         target,
         messages: contextMessages,
         source: "thread_join_context_rendered",
+        readEvidence: "rendered",
+        boundaryEvidence: "thread",
       });
     }
   }
@@ -3022,17 +3027,27 @@ export class AgentProcessManager {
    */
   private consumeVisibleMessages(
     agentId: string,
-    input: { historyScope?: AgentApiHistoryConsumptionScope; target?: string; messages: AgentProxyVisibleMessage[]; boundarySeq?: number; source: string },
+    input: {
+      historyScope?: AgentApiHistoryConsumptionScope;
+      target?: string;
+      messages: AgentProxyVisibleMessage[];
+      boundarySeq?: number;
+      source: string;
+      /**
+       * What the caller knows about the model's reading (task #74). The step
+       * that delivers the bodies states it; the source name never does.
+       */
+      readEvidence?: AgentVisibleDeliveryReadEvidence;
+      /** What the caller can prove about contiguity; defaults to no evidence. */
+      boundaryEvidence?: AgentVisibleDeliveryBoundaryEvidence;
+    },
   ): void {
     // Model-seen boundary contract: delivery/queue/wake signals are attention
     // signals only. They may populate exact-id suppression for the just-rendered
     // rows, but they must not advance the per-target high-water boundary because
     // sparse delivery of a high-seq @mention does not prove older seqs in that
-    // target were consumed. The ledger therefore treats daemon attention
-    // sources (`spawn_wake_notice`, `stdin_*_delivery`,
-    // `agent_api_events_local`, server views, self-authored commits, and
-    // future/unknown strings) as exact-id-only unless the source explicitly
-    // represents rendered or contiguous full-body content consumption.
+    // target were consumed. Contiguity is therefore stated by the caller
+    // (boundaryEvidence), not guessed from the source name.
     const consumed = this.agentVisibleDelivery.recordConsumed(agentId, { ...input, contextId: this.freshnessContext(agentId)?.contextId });
     if (!consumed) return;
 
@@ -3051,10 +3066,11 @@ export class AgentProcessManager {
     const active = this.agents.get(agentId);
     const removedActive = suppress(active?.inbox);
     const removedStarting = this.startingInboxes.suppressConsumed(agentId, consumed.shouldSuppress);
-    // Only surfaces containing message bodies prove the replacement saw
-    // them; startup inbox notices must remain recoverable after a failed turn.
-    const bodySources = new Set(["agent_api_history", "agent_api_events_local", "agent_api_events_server", "server_held_context", "side_effect_preflight_context"]);
-    const removedHeld = bodySources.has(input.source)
+    // Only a conclusive read proves the replacement saw the held messages;
+    // a startup inbox notice must remain recoverable after a failed turn.
+    // That is a property of the consumption itself (the caller says how much
+    // it knows), not of a source-name list.
+    const removedHeld = input.readEvidence === "consumed"
       ? this.selfReset.suppressHeld(agentId, consumed.shouldSuppress) : 0;
     this.assertStartPendingDeliveryInvariants("visible-consume");
     this.recordDaemonEvent("daemon.agent.inbox.visible_consumed", {
@@ -5166,19 +5182,22 @@ export class AgentProcessManager {
     } else if (wakeMessageDeliveredWithThreadContext && wakeMessage) {
       this.notePushedModelBodies(agentProcess, [wakeMessage, ...renderedStartupThreadContextMessages]);
       this.recordRenderedThreadJoinContextReceipts(agentId, renderedStartupThreadContextMessages);
-      this.consumeVisibleMessages(agentId, { messages: [wakeMessage], source: "spawn_wake_message" });
+      // The wake body was rendered into the prompt, so the model read it.
+      this.consumeVisibleMessages(agentId, { messages: [wakeMessage], source: "spawn_wake_message", readEvidence: "rendered" });
       this.ackInjectedRuntimeProfileMessages(agentId, [wakeMessage], agentProcess.launchId);
     } else if (resumeCatchupDeliveredAsInput) {
       this.notePushedModelBodies(agentProcess, [...resumeCatchupInputMessages, ...renderedStartupThreadContextMessages]);
       this.recordInboxUpdateProjection(agentId, agentProcess, resumeCatchupInputMessages, "spawn_resume_catchup_inbox", "wake", prompt);
       this.recordRenderedThreadJoinContextReceipts(agentId, renderedStartupThreadContextMessages);
-      this.consumeVisibleMessages(agentId, { messages: resumeCatchupInputMessages, source: "spawn_resume_catchup_inbox" });
+      // The catch-up bodies were rendered into the first input.
+      this.consumeVisibleMessages(agentId, { messages: resumeCatchupInputMessages, source: "spawn_resume_catchup_inbox", readEvidence: "rendered" });
       this.ackInjectedRuntimeProfileMessages(agentId, resumeCatchupInputMessages, agentProcess.launchId);
     } else if (startingInboxDeliveredAsInput) {
       // Only the rendered thread context carries bodies; the rest is a notice.
       this.notePushedModelBodies(agentProcess, renderedStartupThreadContextMessages);
       this.recordInboxUpdateProjection(agentId, agentProcess, startingInboxMessages, "spawn_starting_inbox_update", "wake", prompt);
       this.recordRenderedThreadJoinContextReceipts(agentId, renderedStartupThreadContextMessages);
+      // The starting-inbox notice is content-free: nobody read those bodies.
       this.consumeVisibleMessages(agentId, { messages: startingInboxMessages, source: "spawn_starting_inbox_update" });
       this.ackInjectedRuntimeProfileMessages(agentId, startingInboxMessages, agentProcess.launchId);
     } else if (wakeMessage && !wakeMessageTransient) {
@@ -5186,11 +5205,12 @@ export class AgentProcessManager {
       // prompt carried the resume prompt (which never embeds the wake body)
       // or a daemon-release profile control prompt (which does embed it).
       // Whether the model read the wake depends on what was rendered, so the
-      // source says it: a rendered body is a read, an announcement is not —
+      // caller states it: a rendered body is a read, an announcement is not —
       // and an announcement must not survive a handoff as a read fact.
       this.consumeVisibleMessages(agentId, {
         messages: [wakeMessage],
         source: wakeBodyRendered ? "spawn_wake_message" : "spawn_wake_notice",
+        readEvidence: wakeBodyRendered ? "rendered" : "none",
       });
       this.ackInjectedRuntimeProfileMessages(agentId, [wakeMessage], agentProcess.launchId);
     }
@@ -11489,6 +11509,8 @@ export class AgentProcessManager {
       this.consumeVisibleMessages(agentId, {
         messages: runtimeProjection.renderedContextMessages,
         source: "stdin_thread_context_delivery",
+        // The rendered thread context carried the bodies to the model.
+        readEvidence: "rendered",
       });
     }
     this.recordDaemonEvent("daemon.agent.stdin_delivery", {
@@ -11636,7 +11658,7 @@ export class AgentProcessManager {
     if (!options.transient) {
       this.notePushedModelBodies(ap, [...messages, ...runtimeProjection.renderedContextMessages]);
       this.recordRenderedThreadJoinContextReceipts(agentId, runtimeProjection.renderedContextMessages);
-      this.consumeVisibleMessages(agentId, { messages, source: traceSource });
+      this.consumeVisibleMessages(agentId, { messages, source: traceSource, readEvidence: "rendered" });
     }
     const senders = [...new Set(messages.map((message) => `@${message.sender_name}`))].join(", ");
     logger.info(
