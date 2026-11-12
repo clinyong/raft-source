@@ -12,6 +12,13 @@ export const sessionResetCommand = defineCommand({
   const client = ctx.createApiClient(ctx.loadAgentContext());
   const result = await createAgentApiSurfaceClient(client).self.sessionReset();
   if (!result.ok || !result.data) {
+    if (result.errorCode === "reset_in_progress") {
+      throw new CliError({
+        code: "RESET_IN_PROGRESS",
+        message: "A previous session reset is still finishing: the replacement session's first turn has not ended. "
+          + "You can request again once this turn ends; do not retry within this turn.",
+      });
+    }
     throw new CliError({ code: "CHECK_FAILED", message: result.error ?? `HTTP ${result.status}` });
   }
   writeText(ctx.io, adoptCliReplyText("Session reset accepted; the current turn must finish first.\n"));

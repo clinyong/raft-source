@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blocksOldLaunchDelivery, reduceSelfSessionReset } from "./selfSessionReset";
+import { SelfSessionResetCoordinator, blocksOldLaunchDelivery, reduceSelfSessionReset } from "./selfSessionReset";
 
 describe("self session reset lifecycle", () => {
   it("waits for the requesting launch's turn end and deduplicates", () => {
@@ -69,4 +69,51 @@ describe("self session reset lifecycle", () => {
     expect(blocksOldLaunchDelivery({ kind: "paused", launchId: "a" }, "b")).toBe(false);
   });
 
+});
+
+describe("SelfSessionResetCoordinator.request rejection reasons", () => {
+  const makeCoordinator = () => {
+    const debug: Array<{ event: string; details: Record<string, unknown> }> = [];
+    const coordinator = new SelfSessionResetCoordinator<never>({
+      send: () => {},
+      error: () => {},
+      resume: () => {},
+      replacementActive: () => false,
+      debug: (event, details) => debug.push({ event, details }),
+    });
+    return { coordinator, debug };
+  };
+
+  it("reports reset_in_progress while the previous reset is still finishing", () => {
+    const { coordinator, debug } = makeCoordinator();
+    expect(coordinator.request("agent", "launch-a", "session-1")).toBe("accepted");
+    expect(coordinator.request("agent", "launch-b", "session-2")).toBe("reset_in_progress");
+    expect(debug.at(-1)).toEqual({
+      event: "request_rejected",
+      details: { reason: "reset_in_progress", requestedLaunchId: "launch-b", stateKind: "requested", stateLaunchId: "launch-a" },
+    });
+  });
+
+  it("reports stale_launch when the previous reset failed for the requesting launch", () => {
+    const { coordinator, debug } = makeCoordinator();
+    expect(coordinator.request("agent", "launch-a", "session-1")).toBe("accepted");
+    coordinator.requestingLaunchExited("agent", "launch-a", "session-1");
+    expect(coordinator.request("agent", "launch-a", "session-1")).toBe("stale_launch");
+    expect(debug.at(-1)).toEqual({
+      event: "request_rejected",
+      details: { reason: "stale_launch", requestedLaunchId: "launch-a", stateKind: "failed", stateLaunchId: "launch-a", sessionCleared: false },
+    });
+  });
+});
+
+describe("SelfSessionResetCoordinator.request with an unresolved older record", () => {
+  it("treats a failed record from an older launch as reset_in_progress", () => {
+    const coordinator = new SelfSessionResetCoordinator<never>({
+      send: () => {}, error: () => {}, resume: () => {}, replacementActive: () => false,
+    });
+    coordinator.setState("agent", { kind: "failed", launchId: "launch-a", sessionCleared: "unknown" });
+    // The current launch is the replacement; the record clears when its first
+    // turn ends, so "Launch is no longer current" would be misleading.
+    expect(coordinator.request("agent", "launch-b", "session-2")).toBe("reset_in_progress");
+  });
 });

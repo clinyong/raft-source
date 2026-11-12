@@ -113,14 +113,33 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     error: (agentId: string, launchId: string, step: string) => void;
     resume: (agentId: string, launchId: string) => void;
     replacementActive: (agentId: string, launchId: string, oldSessionId: string) => boolean;
+    /** Why a request was rejected. The record itself is daemon-memory state,
+     * so without this the only symptom an operator sees is
+     * `Launch is no longer current`. */
+    debug?: (event: "request_rejected", details: Record<string, unknown>) => void;
   }) {}
 
-  request(agentId: string, launchId: string, sessionId: string): "accepted" | "stale" {
+  request(agentId: string, launchId: string, sessionId: string): "accepted" | "reset_in_progress" | "stale_launch" {
     let state = this.state(agentId) ?? { kind: "none" };
     if (state.kind === "failed" && state.sessionCleared === false && state.launchId !== launchId) {
       state = reduceSelfSessionReset(state, { kind: "launch_changed", launchId });
     }
-    if (state.kind !== "none" && (state.launchId !== launchId || state.kind === "failed")) return "stale";
+    if (state.kind !== "none" && (state.launchId !== launchId || state.kind === "failed")) {
+      // A record owned by an older launch is always "the previous reset is
+      // still finishing" for the current launch: turnEnded() clears it once
+      // this replacement ends its first turn, even if the record is `failed`
+      // with an unknown clear outcome. Only a record owned by the requesting
+      // launch itself (which can only be `failed`) means the launch is stale.
+      const reason = state.launchId !== launchId ? "reset_in_progress" : "stale_launch";
+      this.effects.debug?.("request_rejected", {
+        reason,
+        requestedLaunchId: launchId,
+        stateKind: state.kind,
+        stateLaunchId: state.launchId,
+        ...(state.kind === "failed" ? { sessionCleared: state.sessionCleared } : {}),
+      });
+      return reason;
+    }
     this.setOldSession(agentId, sessionId);
     this.setState(agentId, reduceSelfSessionReset(state, { kind: "request", launchId }));
     return "accepted";

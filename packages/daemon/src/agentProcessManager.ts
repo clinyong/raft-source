@@ -1550,6 +1550,9 @@ export class AgentProcessManager {
       return Boolean(ap && ap.launchId && ap.launchId !== oldLaunchId && ap.sessionId
         && ap.sessionId !== oldSessionId && ap.exit.kind === "live");
     },
+    debug: (event, details) => {
+      logger.warn(`[SelfSessionReset] ${event} ${JSON.stringify(details)}`);
+    },
     resume: (agentId, launchId) => {
       const ap = this.agents.get(agentId);
       if (ap?.launchId === launchId && ap.inbox.length > 0) {
@@ -1561,9 +1564,9 @@ export class AgentProcessManager {
   private readonly lifecycleRecords = new AgentLifecycleRecords<RuntimeErrorDeliveryBackoffState, RuntimeErrorFingerprintFenceState>();
 
   /** Accept only a request from the current supported launch. */
-  requestSelfSessionReset(agentId: string, launchId: string): "accepted" | "unsupported" | "stale" | "idle" {
+  requestSelfSessionReset(agentId: string, launchId: string): "accepted" | "unsupported" | "reset_in_progress" | "stale_launch" | "idle" {
     const ap = this.agents.get(agentId);
-    if (!ap || !ap.launchId || ap.launchId !== launchId || !ap.sessionId) return "stale";
+    if (!ap || !ap.launchId || ap.launchId !== launchId || !ap.sessionId) return "stale_launch";
     if (ap.config.runtime !== "claude" && ap.config.runtime !== "pi") return "unsupported";
     if (this.isApmIdle(ap)) return "idle";
     return this.selfReset.request(agentId, launchId, ap.sessionId);

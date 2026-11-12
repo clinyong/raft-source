@@ -24,3 +24,26 @@ test("session reset targets only self and reports acceptance, not completion", a
   assert.match(writes.join(""), /accepted/);
   assert.doesNotMatch(writes.join(""), /completed|successfully restarted/);
 });
+
+test("reset_in_progress is reported with do-not-retry guidance, not CHECK_FAILED", async () => {
+  const ctx = createCommandContext({
+    io: { stdout: { write: () => true }, stderr: { write: () => true } },
+    loadAgentContext: () => agent,
+    createApiClient: () => ({ request: async () => ({
+      ok: false, status: 409,
+      error: "Launch is no longer current",
+      errorCode: "reset_in_progress",
+      data: null,
+    }) }) as any,
+  });
+  await assert.rejects(
+    async () => { await sessionResetCommand.handler(ctx); },
+    (err: unknown) => {
+      const cliError = err as { code?: string; message?: string };
+      assert.equal(cliError.code, "RESET_IN_PROGRESS");
+      assert.match(cliError.message ?? "", /still finishing/);
+      assert.match(cliError.message ?? "", /do not retry within this turn/);
+      return true;
+    },
+  );
+});
