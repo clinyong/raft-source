@@ -1959,7 +1959,15 @@ async function loadRecentTargetMessages(
   return Array.isArray(parsed?.messages) ? normalizeInboxVisibleMessages(parsed!.messages, target) : [];
 }
 
-async function applyAgentInboxStateMachineEffects(
+/**
+ * Apply the freshness state machine's consumption effects.
+ *
+ * Exported for the daemon tests: what each effect proves about the model's
+ * reading is the point of task #74 (the preflight context reaches the model
+ * with the API response, so it is a conclusive read — not a merely rendered
+ * one), and pinning it here keeps that decision at the step that delivers it.
+ */
+export async function applyAgentInboxStateMachineEffects(
   coordinator: AgentProxyInboxCoordinator,
   effects: AgentInboxStateMachineEffect[],
 ): Promise<void> {
@@ -1973,9 +1981,10 @@ async function applyAgentInboxStateMachineEffects(
       messages: effect.messages,
       boundarySeq: effect.boundarySeq,
       source: effect.source,
-      // The preflight context is rendered into the prompt, so the model read
-      // those bodies.
-      readEvidence: "rendered",
+      // The preflight context reaches the model with the API response, like
+      // `server_held_context`: the read is conclusive, so it may also suppress
+      // the held inbox of a session handoff.
+      readEvidence: "consumed",
     });
   }
 }

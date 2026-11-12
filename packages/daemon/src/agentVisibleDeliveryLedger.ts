@@ -236,8 +236,11 @@ export const MAX_EXACT_SEEN_SEQS_PER_TARGET = 2_500;
 export const MAX_MESSAGE_IDS_PER_TARGET = 2_500;
 
 /**
- * Add ids to a target's id set, keeping the newest ones once the cap is hit.
- * A Set preserves insertion order, so the tail is the newest.
+ * Add ids to a target's id set, keeping the most recently ADDED ids once the
+ * cap is hit. A Set preserves insertion order, so the tail is the newest; an
+ * id that is added again keeps its original position and is not refreshed.
+ * The worst that costs is one repeat: an id that fell out of the window is no
+ * longer recognised, so the server's re-push of that message arrives again.
  *
  * Returns the ids the cap evicted. An evicted id can only cost one repeat:
  * the server's re-push of that message is no longer recognised as already

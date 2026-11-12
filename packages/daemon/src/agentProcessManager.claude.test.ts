@@ -67,6 +67,7 @@ import type {
   PredicateFixtureResult,
 } from "./apmStateMachineTrace";
 import { AgentProcessManager } from "./agentProcessManager";
+import { applyAgentInboxStateMachineEffects } from "./agentCredentialProxy";
 import { writeContextGeneration } from "./contextGeneration";
 import { buildCliTransportDir } from "./drivers/cliTransport";
 import { installManagedRunnerCredentialFetch } from "./testing/managedRunnerCredentialFetch";
@@ -5923,6 +5924,36 @@ test("self reset forgets the read position when the user stops the replacement",
       ap.inbox.filter((m: AgentMessage) => m.message_id === "read-1").length,
       1,
       "a user stop forgets the read position, so the message is delivered again",
+    );
+  });
+});
+
+// task #74: a conclusive read also clears the held inbox of a handoff — the
+// old held-inbox source list included the preflight context, because that
+// context reaches the model with the API response. Dropping it would be a
+// repeat, but an undocumented one.
+test("a preflight context read suppresses the held inbox message it proves was read", async () => {
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    const held = makeMessage("held body", { message_id: "held-1", seq: 9 });
+    const selfReset = (manager as any).selfReset;
+    selfReset.hold("agent-reset", [held]);
+    assert.equal(selfReset.held("agent-reset").length, 1, "precondition: the message is held across the handoff");
+
+    await applyAgentInboxStateMachineEffects({
+      consumeVisibleMessages: (input: any) => (manager as any).consumeVisibleMessages("agent-reset", input),
+    } as any, [{
+      type: "consume_visible_messages",
+      target: "#general",
+      messages: [held as any],
+      source: "side_effect_preflight_context",
+    }]);
+
+    assert.equal(
+      selfReset.held("agent-reset").some((message: AgentMessage) => message.message_id === "held-1"),
+      false,
+      "a conclusive preflight read clears the held copy instead of leaving a duplicate for the replacement",
     );
   });
 });
