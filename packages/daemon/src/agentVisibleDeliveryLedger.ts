@@ -3,6 +3,7 @@ import type { AgentProxyVisibleMessage } from "./agentCredentialProxy";
 
 export type AgentVisibleDeliveryConsumeSource =
   | "spawn_wake_message"
+  | "spawn_wake_runtime_profile_control"
   | "agent_api_events_local"
   | "agent_api_events_server"
   | "agent_api_history"

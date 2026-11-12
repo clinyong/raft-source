@@ -472,3 +472,31 @@ test("keepOnlyBodyFacts keeps the read position itself", () => {
   ledger.keepOnlyBodyFacts("agent-1");
   assert.equal(ledger.getBoundary("agent-1", "#general"), 7, "the high-water boundary is body-proven and stays");
 });
+
+test("keepOnlyBodyFacts drops a wake that never rendered its body", () => {
+  const ledger = new AgentVisibleDeliveryLedger();
+  // The runtime-profile-control wake renders the profile control, not the
+  // wake's body: the model has not read it.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 12, message_id: "m-12", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_runtime_profile_control",
+  });
+  // The wake that DOES render its body is a read.
+  ledger.recordConsumed("agent-1", {
+    messages: [{ seq: 13, message_id: "m-13", channel_type: "channel", channel_name: "general" }],
+    source: "spawn_wake_message",
+  });
+
+  ledger.keepOnlyBodyFacts("agent-1");
+
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-12" }),
+    false,
+    "a wake whose body was never rendered is not a read, so it may be delivered again",
+  );
+  assert.equal(
+    ledger.isModelSeen("agent-1", "#general", { message_id: "m-13" }),
+    true,
+    "a wake whose body was rendered is a read and survives the handoff",
+  );
+});
