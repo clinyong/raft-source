@@ -5928,11 +5928,10 @@ test("self reset forgets the read position when the user stops the replacement",
   });
 });
 
-// task #74: a conclusive read also clears the held inbox of a handoff — the
-// old held-inbox source list included the preflight context, because that
-// context reaches the model with the API response. Dropping it would be a
-// repeat, but an undocumented one.
-test("a preflight context read suppresses the held inbox message it proves was read", async () => {
+// task #74/#75: a preflight context is a preview, not a body delivery, so it
+// must NOT clear the held inbox of a handoff. The held copy is the only thing
+// that guarantees the replacement hears about the message at all.
+test("a preflight context read leaves the held inbox message in place", async () => {
   await withManager(async ({ manager }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
     assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
@@ -5952,9 +5951,39 @@ test("a preflight context read suppresses the held inbox message it proves was r
 
     assert.equal(
       selfReset.held("agent-reset").some((message: AgentMessage) => message.message_id === "held-1"),
-      false,
-      "a conclusive preflight read clears the held copy instead of leaving a duplicate for the replacement",
+      true,
+      "a preview is not a read, so the held copy stays for the replacement",
     );
+  });
+});
+
+// task #75: the loss case. The outgoing session only ever saw the freshness
+// guard's truncated preview of a long message; the server re-pushes it after
+// the reset. If the preview counted as a read, the gate drops the re-push and
+// the replacement never sees the message at all.
+test("self reset hands the replacement a message the outgoing session only previewed", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    const previewed = makeMessage("preview body marker that the guard truncates", { message_id: "preview-1", seq: 9 });
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    await applyAgentInboxStateMachineEffects({
+      consumeVisibleMessages: (input: any) => (manager as any).consumeVisibleMessages("agent-reset", input),
+    } as any, [{
+      type: "consume_visible_messages",
+      target: "#general",
+      messages: [previewed as any],
+      source: "side_effect_preflight_context",
+    }]);
+
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+
+    // The server re-pushes the message the outgoing session only previewed.
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2", false, [previewed]);
+    const prompt = driver.spawnCalls[1]!.prompt;
+    assert.match(prompt, /preview body marker/, "the replacement must receive a message the outgoing session only previewed");
   });
 });
 
