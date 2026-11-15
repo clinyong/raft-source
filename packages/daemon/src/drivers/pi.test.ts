@@ -4776,20 +4776,59 @@ test("createPiAgentSessionForContext does not rename a resumed session", async (
     sessionId,
     { sessionDir },
   );
+  let sessionFile: string;
   try {
     assert.equal(first.sessionManager.getSessionName(), "Raft · Cindy · 9999aaaa");
+
+    // Pi writes the session file lazily: it only creates it once the session has a
+    // message. Without a message there is no file, and the resume below would
+    // create a second session instead of resuming this one.
+    assert.equal(existsSync(first.sessionManager.getSessionFile()!), false);
+    first.sessionManager.appendMessage({
+      role: "user",
+      content: "name me",
+      timestamp: Date.now(),
+    });
+    first.sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      api: "openai-completions",
+      provider: "openai",
+      model: "session-name-model",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    });
+    sessionFile = first.sessionManager.getSessionFile()!;
+    assert.equal(existsSync(sessionFile), true);
+
+    // The name reached the file, not just the in-memory session.
+    const written = readFileSync(sessionFile, "utf8");
+    assert.match(written, /"type":"session_info"/);
+    assert.match(written, /"name":"Raft · Cindy · 9999aaaa"/);
   } finally {
     first.dispose();
   }
 
-  // A resume keeps the name the session already carries.
+  // A resume keeps the name the session already carries. The display name
+  // differs on purpose: if the resume renamed the session, the new name would
+  // carry "Cindy2" and this assertion would fail.
   const resumed = await createPiAgentSessionForContext(
-    makeSpawnContext({ displayName: "Cindy", sessionId }, { workingDirectory: root }),
+    makeSpawnContext({ displayName: "Cindy2", sessionId }, { workingDirectory: root }),
     sessionId,
     { sessionDir },
   );
   try {
     assert.equal(resumed.sessionManager.getSessionName(), "Raft · Cindy · 9999aaaa");
+    // The resumed session really opened the existing file.
+    assert.equal(resumed.sessionManager.getSessionFile(), sessionFile);
   } finally {
     resumed.dispose();
     rmSync(root, { recursive: true, force: true });
