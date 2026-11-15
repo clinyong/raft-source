@@ -1,4 +1,5 @@
 import { createCodexIdleRecycle } from "./codexIdleRecycle";
+import { raftSessionName } from "./sessionName";
 import { ambientProcessEnv } from "../processEnvPatch";
 import { RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
 import { spawn, execFileSync } from "node:child_process";
@@ -833,8 +834,7 @@ export function classifyCodexResumeError(message: string, requestedSessionId?: s
 }
 
 export function codexThreadName(agentName: string | null | undefined): string | null {
-  const trimmed = agentName?.trim();
-  return trimmed ? `Raft · ${trimmed}` : null;
+  return raftSessionName(agentName, null);
 }
 
 function hasJsonRpcField(message: JsonRpcMessage, field: "result" | "error"): boolean {
@@ -970,7 +970,9 @@ export class CodexDriver implements RuntimeDriver {
   } | null = null;
   // task #14: "Raft · <agent>" so Raft threads are recognisable in the Codex
   // app sidebar; responses are ignored (older app-servers lack the method).
-  private threadName: string | null = null;
+  // The name is built when the thread id is known, so it can carry the session
+  // suffix that tells two sessions of the same agent apart.
+  private threadAgentName: string | null = null;
   private threadNameRequestIds = new Set<JsonRpcId>();
   private pendingInitialTurnRequestId: JsonRpcId | null = null;
   private pendingInitialTurnInput: unknown = null;
@@ -1019,7 +1021,7 @@ export class CodexDriver implements RuntimeDriver {
     this.pendingResumeParams = null;
     this.archivedUnarchiveAttempted = false;
     this.pendingUnarchive = null;
-    this.threadName = codexThreadName(ctx.config.displayName || ctx.config.name);
+    this.threadAgentName = ctx.config.displayName || ctx.config.name || null;
     this.threadNameRequestIds.clear();
     this.pendingInitialTurnRequestId = null;
     this.pendingInitialTurnInput = null;
@@ -1481,12 +1483,13 @@ export class CodexDriver implements RuntimeDriver {
 
   /** Names the thread unless it already has a name (the user's rename wins). */
   private nameThreadIfUnnamed(result: unknown): void {
-    if (!this.threadName) return;
     const thread = (result as { thread?: { id?: unknown; name?: unknown } } | null)?.thread;
     const threadId = typeof thread?.id === "string" ? thread.id : null;
     if (!threadId) return;
     if (typeof thread?.name === "string" && thread.name.trim()) return;
-    this.threadNameRequestIds.add(this.sendRequest("thread/name/set", { threadId, name: this.threadName }));
+    const threadName = raftSessionName(this.threadAgentName, threadId);
+    if (!threadName) return;
+    this.threadNameRequestIds.add(this.sendRequest("thread/name/set", { threadId, name: threadName }));
   }
 
   private sendErrorResponse(id: JsonRpcId, message: string) {

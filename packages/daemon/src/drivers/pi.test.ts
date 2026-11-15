@@ -4745,3 +4745,53 @@ test('busy notices wait for asynchronous Pi prompt preflight before deciding whe
   assert.ok(calls.includes('steer:during-preflight'));
   await runtime.stop({ reason: 'test' });
 });
+
+test("createPiAgentSessionForContext names a new session with the agent name and the session id prefix", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-session-name-"));
+  const sessionId = "1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9";
+
+  const session = await createPiAgentSessionForContext(
+    makeSpawnContext({ displayName: "Cindy", sessionId: null }, { workingDirectory: root }),
+    sessionId,
+    { sessionDir: path.join(root, ".pi-sessions") },
+  );
+
+  try {
+    const name = session.sessionManager.getSessionName();
+    assert.equal(name, "Raft · Cindy · 1a2b3c4d");
+  } finally {
+    session.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("createPiAgentSessionForContext does not rename a resumed session", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-session-resume-"));
+  const sessionDir = path.join(root, ".pi-sessions");
+  const sessionId = "9999aaaa-bbbb-4ccc-8ddd-eeeeffff0000";
+
+  // A first run creates the session and names it.
+  const first = await createPiAgentSessionForContext(
+    makeSpawnContext({ displayName: "Cindy", sessionId: null }, { workingDirectory: root }),
+    sessionId,
+    { sessionDir },
+  );
+  try {
+    assert.equal(first.sessionManager.getSessionName(), "Raft · Cindy · 9999aaaa");
+  } finally {
+    first.dispose();
+  }
+
+  // A resume keeps the name the session already carries.
+  const resumed = await createPiAgentSessionForContext(
+    makeSpawnContext({ displayName: "Cindy", sessionId }, { workingDirectory: root }),
+    sessionId,
+    { sessionDir },
+  );
+  try {
+    assert.equal(resumed.sessionManager.getSessionName(), "Raft · Cindy · 9999aaaa");
+  } finally {
+    resumed.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -1,5 +1,6 @@
 import { claudeIdleRecycle } from "./claudeIdleRecycle";
 import { spawnRuntimeChild } from "./runtimeChild";
+import { randomUUID } from "node:crypto";
 import type { AgentConfig, AxSurfaceText } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent, RuntimeProbeResult } from "./types";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
@@ -81,7 +82,7 @@ export class ClaudeDriver implements RuntimeDriver {
 
   buildClaudeArgs(
     config: AgentConfig,
-    opts: { standingPromptFilePath: string; managedMcpConfigPath?: string | null },
+    opts: { standingPromptFilePath: string; managedMcpConfigPath?: string | null; sessionId?: string | null },
   ): string[] {
     return buildClaudeArgs(config, opts);
   }
@@ -128,6 +129,10 @@ export class ClaudeDriver implements RuntimeDriver {
     const args = this.buildClaudeArgs(ctx.config, {
       standingPromptFilePath: systemPromptPath,
       managedMcpConfigPath,
+      // A new session gets a daemon-picked id so its display name can carry a
+      // distinguishing suffix. Claude Code reports that same id back in its init
+      // message, so the recorded session id is unchanged by this.
+      sessionId: ctx.config.sessionId ? null : randomUUID(),
     });
 
     delete spawnEnv.CLAUDECODE;

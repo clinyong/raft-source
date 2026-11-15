@@ -697,7 +697,7 @@ test("codex scripted app-server harness starts a fresh thread and initial turn",
         {
           "method": "thread/name/set",
           "params": {
-            "name": "Raft · Codex Agent",
+            "name": "Raft · Codex Agent · fresh-th",
             "threadId": "fresh-thread-1",
           },
         },
@@ -768,7 +768,7 @@ test("codex resume success starts the initial turn on the resumed thread", async
         {
           "method": "thread/name/set",
           "params": {
-            "name": "Raft · Codex Agent",
+            "name": "Raft · Codex Agent · existing",
             "threadId": "existing-thread-1",
           },
         },
@@ -882,7 +882,7 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
         {
           "method": "thread/name/set",
           "params": {
-            "name": "Raft · Codex Agent",
+            "name": "Raft · Codex Agent · fresh-th",
             "threadId": "fresh-thread-1",
           },
         },
@@ -1033,6 +1033,20 @@ test("codexThreadName labels Raft threads and skips a missing agent name", () =>
   assert.equal(codexThreadName("  "), null);
   assert.equal(codexThreadName(null), null);
 });
+
+test("codex names a fresh thread with the agent name and the thread id prefix", async () => {
+  await withScriptedCodexAppServer("trust_write", async ({ events, logPath }) => {
+    await waitFor(
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "fresh-thread-1"),
+      "codex fresh thread turn_end",
+    );
+    const nameRequest = readScriptedCodexMessages(logPath).find((message) => message.method === "thread/name/set");
+    assert.ok(nameRequest, "the fresh thread must be named");
+    assert.equal(nameRequest.params.name, "Raft · Codex Agent · fresh-th");
+    assert.equal(nameRequest.params.threadId, "fresh-thread-1");
+  });
+});
+
 
 
 test("codex resume permission error does not fall back to a fresh thread", async () => {

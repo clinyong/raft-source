@@ -556,3 +556,32 @@ test("task #1277 (launch): a claude spawn with an already-cancelled launch signa
     rmSyncLC(root, { recursive: true, force: true });
   }
 });
+
+test("claude driver names a new session with the agent name and the session id prefix", () => {
+  const sessionId = "1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9";
+  const args = driver.buildClaudeArgs({ ...config, sessionId: null } as any, {
+    standingPromptFilePath: "/tmp/system.md",
+    sessionId,
+  });
+
+  assert.ok(args.includes("--session-id"));
+  assert.equal(args[args.indexOf("--session-id") + 1], sessionId);
+  assert.ok(args.includes("--name"));
+  assert.equal(args[args.indexOf("--name") + 1], "Raft · Hao · 1a2b3c4d");
+  // A new session must not resume one.
+  assert.ok(!args.includes("--resume"));
+});
+
+test("claude driver does not name a resumed session", () => {
+  const resumedId = "9999aaaa-bbbb-4ccc-8ddd-eeeeffff0000";
+  const args = driver.buildClaudeArgs({ ...config, sessionId: resumedId } as any, {
+    standingPromptFilePath: "/tmp/system.md",
+    sessionId: null,
+  });
+
+  assert.ok(args.includes("--resume"));
+  assert.equal(args[args.indexOf("--resume") + 1], resumedId);
+  // Resuming keeps the name the session already has.
+  assert.ok(!args.includes("--name"));
+  assert.ok(!args.includes("--session-id"));
+});

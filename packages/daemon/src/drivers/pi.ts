@@ -1,5 +1,6 @@
 import { RuntimeModelNotFoundError } from "../spawnFailureErrors";
 import { withProcessEnvPatch } from "../processEnvPatch";
+import { raftSessionName } from "./sessionName";
 import type { ProviderRequestObserver } from "../providerRequestFetch";
 import "../bundledPiOAuth";
 import { randomUUID } from "node:crypto";
@@ -1688,6 +1689,23 @@ export async function createPiAgentSessionForContext(
     const sessionManager = existingSessionFile
       ? SessionManager.open(existingSessionFile, sessionDir, ctx.workingDirectory)
       : SessionManager.create(ctx.workingDirectory, sessionDir, { id: sessionId });
+    if (!existingSessionFile) {
+      // A new session gets a display name so it is recognisable in Pi's session picker.
+      // A resumed session keeps the name it already has.
+      const sessionName = raftSessionName(ctx.config.displayName || ctx.config.name, sessionId);
+      if (sessionName) {
+        try {
+          sessionManager.appendSessionInfo(sessionName);
+        } catch (error) {
+          // A name is a nicety, never a reason to fail the launch.
+          console.warn(
+            "[%s] could not name the Pi session (continuing without a name): %s",
+            logPrefix,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+    }
     const persistSessionEntry = sessionManager._persist.bind(sessionManager);
     let lastTranscriptPersistOutcome: "deferred" | "persisted" | "failed" | null = null;
     sessionManager._persist = (entry) => {
