@@ -4758,7 +4758,7 @@ test("createPiAgentSessionForContext names a new session with the agent name and
 
   try {
     const name = session.sessionManager.getSessionName();
-    assert.equal(name, "Raft · Cindy · 1a2b3c4d");
+    assert.equal(name, "Raft · Cindy · c6d7e8f9");
   } finally {
     session.dispose();
     rmSync(root, { recursive: true, force: true });
@@ -4778,7 +4778,7 @@ test("createPiAgentSessionForContext does not rename a resumed session", async (
   );
   let sessionFile: string;
   try {
-    assert.equal(first.sessionManager.getSessionName(), "Raft · Cindy · 9999aaaa");
+    assert.equal(first.sessionManager.getSessionName(), "Raft · Cindy · ffff0000");
 
     // Pi writes the session file lazily: it only creates it once the session has a
     // message. Without a message there is no file, and the resume below would
@@ -4812,7 +4812,7 @@ test("createPiAgentSessionForContext does not rename a resumed session", async (
     // The name reached the file, not just the in-memory session.
     const written = readFileSync(sessionFile, "utf8");
     assert.match(written, /"type":"session_info"/);
-    assert.match(written, /"name":"Raft · Cindy · 9999aaaa"/);
+    assert.match(written, /"name":"Raft · Cindy · ffff0000"/);
   } finally {
     first.dispose();
   }
@@ -4826,7 +4826,7 @@ test("createPiAgentSessionForContext does not rename a resumed session", async (
     { sessionDir },
   );
   try {
-    assert.equal(resumed.sessionManager.getSessionName(), "Raft · Cindy · 9999aaaa");
+    assert.equal(resumed.sessionManager.getSessionName(), "Raft · Cindy · ffff0000");
     // The resumed session really opened the existing file.
     assert.equal(resumed.sessionManager.getSessionFile(), sessionFile);
   } finally {

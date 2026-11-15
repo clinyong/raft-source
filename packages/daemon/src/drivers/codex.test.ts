@@ -196,14 +196,14 @@ rl.on("line", (line) => {
     if (scenario === "trust_write_after_log_delay") {
       setTimeout(() => {
         writeTrustConfig(message.params.cwd);
-        send({ id: message.id, result: { thread: { id: "fresh-thread-1" } } });
+        send({ id: message.id, result: { thread: { id: "01a1aedb-1b10-7352-95e7-966fe9bf7dec" } } });
       }, 25);
       return;
     }
     if (scenario === "trust_write") {
       writeTrustConfig(message.params.cwd);
     }
-    send({ id: message.id, result: { thread: { id: "fresh-thread-1" } } });
+    send({ id: message.id, result: { thread: { id: "01a1aedb-1b10-7352-95e7-966fe9bf7dec" } } });
     return;
   }
 
@@ -346,10 +346,10 @@ function sessionIdForScenario(scenario: string): string | null {
     case "resume_archived_unarchive_fails":
       return "archived-thread-1";
     case "resume_named":
-      return "named-thread-1";
+      return "01a1aee0-1234-7890-abcd-ef0123456789";
     case "resume_success":
     case "resume_pending":
-      return "existing-thread-1";
+      return "01a1aedf-40c1-7763-b6f9-50626e926195";
     default:
       return null;
   }
@@ -548,7 +548,7 @@ test("codex instruction-shape trace covers compaction and its first subsequent r
     driver.parseLine(JSON.stringify({
       method: "item/started",
       params: {
-        threadId: "fresh-thread-1",
+        threadId: "01a1aedb-1b10-7352-95e7-966fe9bf7dec",
         turnId: "turn-1",
         item: { type: "contextCompaction", id: "item-compact-1" },
       },
@@ -556,7 +556,7 @@ test("codex instruction-shape trace covers compaction and its first subsequent r
     driver.parseLine(JSON.stringify({
       method: "item/completed",
       params: {
-        threadId: "fresh-thread-1",
+        threadId: "01a1aedb-1b10-7352-95e7-966fe9bf7dec",
         turnId: "turn-1",
         item: { type: "contextCompaction", id: "item-compact-1" },
       },
@@ -578,7 +578,7 @@ test("codex instruction-shape trace covers compaction and its first subsequent r
       span.attrs?.compaction_starts_count,
       span.attrs?.compaction_finishes_count,
     ]), [[1, 0], [1, 1], [1, 1]]);
-    assert.equal(spans[3]!.attrs?.session_id, "fresh-thread-1");
+    assert.equal(spans[3]!.attrs?.session_id, "01a1aedb-1b10-7352-95e7-966fe9bf7dec");
 
     driver.encodeStdinMessage("second request", driver.currentSessionId, { mode: "idle" });
     assert.equal(traceRows(sink).filter(
@@ -627,7 +627,7 @@ test("codex app-server keeps default CODEX_HOME unset when absent", async () => 
       await waitFor(
         () =>
           fileIncludes(trustConfigPath, JSON.stringify(workDir)) &&
-          events.some((event) => event.kind === "turn_end" && event.sessionId === "fresh-thread-1"),
+          events.some((event) => event.kind === "turn_end" && event.sessionId === "01a1aedb-1b10-7352-95e7-966fe9bf7dec"),
         "scripted codex trust config and initial turn completion",
       );
       assert.equal(readFileSync(trustConfigPath, "utf8").includes(JSON.stringify(workDir)), true);
@@ -654,14 +654,14 @@ test("codex app-server keeps default CODEX_HOME unset when absent", async () => 
 test("codex scripted app-server harness starts a fresh thread and initial turn", async () => {
   await withScriptedCodexAppServer("fresh", async ({ events, logPath, workDir }) => {
     await waitFor(
-      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "fresh-thread-1"),
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "01a1aedb-1b10-7352-95e7-966fe9bf7dec"),
       "fresh codex turn_end",
     );
 
     assert.deepEqual(events, [
       codexToolingObservation("thread/start"),
-      { kind: "session_init", sessionId: "fresh-thread-1" },
-      { kind: "turn_end", sessionId: "fresh-thread-1" },
+      { kind: "session_init", sessionId: "01a1aedb-1b10-7352-95e7-966fe9bf7dec" },
+      { kind: "turn_end", sessionId: "01a1aedb-1b10-7352-95e7-966fe9bf7dec" },
     ]);
     // Review the fresh-thread instructions/sandbox settings and initial input sent to its thread ID.
     expect(readScriptedCodexRequests(logPath, workDir)).toMatchInlineSnapshot(`
@@ -697,8 +697,8 @@ test("codex scripted app-server harness starts a fresh thread and initial turn",
         {
           "method": "thread/name/set",
           "params": {
-            "name": "Raft · Codex Agent · fresh-th",
-            "threadId": "fresh-thread-1",
+            "name": "Raft · Codex Agent · e9bf7dec",
+            "threadId": "01a1aedb-1b10-7352-95e7-966fe9bf7dec",
           },
         },
         {
@@ -710,7 +710,7 @@ test("codex scripted app-server harness starts a fresh thread and initial turn",
                 "type": "text",
               },
             ],
-            "threadId": "fresh-thread-1",
+            "threadId": "01a1aedb-1b10-7352-95e7-966fe9bf7dec",
           },
         },
       ]
@@ -722,14 +722,14 @@ test("codex scripted app-server harness starts a fresh thread and initial turn",
 test("codex resume success starts the initial turn on the resumed thread", async () => {
   await withScriptedCodexAppServer("resume_success", async ({ events, logPath, workDir }) => {
     await waitFor(
-      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "existing-thread-1"),
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "01a1aedf-40c1-7763-b6f9-50626e926195"),
       "codex resumed turn_end",
     );
 
     assert.deepEqual(events, [
       codexToolingObservation("thread/resume"),
-      { kind: "session_init", sessionId: "existing-thread-1" },
-      { kind: "turn_end", sessionId: "existing-thread-1" },
+      { kind: "session_init", sessionId: "01a1aedf-40c1-7763-b6f9-50626e926195" },
+      { kind: "turn_end", sessionId: "01a1aedf-40c1-7763-b6f9-50626e926195" },
     ]);
 
     // Review that resume targets the saved thread, excludes returned history, and starts input on that same thread.
@@ -762,14 +762,14 @@ test("codex resume success starts the initial turn on the resumed thread", async
             "model": "gpt-5.3-codex",
             "sandbox": "danger-full-access",
             "sandbox_mode": "danger-full-access",
-            "threadId": "existing-thread-1",
+            "threadId": "01a1aedf-40c1-7763-b6f9-50626e926195",
           },
         },
         {
           "method": "thread/name/set",
           "params": {
-            "name": "Raft · Codex Agent · existing",
-            "threadId": "existing-thread-1",
+            "name": "Raft · Codex Agent · 6e926195",
+            "threadId": "01a1aedf-40c1-7763-b6f9-50626e926195",
           },
         },
         {
@@ -781,7 +781,7 @@ test("codex resume success starts the initial turn on the resumed thread", async
                 "type": "text",
               },
             ],
-            "threadId": "existing-thread-1",
+            "threadId": "01a1aedf-40c1-7763-b6f9-50626e926195",
           },
         },
       ]
@@ -797,7 +797,7 @@ test("codex resume target is not deliverable before thread ready", async () => {
     );
 
     assert.equal(driver.currentSessionId, null);
-    assert.equal(driver.encodeStdinMessage("queued before resume", "existing-thread-1", { mode: "idle" }), null);
+    assert.equal(driver.encodeStdinMessage("queued before resume", "01a1aedf-40c1-7763-b6f9-50626e926195", { mode: "idle" }), null);
     assert.equal(driver.currentSessionId, null);
   });
 });
@@ -805,7 +805,7 @@ test("codex resume target is not deliverable before thread ready", async () => {
 test("codex resume missing rollout falls back to fresh thread/start", async () => {
   await withScriptedCodexAppServer("resume_missing_rollout", async ({ events, logPath, workDir }) => {
     await waitFor(
-      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "fresh-thread-1"),
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "01a1aedb-1b10-7352-95e7-966fe9bf7dec"),
       "codex resume fallback turn_end",
     );
 
@@ -830,8 +830,8 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
         requestedSessionId: "missing-thread-1",
       },
       codexToolingObservation("thread/start"),
-      { kind: "session_init", sessionId: "fresh-thread-1" },
-      { kind: "turn_end", sessionId: "fresh-thread-1" },
+      { kind: "session_init", sessionId: "01a1aedb-1b10-7352-95e7-966fe9bf7dec" },
+      { kind: "turn_end", sessionId: "01a1aedb-1b10-7352-95e7-966fe9bf7dec" },
     ]);
 
     // Review that fallback drops resume-only fields and sends the recovery notice plus original input to the new thread.
@@ -882,8 +882,8 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
         {
           "method": "thread/name/set",
           "params": {
-            "name": "Raft · Codex Agent · fresh-th",
-            "threadId": "fresh-thread-1",
+            "name": "Raft · Codex Agent · e9bf7dec",
+            "threadId": "01a1aedb-1b10-7352-95e7-966fe9bf7dec",
           },
         },
         {
@@ -899,7 +899,7 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
                 "type": "text",
               },
             ],
-            "threadId": "fresh-thread-1",
+            "threadId": "01a1aedb-1b10-7352-95e7-966fe9bf7dec",
           },
         },
       ]
@@ -910,7 +910,7 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
 test("codex resume active writer falls back to fresh thread/start", async () => {
   await withScriptedCodexAppServer("resume_thread_writer_busy", async ({ events, logPath }) => {
     await waitFor(
-      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "fresh-thread-1"),
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "01a1aedb-1b10-7352-95e7-966fe9bf7dec"),
       "codex active-writer resume fallback turn_end",
     );
 
@@ -935,8 +935,8 @@ test("codex resume active writer falls back to fresh thread/start", async () => 
         requestedSessionId: "busy-thread-1",
       },
       codexToolingObservation("thread/start"),
-      { kind: "session_init", sessionId: "fresh-thread-1" },
-      { kind: "turn_end", sessionId: "fresh-thread-1" },
+      { kind: "session_init", sessionId: "01a1aedb-1b10-7352-95e7-966fe9bf7dec" },
+      { kind: "turn_end", sessionId: "01a1aedb-1b10-7352-95e7-966fe9bf7dec" },
     ]);
 
     const messages = readScriptedCodexMessages(logPath);
@@ -986,7 +986,7 @@ test("codex resume of an archived thread unarchives it and resumes the same thre
 test("codex resume of an archived thread starts fresh when unarchive fails (task #14)", async () => {
   await withScriptedCodexAppServer("resume_archived_unarchive_fails", async ({ events, logPath }) => {
     await waitFor(
-      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "fresh-thread-1"),
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "01a1aedb-1b10-7352-95e7-966fe9bf7dec"),
       "codex archived fallback turn_end",
     );
 
@@ -1021,7 +1021,7 @@ test("codex resume of an archived thread starts fresh when unarchive fails (task
 test("codex keeps a thread name the user already set (task #14)", async () => {
   await withScriptedCodexAppServer("resume_named", async ({ events, logPath }) => {
     await waitFor(
-      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "named-thread-1"),
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "01a1aee0-1234-7890-abcd-ef0123456789"),
       "codex named resume turn_end",
     );
     assert.equal(readScriptedCodexMessages(logPath).some((message) => message.method === "thread/name/set"), false);
@@ -1037,13 +1037,13 @@ test("codexThreadName labels Raft threads and skips a missing agent name", () =>
 test("codex names a fresh thread with the agent name and the thread id prefix", async () => {
   await withScriptedCodexAppServer("trust_write", async ({ events, logPath }) => {
     await waitFor(
-      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "fresh-thread-1"),
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "01a1aedb-1b10-7352-95e7-966fe9bf7dec"),
       "codex fresh thread turn_end",
     );
     const nameRequest = readScriptedCodexMessages(logPath).find((message) => message.method === "thread/name/set");
     assert.ok(nameRequest, "the fresh thread must be named");
-    assert.equal(nameRequest.params.name, "Raft · Codex Agent · fresh-th");
-    assert.equal(nameRequest.params.threadId, "fresh-thread-1");
+    assert.equal(nameRequest.params.name, "Raft · Codex Agent · e9bf7dec");
+    assert.equal(nameRequest.params.threadId, "01a1aedb-1b10-7352-95e7-966fe9bf7dec");
   });
 });
 

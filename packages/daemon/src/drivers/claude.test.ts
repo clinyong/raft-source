@@ -567,7 +567,7 @@ test("claude driver names a new session with the agent name and the session id p
   assert.ok(args.includes("--session-id"));
   assert.equal(args[args.indexOf("--session-id") + 1], sessionId);
   assert.ok(args.includes("--name"));
-  assert.equal(args[args.indexOf("--name") + 1], "Raft · Hao · 1a2b3c4d");
+  assert.equal(args[args.indexOf("--name") + 1], "Raft · Hao · c6d7e8f9");
   // A new session must not resume one.
   assert.ok(!args.includes("--resume"));
 });

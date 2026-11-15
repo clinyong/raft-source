@@ -5,10 +5,15 @@
  * across runtimes (a Codex thread and a Pi session of the same agent should read the same way).
  * Changing the format in one place keeps both sides aligned.
  *
- * The suffix is the first 8 characters of the runtime session id. Both runtimes already carry
- * that id in their own identifiers — Pi's session file is `<timestamp>_<sessionId>.jsonl` and
- * Codex's thread id is the same id — so the name points straight at the underlying session
- * instead of needing a second timestamp (and a second timezone convention).
+ * The suffix is the LAST 8 characters of the runtime session id. The tail was chosen over the
+ * head on purpose: Codex thread ids are UUIDv7, so their leading characters are a quantised
+ * creation timestamp that advances only once every ~65 seconds. Two sessions of the same agent
+ * created inside that window would carry the same head and so the same display name. The
+ * trailing characters of a UUIDv7 are random, and Pi's and Claude Code's ids are random
+ * throughout, so the tail never collides in practice.
+ *
+ * The id still identifies the session: Pi's session file is `<timestamp>_<sessionId>.jsonl` and
+ * Codex's rollout file is `rollout-<ts>-<uuid>.jsonl`, so the full id remains searchable there.
  *
  * The name is a *display* name. Neither runtime lets the daemon rename its own session files.
  */
@@ -31,6 +36,7 @@ export function raftSessionName(
 ): string | null {
   const trimmed = agentName?.trim();
   if (!trimmed) return null;
-  const suffix = sessionId?.trim().slice(0, RAFT_SESSION_NAME_SUFFIX_LENGTH);
+  const id = sessionId?.trim();
+  const suffix = id ? id.slice(-RAFT_SESSION_NAME_SUFFIX_LENGTH) : "";
   return suffix ? `Raft · ${trimmed} · ${suffix}` : `Raft · ${trimmed}`;
 }
