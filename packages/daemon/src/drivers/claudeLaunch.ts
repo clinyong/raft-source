@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig } from "@botiverse/raft-shared";
 import { isClaudeCustomProviderConfig } from "./claudeProviderIsolation";
+import { raftSessionName } from "./sessionName";
 import type { RuntimeProbeResult } from "./types";
 import { firstExistingPath, formatCommandLookupTiming, lookupCommandOnPath, lookupCommandOnPathAsync, readCommandVersion, resolveHomePath, type CommandLookup, type ProbeDeps } from "./probe";
 import { resolveRuntimeLaunch, resolveWindowsDirectLaunch, type DirectLaunch, type WindowsLaunchDeps } from "./windowsLaunch";
@@ -95,7 +96,7 @@ export function probeClaudeLaunch(config: AgentConfig, deps: ProbeDeps = {}): Ru
 
 export function buildClaudeArgs(
   config: AgentConfig,
-  opts: { standingPromptFilePath: string; managedMcpConfigPath?: string | null },
+  opts: { standingPromptFilePath: string; managedMcpConfigPath?: string | null; sessionId?: string | null },
 ): string[] {
   const launchRuntimeFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(config));
   const args = [
@@ -125,6 +126,15 @@ export function buildClaudeArgs(
 
   if (config.sessionId) {
     args.push("--resume", config.sessionId);
+  } else if (opts.sessionId) {
+    // A new session: the daemon picks the id so the display name can carry its
+    // distinguishing suffix, and Claude Code honours the id we pass in (its
+    // init message then reports the very same id).
+    args.push("--session-id", opts.sessionId);
+    const sessionName = raftSessionName(config.displayName || config.name, opts.sessionId);
+    if (sessionName) {
+      args.push("--name", sessionName);
+    }
   }
 
   if (opts.managedMcpConfigPath) {

@@ -4745,3 +4745,92 @@ test('busy notices wait for asynchronous Pi prompt preflight before deciding whe
   assert.ok(calls.includes('steer:during-preflight'));
   await runtime.stop({ reason: 'test' });
 });
+
+test("createPiAgentSessionForContext names a new session with the agent name and the session id prefix", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-session-name-"));
+  const sessionId = "1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9";
+
+  const session = await createPiAgentSessionForContext(
+    makeSpawnContext({ displayName: "Cindy", sessionId: null }, { workingDirectory: root }),
+    sessionId,
+    { sessionDir: path.join(root, ".pi-sessions") },
+  );
+
+  try {
+    const name = session.sessionManager.getSessionName();
+    assert.equal(name, "Raft · Cindy · c6d7e8f9");
+  } finally {
+    session.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("createPiAgentSessionForContext does not rename a resumed session", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-session-resume-"));
+  const sessionDir = path.join(root, ".pi-sessions");
+  const sessionId = "9999aaaa-bbbb-4ccc-8ddd-eeeeffff0000";
+
+  // A first run creates the session and names it.
+  const first = await createPiAgentSessionForContext(
+    makeSpawnContext({ displayName: "Cindy", sessionId: null }, { workingDirectory: root }),
+    sessionId,
+    { sessionDir },
+  );
+  let sessionFile: string;
+  try {
+    assert.equal(first.sessionManager.getSessionName(), "Raft · Cindy · ffff0000");
+
+    // Pi writes the session file lazily: it only creates it once the session has a
+    // message. Without a message there is no file, and the resume below would
+    // create a second session instead of resuming this one.
+    assert.equal(existsSync(first.sessionManager.getSessionFile()!), false);
+    first.sessionManager.appendMessage({
+      role: "user",
+      content: "name me",
+      timestamp: Date.now(),
+    });
+    first.sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      api: "openai-completions",
+      provider: "openai",
+      model: "session-name-model",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    });
+    sessionFile = first.sessionManager.getSessionFile()!;
+    assert.equal(existsSync(sessionFile), true);
+
+    // The name reached the file, not just the in-memory session.
+    const written = readFileSync(sessionFile, "utf8");
+    assert.match(written, /"type":"session_info"/);
+    assert.match(written, /"name":"Raft · Cindy · ffff0000"/);
+  } finally {
+    first.dispose();
+  }
+
+  // A resume keeps the name the session already carries. The display name
+  // differs on purpose: if the resume renamed the session, the new name would
+  // carry "Cindy2" and this assertion would fail.
+  const resumed = await createPiAgentSessionForContext(
+    makeSpawnContext({ displayName: "Cindy2", sessionId }, { workingDirectory: root }),
+    sessionId,
+    { sessionDir },
+  );
+  try {
+    assert.equal(resumed.sessionManager.getSessionName(), "Raft · Cindy · ffff0000");
+    // The resumed session really opened the existing file.
+    assert.equal(resumed.sessionManager.getSessionFile(), sessionFile);
+  } finally {
+    resumed.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
