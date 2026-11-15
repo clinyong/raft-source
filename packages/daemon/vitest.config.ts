@@ -7,8 +7,9 @@ export default defineConfig({
     update: !process.env.CI,
     environment: "node",
     include: ["src/**/*.test.ts"],
-    // Unit tests never reach the network; see src/testing/networkGuard.ts.
-    setupFiles: ["./src/testing/networkGuard.ts"],
+    // Unit tests never reach the network (src/testing/networkGuard.ts) and never
+    // resolve the host's real Raft home (src/testing/raftHomeIsolation.ts).
+    setupFiles: ["./src/testing/raftHomeIsolation.ts", "./src/testing/networkGuard.ts"],
     pool: "forks",
     // CI runners (blacksmith-4vcpu, 16 GB) intermittently OOM-kill this suite
     // (exit 137, no test failure — runs 38031513722 / 38023257486): one fork per
