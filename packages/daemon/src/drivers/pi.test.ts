@@ -4697,6 +4697,29 @@ test("Pi idle observation uses SDK context and loaded model settings, and fails 
   assert.equal(snapshot({ session: { model: {}, getContextUsage: () => { throw new Error("bad"); } } }).reason, "observation_failed");
 });
 
+test("Pi idle delivery falls back to steering the original text when the stream wait expires", async () => {
+  const calls: string[] = [];
+  const fake = createFakeAgentSession("pi-streaming-timeout-fallback", calls);
+  Object.defineProperty(fake, "isIdle", { get: () => !fake.isStreaming });
+  const runtime = new PiSdkRuntimeSession(
+    makeSpawnContext({ sessionId: "pi-streaming-timeout-fallback" }),
+    () => undefined,
+    async () => fake as unknown as AgentSession,
+  );
+  try {
+    await runtime.start({ text: "initial" });
+    await waitForState(() => calls.some((call) => call.startsWith("prompt:initial:")), "initial Pi prompt");
+    fake.__setStreaming(true);
+    (runtime as any).waitForStreamingToClear = async () => false;
+
+    runtime.send({ mode: "idle", text: "original fallback text" });
+    await waitForState(() => calls.includes("steer:original fallback text"), "timeout fallback steer");
+    assert.equal(calls.some((call) => call.includes("[Raft 系统提醒]")), false);
+  } finally {
+    await runtime.stop({ reason: "test" });
+  }
+});
+
 test('busy delivery starts an idle Pi session and steers an active Pi session', async () => {
   const calls: string[] = [];
   const fake = createFakeAgentSession('pi-idle-guard', calls);
