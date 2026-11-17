@@ -72,13 +72,17 @@ describe("self session reset lifecycle", () => {
 });
 
 describe("SelfSessionResetCoordinator.request rejection reasons", () => {
-  const makeCoordinator = () => {
+  const makeCoordinator = (overrides: {
+    replacementActive?: () => boolean;
+    replacementSessionObserved?: (agentId: string, launchId: string, retiredSessionIds: readonly string[]) => boolean;
+  } = {}) => {
     const debug: Array<{ event: string; details: Record<string, unknown> }> = [];
     const coordinator = new SelfSessionResetCoordinator<never>({
       send: () => {},
       error: () => {},
       resume: () => {},
-      replacementActive: () => false,
+      replacementActive: overrides.replacementActive ?? (() => false),
+      replacementSessionObserved: overrides.replacementSessionObserved ?? (() => false),
       debug: (event, details) => debug.push({ event, details }),
     });
     return { coordinator, debug };
@@ -110,10 +114,73 @@ describe("SelfSessionResetCoordinator.request with an unresolved older record", 
   it("treats a failed record from an older launch as reset_in_progress", () => {
     const coordinator = new SelfSessionResetCoordinator<never>({
       send: () => {}, error: () => {}, resume: () => {}, replacementActive: () => false,
+      replacementSessionObserved: () => false,
     });
     coordinator.setState("agent", { kind: "failed", launchId: "launch-a", sessionCleared: "unknown" });
     // The current launch is the replacement; the record clears when its first
     // turn ends, so "Launch is no longer current" would be misleading.
     expect(coordinator.request("agent", "launch-b", "session-2")).toBe("reset_in_progress");
+  });
+});
+
+// M1: the wait for the replacement's first turn was the only reason a second
+// request was refused. Once the replacement reported a session of its own,
+// the previous clear is proven and the new request may take the record over.
+describe("SelfSessionResetCoordinator.request with a replacement that reported its session", () => {
+  const makeCoordinator = (replacementSessionObserved: (agentId: string, launchId: string, retiredSessionIds: readonly string[]) => boolean) => {
+    const debug: Array<{ event: string; details: Record<string, unknown> }> = [];
+    const coordinator = new SelfSessionResetCoordinator<{ message_id?: string }>({
+      send: () => {}, error: () => {}, resume: () => {}, replacementActive: () => false,
+      replacementSessionObserved,
+      debug: (event, details) => debug.push({ event, details }),
+    });
+    return { coordinator, debug };
+  };
+
+  it("accepts a second request while the replacement's first turn is still running", () => {
+    const { coordinator, debug } = makeCoordinator((_agentId, launchId, retired) => launchId === "launch-b" && retired.includes("session-1"));
+    expect(coordinator.request("agent", "launch-a", "session-1")).toBe("accepted");
+    coordinator.setState("agent", { kind: "clearing", launchId: "launch-a" });
+    expect(coordinator.request("agent", "launch-b", "session-2")).toBe("accepted");
+    // The record is taken over, not completed: it ends with the new
+    // replacement's first turn.
+    expect(coordinator.state("agent")).toEqual({ kind: "requested", launchId: "launch-b" });
+    expect(debug.at(-1)).toEqual({
+      event: "request_accepted",
+      details: {
+        reason: "replacement_session_observed",
+        requestedLaunchId: "launch-b",
+        stateKind: "clearing",
+        stateLaunchId: "launch-a",
+      },
+    });
+  });
+
+  it("keeps the messages the previous reset held when a second request takes the record over", () => {
+    const { coordinator } = makeCoordinator(() => true);
+    expect(coordinator.request("agent", "launch-a", "session-1")).toBe("accepted");
+    coordinator.hold("agent", [{ message_id: "held-1" }]);
+    expect(coordinator.request("agent", "launch-b", "session-2")).toBe("accepted");
+    expect(coordinator.held("agent")).toEqual([{ message_id: "held-1" }]);
+  });
+
+  it("still refuses a second request while the replacement has no session of its own", () => {
+    const { coordinator } = makeCoordinator(() => false);
+    expect(coordinator.request("agent", "launch-a", "session-1")).toBe("accepted");
+    coordinator.setState("agent", { kind: "clearing", launchId: "launch-a" });
+    expect(coordinator.request("agent", "launch-b", "session-2")).toBe("reset_in_progress");
+  });
+
+  it("refuses a start on a session an earlier reset retired", () => {
+    const { coordinator } = makeCoordinator(() => true);
+    expect(coordinator.request("agent", "launch-a", "session-1")).toBe("accepted");
+    coordinator.setState("agent", { kind: "clearing", launchId: "launch-a" });
+    expect(coordinator.request("agent", "launch-b", "session-2")).toBe("accepted");
+    coordinator.setState("agent", { kind: "clearing", launchId: "launch-b" });
+    // Both the session the first reset retired and the one the second reset
+    // retired are refused: neither may be resumed.
+    expect(coordinator.blocksStart("agent", "launch-c", "session-1", null)).toBe(true);
+    expect(coordinator.blocksStart("agent", "launch-c", "session-2", null)).toBe(true);
+    expect(coordinator.blocksStart("agent", "launch-c", "session-3", null)).toBe(false);
   });
 });

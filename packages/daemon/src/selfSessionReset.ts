@@ -91,6 +91,11 @@ type ResetFailureReason = "restart_timeout" | "launch_exited";
 type ResetRecord<T> = {
   state: SelfSessionResetState;
   oldSessionId: string | null;
+  /** Every session this record retired. A second request may take the
+   * record over while the previous replacement is still running, so the
+   * sessions retired by the earlier resets stay listed: a start that would
+   * resume one of them is still refused. */
+  retiredSessions: string[];
   failureReason: ResetFailureReason | null;
   timer: ReturnType<typeof setTimeout> | null;
   cancelPending: boolean;
@@ -113,10 +118,15 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     error: (agentId: string, launchId: string, step: string) => void;
     resume: (agentId: string, launchId: string) => void;
     replacementActive: (agentId: string, launchId: string, oldSessionId: string) => boolean;
+    /** Whether the launch that asks for a reset is running with a session of
+     * its own: the session it reported is not one of the retired ones. That
+     * is the proof that the previous clear happened, even though the
+     * replacement has not finished its first turn yet. */
+    replacementSessionObserved: (agentId: string, launchId: string, retiredSessionIds: readonly string[]) => boolean;
     /** Why a request was rejected. The record itself is daemon-memory state,
      * so without this the only symptom an operator sees is
      * `Launch is no longer current`. */
-    debug?: (event: "request_rejected", details: Record<string, unknown>) => void;
+    debug?: (event: "request_rejected" | "request_accepted", details: Record<string, unknown>) => void;
   }) {}
 
   request(agentId: string, launchId: string, sessionId: string): "accepted" | "reset_in_progress" | "stale_launch" {
@@ -125,6 +135,22 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
       state = reduceSelfSessionReset(state, { kind: "launch_changed", launchId });
     }
     if (state.kind !== "none" && (state.launchId !== launchId || state.kind === "failed")) {
+      // The only thing that kept an older record open was the wait for the
+      // replacement's first turn to end. Once the replacement has reported a
+      // session id of its own, the previous clear is proven, so a new request
+      // may take the record over instead of being refused. The record is NOT
+      // completed here: the messages the previous reset held stay in it and
+      // it ends with the new replacement's first turn, like any other reset.
+      if (state.launchId !== launchId && this.replacementProven(agentId, launchId)) {
+        this.effects.debug?.("request_accepted", {
+          reason: "replacement_session_observed",
+          requestedLaunchId: launchId,
+          stateKind: state.kind,
+          stateLaunchId: state.launchId,
+        });
+        this.takeOver(agentId, launchId, sessionId);
+        return "accepted";
+      }
       // A record owned by an older launch is always "the previous reset is
       // still finishing" for the current launch: turnEnded() clears it once
       // this replacement ends its first turn, even if the record is `failed`
@@ -141,8 +167,37 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
       return reason;
     }
     this.setOldSession(agentId, sessionId);
+    this.retireSession(agentId, sessionId);
     this.setState(agentId, reduceSelfSessionReset(state, { kind: "request", launchId }));
     return "accepted";
+  }
+
+  /**
+   * A second request takes the record over from the reset it supersedes.
+   * The record is not completed: the messages the previous reset held stay in
+   * it (nothing is dropped) and it ends with the new replacement's first
+   * turn, as every other reset does.
+   */
+  private takeOver(agentId: string, launchId: string, sessionId: string): void {
+    // The previous reset's timer waits for the launch it was armed for.
+    this.clearTimer(agentId);
+    const record = this.ensure(agentId);
+    record.state = { kind: "requested", launchId };
+    record.failureReason = null;
+    record.cancelPending = false;
+    this.setOldSession(agentId, sessionId);
+    this.retireSession(agentId, sessionId);
+  }
+
+  /**
+   * Whether the launch asking for a reset is a replacement that reported a
+   * session of its own. That proves the previous clear happened, so the
+   * previous reset no longer has to be waited for.
+   */
+  private replacementProven(agentId: string, launchId: string): boolean {
+    const retired = this.retiredSessionIds(agentId);
+    if (!retired.length) return false;
+    return this.effects.replacementSessionObserved(agentId, launchId, retired);
   }
 
   requestingLaunchExited(agentId: string, launchId: string, sessionId: string): void {
@@ -208,7 +263,9 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     this.setCancelPending(agentId, false);
     // The clear never started, so no stop is coming: nothing is handed off.
     this.setHandoffStopExpected(agentId, false);
+    const rejectedSession = this.oldSession(agentId);
     this.setOldSession(agentId, null);
+    this.unretireSession(agentId, rejectedSession);
     this.effects.resume(agentId, launchId);
   }
 
@@ -228,7 +285,7 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     const state = this.state(agentId);
     if (!state || state.kind === "none") return false;
     if (launchId && blocksOldLaunchDelivery(state, launchId)) return true;
-    return Boolean(this.oldSession(agentId) && sessionId === this.oldSession(agentId) && oldSessionRetired(state));
+    return Boolean(this.isRetiredSession(agentId, sessionId) && oldSessionRetired(state));
   }
 
   blocksOldLaunch(agentId: string, launchId: string | null): boolean {
@@ -239,7 +296,7 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
   holdsTransient(agentId: string, launchId: string | null, sessionId: string | null, deliverable: boolean): boolean {
     const state = this.state(agentId);
     return Boolean(state && state.kind !== "none" && !(state.kind === "failed" && state.sessionCleared === false)
-      && (!launchId || blocksOldLaunchDelivery(state, launchId) || sessionId === this.oldSession(agentId) || !deliverable));
+      && (!launchId || blocksOldLaunchDelivery(state, launchId) || this.isRetiredSession(agentId, sessionId) || !deliverable));
   }
 
   holdsInbox(agentId: string): boolean { return oldSessionRetired(this.state(agentId)); }
@@ -247,14 +304,15 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
   blocksStart(agentId: string, launchId: string | undefined, sessionId: string | null | undefined, currentLaunchId: string | null | undefined): boolean {
     const state = this.state(agentId);
     if (!state || state.kind === "none" || !oldSessionRetired(state) || launchId === state.launchId) return false;
-    return Boolean((this.oldSession(agentId) && sessionId === this.oldSession(agentId)) || currentLaunchId === state.launchId);
+    return Boolean(this.isRetiredSession(agentId, sessionId) || currentLaunchId === state.launchId);
   }
 
   turnEnded(agentId: string, launchId: string, sessionId: string | null | undefined, successful: boolean): boolean {
     const state = this.state(agentId);
     if (!state || state.kind === "none") return false;
     const oldSession = this.oldSession(agentId);
-    if (launchId !== state.launchId && oldSession && sessionId && sessionId !== oldSession && successful) {
+    const retired = oldSession ? this.retiredSessionIds(agentId) : [];
+    if (launchId !== state.launchId && retired.length > 0 && sessionId && !retired.includes(sessionId) && successful) {
       this.complete(agentId);
       return false;
     }
@@ -268,6 +326,7 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     if (state) this.setState(agentId, reduceSelfSessionReset(state, { kind: "clear_started", launchId }));
     if (sessionId) {
       this.setOldSession(agentId, sessionId);
+      this.retireSession(agentId, sessionId);
       this.arm(agentId, launchId, sessionId);
     }
     // The server clears the session by stopping the agent: the stop that
@@ -297,10 +356,38 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
   private ensure(agentId: string): ResetRecord<T> {
     let record = this.records.get(agentId);
     if (!record) {
-      record = { state: { kind: "none" }, oldSessionId: null, failureReason: null, timer: null, cancelPending: false, transient: [], heldInbox: [], pendingBodies: null, handoffStopExpected: false };
+      record = { state: { kind: "none" }, oldSessionId: null, retiredSessions: [], failureReason: null, timer: null, cancelPending: false, transient: [], heldInbox: [], pendingBodies: null, handoffStopExpected: false };
       this.records.set(agentId, record);
     }
     return record;
+  }
+
+  /** Every session this record retired, the current one first. */
+  private retiredSessionIds(agentId: string): string[] {
+    const record = this.records.get(agentId);
+    if (!record) return [];
+    const ids: string[] = [];
+    if (record.oldSessionId) ids.push(record.oldSessionId);
+    for (const id of record.retiredSessions) if (!ids.includes(id)) ids.push(id);
+    return ids;
+  }
+
+  private isRetiredSession(agentId: string, sessionId: string | null | undefined): boolean {
+    if (!sessionId) return false;
+    return this.retiredSessionIds(agentId).includes(sessionId);
+  }
+
+  private retireSession(agentId: string, sessionId: string | null): void {
+    if (!sessionId) return;
+    const record = this.ensure(agentId);
+    if (!record.retiredSessions.includes(sessionId)) record.retiredSessions.push(sessionId);
+  }
+
+  private unretireSession(agentId: string, sessionId: string | null): void {
+    if (!sessionId) return;
+    const record = this.records.get(agentId);
+    if (!record) return;
+    record.retiredSessions = record.retiredSessions.filter((id) => id !== sessionId);
   }
 
   state(agentId: string): SelfSessionResetState | undefined { return this.records.get(agentId)?.state; }
