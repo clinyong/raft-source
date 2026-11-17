@@ -1,25 +1,42 @@
 #!/usr/bin/env bash
 # Build and optionally install raft-computer for one exact source commit.
 # Usage: mac-computer-replace.sh <full-commit-sha> [--apply]
+#        mac-computer-replace.sh --rollback <backup-dir> --apply
 set -Eeuo pipefail
 
 usage() {
   printf 'Usage: %s <full-commit-sha> [--apply]\n' "${0##*/}"
+  printf '       %s --rollback <backup-dir> --apply\n' "${0##*/}"
 }
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-  usage >&2
-  exit 2
+if [ "$#" -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
+  usage
+  exit 0
 fi
-TARGET_SHA="$1"
+
+MODE="replace"
 APPLY=0
-if [ "$#" -eq 2 ]; then
-  [ "$2" = "--apply" ] || { usage >&2; exit 2; }
+ROLLBACK_DIR=""
+TARGET_SHA=""
+if [ "${1:-}" = "--rollback" ]; then
+  [ "$#" -eq 3 ] && [ "$3" = "--apply" ] || { usage >&2; exit 2; }
+  MODE="rollback"
+  ROLLBACK_DIR="$2"
   APPLY=1
-fi
-if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-  printf 'Abort: target must be a full 40-character lowercase commit SHA.\n' >&2
-  exit 2
+else
+  if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    usage >&2
+    exit 2
+  fi
+  TARGET_SHA="$1"
+  if [ "$#" -eq 2 ]; then
+    [ "$2" = "--apply" ] || { usage >&2; exit 2; }
+    APPLY=1
+  fi
+  if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'Abort: target must be a full 40-character lowercase commit SHA.\n' >&2
+    exit 2
+  fi
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -36,7 +53,8 @@ JOB="gui/$(id -u)/$LABEL"
 WORKTREE="$HOME/my-projects/raft-build-$TARGET_SHA"
 CAND_BIN="$WORKTREE/packages/computer/dist-native/raft-computer-darwin-arm64"
 CAND_WASM="$WORKTREE/packages/computer/dist-native/photon_rs_bg.wasm"
-RAFT_HOME="/Users/leo/raft-home-leo-lab"
+RAFT_HOME="$HOME/raft-home-leo-lab"
+BOOT_LAYERS="$HOME/raft-selfhost/boot-layers.sh"
 export RAFT_HOME SLOCK_HOME="$RAFT_HOME"
 
 say() { printf '\n== %s ==\n' "$*"; }
@@ -45,7 +63,62 @@ sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 service_running() {
   "$BIN" status 2>/dev/null | grep -E '^Service:[[:space:]]+running' >/dev/null
 }
+require_apply_context() {
+  [ -t 0 ] && [ -t 1 ] || die "--apply requires a local interactive terminal"
+  [ -z "${SLOCK_CURRENT_AGENT_ID:-}${SLOCK_AGENT_ID:-}${PI_CODING_AGENT:-}" ] \
+    || die "agent session environment detected; run from your own terminal"
+  [ -z "${SSH_CONNECTION:-}" ] || die "SSH_CONNECTION is set; run on the Mac console"
+  [ "$(id -un)" = "leo" ] || die "run --apply as leo"
+  launchctl print "$JOB" >/dev/null 2>&1 || die "cannot access launchd job $JOB"
+}
 
+if [ "$MODE" = "rollback" ]; then
+  say "Manual rollback from a previously created backup"
+  [ "$(uname -s)" = "Darwin" ] || die "rollback must run on macOS"
+  [ "$(uname -m)" = "arm64" ] || die "the approved Mac target is Apple Silicon arm64"
+  require_apply_context
+  [ -x "$BOOT_LAYERS" ] || die "identity checker not found: $BOOT_LAYERS"
+  [ -d "$INSTALL_ROOT/bin" ] || die "install directory not found: $INSTALL_ROOT/bin"
+  [ -d "$ROLLBACK_DIR" ] || die "backup directory not found: $ROLLBACK_DIR"
+  shopt -s nullglob
+  BACKUP_BINARIES=("$ROLLBACK_DIR"/raft-computer-*)
+  [ "${#BACKUP_BINARIES[@]}" -eq 1 ] || die "backup directory must contain exactly one raft-computer-* binary"
+  BACKUP_BIN="${BACKUP_BINARIES[0]}"
+  [ -f "$BACKUP_BIN" ] || die "backup binary not found: $BACKUP_BIN"
+  BACKUP_SHA="$(sha256 "$BACKUP_BIN")"
+  printf 'Restore: %s\nSHA-256: %s\n' "$BACKUP_BIN" "$BACKUP_SHA"
+  printf 'Type YES to restore this binary and restart the local Computer daemon: '
+  IFS= read -r CONFIRM
+  [ "$CONFIRM" = "YES" ] || die "confirmation was not YES; nothing was installed"
+
+  ROLLBACK_TMP="$(mktemp "$INSTALL_ROOT/bin/.raft-computer-rollback.XXXXXX")" \
+    || die "could not create rollback temporary file"
+  if ! cp -p "$BACKUP_BIN" "$ROLLBACK_TMP" || ! chmod 755 "$ROLLBACK_TMP" || ! mv -f "$ROLLBACK_TMP" "$BIN"; then
+    rm -f "$ROLLBACK_TMP"
+    die "could not atomically restore the backed-up Computer binary"
+  fi
+  ROLLBACK_TMP=""
+  if [ -f "$ROLLBACK_DIR/photon_rs_bg.wasm" ]; then
+    WASM_TMP="$(mktemp "$INSTALL_ROOT/bin/.photon-rollback.XXXXXX")" \
+      || die "could not create wasm rollback temporary file"
+    if ! cp -p "$ROLLBACK_DIR/photon_rs_bg.wasm" "$WASM_TMP" || ! mv -f "$WASM_TMP" "$WASM"; then
+      rm -f "$WASM_TMP"
+      die "could not atomically restore the backed-up wasm sidecar"
+    fi
+  fi
+  [ "$(sha256 "$BIN")" = "$BACKUP_SHA" ] || die "restored binary SHA-256 does not match its backup"
+  launchctl kickstart -k "$JOB" || die "launchd rollback restart failed"
+  sleep 35
+  if ! service_running; then
+    launchctl kickstart -k "$JOB" || die "launchd rollback retry failed"
+    sleep 20
+  fi
+  service_running || die "Computer daemon did not recover after rollback"
+  "$BOOT_LAYERS" --identity-for-home "$RAFT_HOME" || die "Raft home identity check failed after rollback"
+  say "Manual rollback complete"
+  printf 'Restored SHA-256: %s\n' "$BACKUP_SHA"
+  exit 0
+fi
 say "Read-only host and Node preflight"
 [ "$(uname -s)" = "Darwin" ] || die "this replacement script must run on macOS"
 [ "$(uname -m)" = "arm64" ] || die "the approved Mac build target is Apple Silicon arm64"
@@ -143,13 +216,9 @@ if [ "$APPLY" -eq 0 ]; then
 fi
 
 say "Check Mac daemon and interactive-session safety"
-[ -t 0 ] && [ -t 1 ] || die "--apply requires a local interactive terminal"
-[ -z "${SLOCK_CURRENT_AGENT_ID:-}${SLOCK_AGENT_ID:-}${PI_CODING_AGENT:-}" ] \
-  || die "agent session environment detected; run from your own terminal"
-[ -z "${SSH_CONNECTION:-}" ] || die "SSH_CONNECTION is set; run on the Mac console"
-[ "$(id -un)" = "leo" ] || die "run --apply as leo"
+require_apply_context
+[ -x "$BOOT_LAYERS" ] || die "identity checker not found: $BOOT_LAYERS"
 [ -x "$BIN" ] || die "installed Computer binary not found: $BIN"
-launchctl print "$JOB" >/dev/null 2>&1 || die "cannot access launchd job $JOB"
 service_running || die "Computer daemon is not running; investigate before replacement"
 CUR_SHA="$(sha256 "$BIN")"
 printf 'Installed binary: %s\nInstalled SHA-256: %s\n' "$BIN" "$CUR_SHA"
@@ -209,6 +278,7 @@ rollback_install() {
       sleep 20
     fi
     service_running || failed=1
+    "$BOOT_LAYERS" --identity-for-home "$RAFT_HOME" >/dev/null || failed=1
   fi
   if [ "$failed" -eq 0 ]; then
     printf 'Rollback restored the prior binary and daemon. Backup: %s\n' "$BACKUP_DIR" >&2
@@ -262,10 +332,14 @@ if ! service_running; then
   sleep 20
 fi
 service_running || die "Computer daemon did not recover; automatic rollback will run"
+"$BOOT_LAYERS" --identity-for-home "$RAFT_HOME" \
+  || die "Raft home identity check failed after replacement; automatic rollback will run"
 [ "$(sha256 "$BIN")" = "$CAND_SHA" ] || die "installed binary changed during daemon restart"
 REPLACEMENT_STARTED=0
 say "Replacement complete"
 printf 'Installed commit: %s\nInstalled SHA-256: %s\nBackup: %s\n' "$TARGET_SHA" "$CAND_SHA" "$BACKUP_DIR"
+printf 'Interactive rollback: %s --rollback %q --apply\n' "$0" "$BACKUP_DIR"
+printf 'If that helper is unavailable, the backup binary is: %q\n' "$BACKUP_DIR/raft-computer-$CUR_SHA"
 printf 'If a later issue requires manual recovery, restore the backup and restart launchd:\n'
 printf 'tmp=$(mktemp %q)\n' "$INSTALL_ROOT/bin/.raft-computer-rollback.XXXXXX"
 printf 'cp -p %q "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" %q && launchctl kickstart -k %q\n' \
