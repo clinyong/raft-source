@@ -65,6 +65,7 @@ import { createPiIdleRecycle } from "./piIdleRecycle";
 import { createManagedMcpPiTools } from "./managedMcpTools";
 import { createPiCommandTool } from "./piCommandTool";
 import { createPiBashTimeoutExtension } from "./piBashTimeout";
+import { createPiContextReminderExtensions } from "./piContextReminderExtension";
 import {
   createPiCompactionFitExtension,
   piCompactionFitTelemetryAttrs,
@@ -1608,7 +1609,15 @@ export async function createPiAgentSessionForContext(
           resourceLoaderOptions: {
             additionalExtensionPaths: localExtensionPaths,
             // Keeps an oversized compaction request inside the model limit (task #10).
-            extensionFactories: [createPiCompactionFitExtension(), createPiBashTimeoutExtension()],
+            extensionFactories: [
+              createPiCompactionFitExtension(),
+              createPiBashTimeoutExtension(),
+              ...createPiContextReminderExtensions(
+                runtimeConfig.runtime,
+                ctx.agentId,
+                (model) => settingsManager.getCompactionReserveTokens(model),
+              ),
+            ],
             systemPromptOverride: () => ctx.standingPrompt,
           },
         });
@@ -1875,9 +1884,6 @@ export class PiSdkRuntimeSession implements RuntimeSession {
   private cancellationSource: "requested_stop" | "dispose" | null = null;
   private exitInfo: RuntimeExitInfo | null = null;
   private activeProviderRequest: PiProviderRequestState | null = null;
-  private contextReminderSessionId: string | null = null;
-  private contextReminderSent = false;
-  private pendingContextReminder: string | null = null;
 
   constructor(
     private readonly ctx: SpawnContext,
@@ -1996,7 +2002,6 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     this.mappingState.sessionId = session.sessionId;
     this.setCurrentSessionId(session.sessionId);
     this.toolExecutionObserver?.setRuntimeSessionId(session.sessionId);
-    this.resetContextReminderForSession(session.sessionId);
     this.unsubscribe = session.subscribe((event) => {
       this.observeToolExecutionEvent(event);
       this.recordCompactionLifecycle(event);
@@ -2016,9 +2021,6 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       )) {
         if (parsed.kind === "error") {
           this.reportProviderRequestFailure(parsed.message);
-        }
-        if (parsed.kind === "turn_end") {
-          this.queueContextReminder(parsed.sessionId ?? this.mappingState.sessionId);
         }
         this.emitRuntimeEvent(
           parsed.kind === "compaction_finished" ? { ...parsed, runtimeIdle: session.isIdle } : parsed,
@@ -2047,7 +2049,6 @@ export class PiSdkRuntimeSession implements RuntimeSession {
 
     if (input.mode === "busy") {
       let requestMethod: "turn/start" | "turn/steer" = "turn/steer";
-      let deliveryText = input.text;
       this.deferSdkCall(
         async () => {
           if (this.promptPreflight) await this.promptPreflight;
@@ -2055,28 +2056,17 @@ export class PiSdkRuntimeSession implements RuntimeSession {
           if (session.isIdle) {
             requestMethod = "turn/start";
             this.toolExecutionObserver?.beginRuntimeTurn();
-            deliveryText = this.consumePendingContextReminder(input.text);
-            return this.promptWithPreflight(session, deliveryText, true);
+            return this.promptWithPreflight(session, input.text, true);
           }
           return session.steer(input.text);
         },
         "steer_request",
-        {
-          requestMethod: () => requestMethod,
-          get text() {
-            return deliveryText;
-          },
-        },
+        { requestMethod: () => requestMethod, text: input.text },
       );
       return { ok: true, acceptedAs: "steer" };
     }
 
-    const text = this.consumePendingContextReminder(input.text);
-    if (session.isStreaming) {
-      this.launchPromptAfterStreaming(text);
-      return { ok: true, acceptedAs: "prompt" };
-    }
-    this.launchPrompt(text, true);
+    this.launchPromptAfterStreaming(input.text);
     return { ok: true, acceptedAs: "prompt" };
   }
 
@@ -2122,57 +2112,6 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     }
     await this.disposeSession();
     this.emitExitAndClose(0, null);
-  }
-
-  private resetContextReminderForSession(sessionId: string): void {
-    if (this.contextReminderSessionId === sessionId) return;
-    this.contextReminderSessionId = sessionId;
-    this.contextReminderSent = false;
-    this.pendingContextReminder = null;
-  }
-
-  private queueContextReminder(sessionId: string | null | undefined): void {
-    if (this.ctx.config.runtime !== "pi" || !sessionId) return;
-    this.resetContextReminderForSession(sessionId);
-    if (this.contextReminderSent) return;
-
-    const session = this.session;
-    if (!session) return;
-    try {
-      const model = session.model;
-      const usage = session.getContextUsage();
-      const tokens = usage?.tokens;
-      const contextWindow = usage?.contextWindow;
-      const reserveTokens = model
-        ? session.settingsManager?.getCompactionReserveTokens(model)
-        : undefined;
-      if (
-        typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < 0
-        || typeof contextWindow !== "number" || !Number.isSafeInteger(contextWindow) || contextWindow <= 0
-        || typeof reserveTokens !== "number" || !Number.isSafeInteger(reserveTokens) || reserveTokens < 0
-      ) return;
-
-      // TODO: Calibration is pending for the 32,000-token safety margin; validate it against observed Pi sessions.
-      const threshold = Math.min(0.70 * contextWindow, contextWindow - reserveTokens - 32_000);
-      if (threshold <= 0 || tokens < threshold) return;
-
-      const percentage = Math.round((tokens / contextWindow) * 100);
-      this.pendingContextReminder = `上下文已用到约 ${percentage}%，请先把交接写进 MEMORY，再 raft session reset`;
-      this.contextReminderSent = true;
-    } catch {
-      // Missing or invalid SDK usage/settings fail closed: no guessed defaults.
-    }
-  }
-
-  private consumePendingContextReminder(text: string): string {
-    if (this.ctx.config.runtime !== "pi") return text;
-    const sessionId = this.mappingState.sessionId;
-    if (!sessionId) return text;
-    this.resetContextReminderForSession(sessionId);
-    const notice = this.pendingContextReminder;
-    if (!notice) return text;
-    this.pendingContextReminder = null;
-    return `${notice}\n\n${text}`;
   }
 
   private emitSessionInit(): void {

@@ -4697,116 +4697,24 @@ test("Pi idle observation uses SDK context and loaded model settings, and fails 
   assert.equal(snapshot({ session: { model: {}, getContextUsage: () => { throw new Error("bad"); } } }).reason, "observation_failed");
 });
 
-test("Pi context reminder is queued once per session and only prepended to the next delivered input", async () => {
+test("Pi idle delivery falls back to steering the original text when the stream wait expires", async () => {
   const calls: string[] = [];
-  let usage: unknown = { tokens: 58_000, contextWindow: 100_000 };
-  let reserveTokens: unknown = 10_000;
-  const fake = createFakeAgentSession("pi-context-reminder-1", calls);
+  const fake = createFakeAgentSession("pi-streaming-timeout-fallback", calls);
   Object.defineProperty(fake, "isIdle", { get: () => !fake.isStreaming });
-  Object.assign(fake, {
-    model: { id: "example", provider: "example" },
-    getContextUsage: () => usage,
-    settingsManager: { getCompactionReserveTokens: () => reserveTokens },
-  });
   const runtime = new PiSdkRuntimeSession(
-    makeSpawnContext({ sessionId: "pi-context-reminder-1" }),
+    makeSpawnContext({ sessionId: "pi-streaming-timeout-fallback" }),
     () => undefined,
     async () => fake as unknown as AgentSession,
   );
-  const notice = "上下文已用到约 58%，请先把交接写进 MEMORY，再 raft session reset";
   try {
     await runtime.start({ text: "initial" });
     await waitForState(() => calls.some((call) => call.startsWith("prompt:initial:")), "initial Pi prompt");
-    assert.equal(calls.filter((call) => call.startsWith("prompt:")).length, 1, "turn end alone does not start a follow-up");
-
-    // A pending reminder must not ride a busy delivery into an active turn.
     fake.__setStreaming(true);
-    runtime.send({ mode: "busy", text: "active-turn message" });
-    await waitForState(() => calls.includes("steer:active-turn message"), "busy message without interruption");
-    assert.equal(calls.some((call) => call.includes("上下文已用到约")), false, "busy steer must not consume the reminder");
+    (runtime as any).waitForStreamingToClear = async () => false;
 
-    fake.__setStreaming(false);
-    runtime.send({ mode: "idle", text: "next message" });
-    await waitForState(() => calls.some((call) => call.startsWith(`prompt:${notice}\n\nnext message:`)), "context reminder on next input");
-
-    runtime.send({ mode: "idle", text: "same session later" });
-    await waitForState(() => calls.some((call) => call.endsWith("same session later:subscribers=1")), "later same-session input");
-    assert.equal(calls.filter((call) => call.includes("上下文已用到约")).length, 1, "same session receives the reminder only once");
-
-    // Simulate the runtime reporting a different session id. Equality at the
-    // 70% threshold exercises the 70% side of the minimum formula.
-    usage = { tokens: 140_000, contextWindow: 200_000 };
-    (runtime as any).mappingState.sessionId = "pi-context-reminder-2";
-    runtime.send({ mode: "idle", text: "new session first message" });
-    await waitForState(() => calls.some((call) => call.endsWith("new session first message:subscribers=1")), "new-session first input");
-    runtime.send({ mode: "idle", text: "new session next message" });
-    const secondNotice = "上下文已用到约 70%，请先把交接写进 MEMORY，再 raft session reset";
-    await waitForState(() => calls.some((call) => call.startsWith(`prompt:${secondNotice}\n\nnew session next message:`)), "new-session context reminder");
-    assert.equal(calls.filter((call) => call.includes("上下文已用到约")).length, 2, "a new session can receive its own reminder");
-  } finally {
-    await runtime.stop({ reason: "test" });
-  }
-});
-
-test("Pi context reminder fails closed when usage, window, or reserve is missing or invalid", async () => {
-  const cases: Array<{ name: string; usage: unknown; reserve: unknown }> = [
-    { name: "missing usage", usage: undefined, reserve: 10_000 },
-    { name: "null tokens", usage: { tokens: null, contextWindow: 100_000 }, reserve: 10_000 },
-    { name: "invalid tokens", usage: { tokens: Number.NaN, contextWindow: 100_000 }, reserve: 10_000 },
-    { name: "negative tokens", usage: { tokens: -1, contextWindow: 100_000 }, reserve: 10_000 },
-    { name: "missing window", usage: { tokens: 80_000 }, reserve: 10_000 },
-    { name: "null window", usage: { tokens: 80_000, contextWindow: null }, reserve: 10_000 },
-    { name: "invalid window", usage: { tokens: 80_000, contextWindow: Number.POSITIVE_INFINITY }, reserve: 10_000 },
-    { name: "missing reserve", usage: { tokens: 80_000, contextWindow: 100_000 }, reserve: undefined },
-    { name: "null reserve", usage: { tokens: 80_000, contextWindow: 100_000 }, reserve: null },
-    { name: "invalid reserve", usage: { tokens: 80_000, contextWindow: 100_000 }, reserve: -1 },
-    { name: "reserve leaves no threshold", usage: { tokens: 1, contextWindow: 40_000 }, reserve: 16_384 },
-  ];
-
-  for (const item of cases) {
-    const calls: string[] = [];
-    const fake = createFakeAgentSession(`pi-context-${item.name}`, calls);
-    Object.assign(fake, {
-      model: { id: "example", provider: "example" },
-      getContextUsage: () => item.usage,
-      settingsManager: { getCompactionReserveTokens: () => item.reserve },
-    });
-    const runtime = new PiSdkRuntimeSession(
-      makeSpawnContext({ sessionId: `pi-context-${item.name}` }),
-      () => undefined,
-      async () => fake as unknown as AgentSession,
-    );
-    try {
-      await runtime.start({ text: "initial" });
-      await waitForState(() => calls.some((call) => call.startsWith("prompt:initial:")), `${item.name} initial prompt`);
-      runtime.send({ mode: "idle", text: "next message" });
-      await waitForState(() => calls.some((call) => call.endsWith("next message:subscribers=1")), `${item.name} next input`);
-      assert.equal(calls.some((call) => call.includes("上下文已用到约")), false, `${item.name} must not notify`);
-    } finally {
-      await runtime.stop({ reason: "test" });
-    }
-  }
-});
-
-test("Built-in Pi sessions do not receive the Pi context reminder", async () => {
-  const calls: string[] = [];
-  const fake = createFakeAgentSession("builtin-context-reminder", calls);
-  Object.assign(fake, {
-    model: { id: "example", provider: "example" },
-    getContextUsage: () => ({ tokens: 80_000, contextWindow: 100_000 }),
-    settingsManager: { getCompactionReserveTokens: () => 10_000 },
-  });
-  const runtime = new PiSdkRuntimeSession(
-    makeSpawnContext({ runtime: "builtin", sessionId: "builtin-context-reminder" }),
-    () => undefined,
-    async () => fake as unknown as AgentSession,
-  );
-  try {
-    await runtime.start({ text: "initial" });
-    await waitForState(() => calls.some((call) => call.startsWith("prompt:initial:")), "initial Built-in prompt");
-    runtime.send({ mode: "idle", text: "next message" });
-    await waitForState(() => calls.some((call) => call.endsWith("next message:subscribers=1")), "next Built-in input");
-    assert.equal(calls.some((call) => call.includes("上下文已用到约")), false);
+    runtime.send({ mode: "idle", text: "original fallback text" });
+    await waitForState(() => calls.includes("steer:original fallback text"), "timeout fallback steer");
+    assert.equal(calls.some((call) => call.includes("[Raft 系统提醒]")), false);
   } finally {
     await runtime.stop({ reason: "test" });
   }
