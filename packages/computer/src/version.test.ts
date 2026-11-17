@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { readBundledCliVersion, readBundledDaemonVersion, readComputerVersion } from "./version";
+import {
+  readBakedCommitSha,
+  readBakedSourceDirty,
+  readBundledCliVersion,
+  readBundledDaemonVersion,
+  readComputerVersion,
+} from "./version";
 
 type VersionEnv = {
   raft?: string;
@@ -38,6 +44,19 @@ function setEnvValue(
   }
   process.env[name] = value;
 }
+
+test("build provenance helpers preserve injected commit SHA and dirty state", () => {
+  const commitSha = "b87bd2dabf2ec75f91e453249a6409b68148e2c3";
+  for (const sourceDirty of [false, true]) {
+    const metadata = {
+      commitSha: readBakedCommitSha(commitSha) ?? null,
+      sourceDirty: readBakedSourceDirty(sourceDirty) ?? null,
+    };
+    assert.deepEqual(JSON.parse(JSON.stringify(metadata)), { commitSha, sourceDirty });
+  }
+  assert.equal(readBakedCommitSha(undefined), undefined);
+  assert.equal(readBakedSourceDirty("true"), undefined);
+});
 
 test("readComputerVersion reads package metadata and ignores runtime version env", async () => {
   await withVersionEnv({ raft: "7.7.7-env-must-not-win", slock: "9.9.9-legacy-dirty" }, async () => {

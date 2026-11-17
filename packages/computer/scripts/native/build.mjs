@@ -53,6 +53,11 @@ import {
   seaLoaderSource,
 } from "./seaEntries.mjs";
 import {
+  assertBuildIdentity,
+  isFullCommitSha,
+  resolveBuildIdentity,
+} from "./source-identity.mjs";
+import {
   assertLatin1Source,
   countNonLatin1,
   escapeNonLatin1,
@@ -379,7 +384,7 @@ function assertLazyShimsDynamicOnly(result, shims, where) {
 // esbuild options both Computer bundles share. Each bundle function spells out
 // its entry, `bundle` and `packages` itself: carrier-version-closure-gate reads
 // them from bundleCjs's own body.
-function computerBundleOptions({ version, daemonVersion, cliVersion, minify }) {
+function computerBundleOptions({ version, daemonVersion, cliVersion, commitSha, sourceDirty, minify }) {
   return {
     platform: "node",
     format: "cjs",
@@ -389,6 +394,8 @@ function computerBundleOptions({ version, daemonVersion, cliVersion, minify }) {
       __RAFT_COMPUTER_VERSION__: JSON.stringify(version),
       __RAFT_DAEMON_VERSION__: JSON.stringify(daemonVersion),
       __RAFT_CLI_VERSION__: JSON.stringify(cliVersion),
+      __RAFT_COMMIT_SHA__: JSON.stringify(commitSha),
+      __RAFT_SOURCE_DIRTY__: JSON.stringify(sourceDirty),
       // The source is ESM and uses `import.meta.url` (e.g. service.ts's
       // top-level `createRequire(import.meta.url)` for SEA detection). In CJS
       // output esbuild lowers `import.meta.url` to `undefined`, so
@@ -423,11 +430,11 @@ function bundledInputs(result) {
 // with the daemon and the agent CLI left external, so none of their source is
 // resident in those processes; the SEA loader turns a stray daemon import into
 // a routing error.
-async function bundleLiteCjs({ version, daemonVersion, cliVersion, workDir, minify = true }) {
+async function bundleLiteCjs({ version, daemonVersion, cliVersion, commitSha, sourceDirty, workDir, minify = true }) {
   const { build } = await import("esbuild");
   const outfile = join(workDir, "computer-lite-bundle.cjs");
   const result = await build({
-    ...computerBundleOptions({ version, daemonVersion, cliVersion, minify }),
+    ...computerBundleOptions({ version, daemonVersion, cliVersion, commitSha, sourceDirty, minify }),
     entryPoints: [join(COMPUTER_ROOT, "src", "index.ts")],
     bundle: true,
     packages: undefined,
@@ -484,11 +491,11 @@ async function bundleKimiCjs({ workDir, minify = true }) {
 
 // The full bundle: the runner (`__run`) and the other hidden entries that run
 // daemon code (seaEntries.mjs SEA_RUNNER_ENTRIES).
-async function bundleCjs({ version, daemonVersion, cliVersion, workDir, minify = true }) {
+async function bundleCjs({ version, daemonVersion, cliVersion, commitSha, sourceDirty, workDir, minify = true }) {
   const { build } = await import("esbuild");
   const outfile = join(workDir, "computer-bundle.cjs");
   const result = await build({
-    ...computerBundleOptions({ version, daemonVersion, cliVersion, minify }),
+    ...computerBundleOptions({ version, daemonVersion, cliVersion, commitSha, sourceDirty, minify }),
     entryPoints: [join(COMPUTER_ROOT, "src", "index.ts")],
     bundle: true,
     // SEA has no node_modules — inline EVERYTHING including @botiverse/raft-daemon.
@@ -622,7 +629,17 @@ async function injectAndSign({ officialNode, blobPath, platform, outBinary }) {
   await chmod(outBinary, 0o755);
 }
 
-function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, cliVersion, smokeHome }) {
+function smokeNativeBinary({
+  outBinary,
+  platform,
+  arch,
+  version,
+  daemonVersion,
+  cliVersion,
+  commitSha,
+  sourceDirty,
+  smokeHome,
+}) {
   if (platform !== process.platform || arch !== process.arch) return;
   // Prevent K dispatch from testing an installed resident instead of these
   // newly injected bytes, and keep host account credentials out of all probes.
@@ -665,7 +682,7 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
   } catch {
     throw new Error(`native version identity smoke returned invalid JSON: ${versionsResult.stdout}`);
   }
-  const expectedFields = ["cliVersion", "computerVersion", "daemonVersion"];
+  const expectedFields = ["cliVersion", "commitSha", "computerVersion", "daemonVersion", "sourceDirty"];
   const reportedFields =
     reported !== null && typeof reported === "object" && !Array.isArray(reported)
       ? Object.keys(reported).sort()
@@ -676,7 +693,8 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
         `got ${reportedFields.length > 0 ? reportedFields.join(", ") : "<no fields>"}`,
     );
   }
-  for (const field of expectedFields) {
+  const versionFields = ["cliVersion", "computerVersion", "daemonVersion"];
+  for (const field of versionFields) {
     const value = reported?.[field];
     if (
       typeof value !== "string"
@@ -689,11 +707,26 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
       );
     }
   }
+  if (!isFullCommitSha(reported?.commitSha)) {
+    throw new Error(
+      `native version identity commitSha is not a full commit SHA: ${JSON.stringify(reported?.commitSha)}`,
+    );
+  }
+  if (typeof reported?.sourceDirty !== "boolean") {
+    throw new Error(`native version identity sourceDirty is not a boolean: ${JSON.stringify(reported?.sourceDirty)}`);
+  }
   const expected = {
+    cliVersion,
+    commitSha,
     computerVersion: version,
     daemonVersion,
-    cliVersion,
+    sourceDirty,
   };
+  assertBuildIdentity({
+    identity: { commitSha: reported.commitSha, sourceDirty: reported.sourceDirty },
+    expectedCommitSha: commitSha,
+    expectedSourceDirty: sourceDirty,
+  });
   for (const field of expectedFields) {
     if (reported[field] !== expected[field]) {
       throw new Error(
@@ -793,6 +826,7 @@ async function sha256(file) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const identity = resolveBuildIdentity({ repoRoot: REPO_ROOT, commitSha: args["commit-sha"] });
   const pkg = JSON.parse(await readFile(join(COMPUTER_ROOT, "package.json"), "utf8"));
   const daemonPkg = JSON.parse(await readFile(join(DAEMON_ROOT, "package.json"), "utf8"));
   const cliPkg = JSON.parse(await readFile(join(CLI_ROOT, "package.json"), "utf8"));
@@ -839,8 +873,22 @@ async function main() {
   await mkdir(outDir, { recursive: true });
   await mkdir(workDir, { recursive: true });
 
-  const bundlePath = await bundleCjs({ version, daemonVersion, cliVersion, workDir, minify: !noMinify });
-  const liteBundlePath = await bundleLiteCjs({ version, daemonVersion, cliVersion, workDir, minify: !noMinify });
+  const bundlePath = await bundleCjs({
+    ...identity,
+    version,
+    daemonVersion,
+    cliVersion,
+    workDir,
+    minify: !noMinify,
+  });
+  const liteBundlePath = await bundleLiteCjs({
+    ...identity,
+    version,
+    daemonVersion,
+    cliVersion,
+    workDir,
+    minify: !noMinify,
+  });
   const kimiBundlePath = await bundleKimiCjs({ workDir, minify: !noMinify });
   if (bundleOnly) {
     console.log(
@@ -881,7 +929,7 @@ async function main() {
   await injectAndSign({ officialNode, blobPath, platform, outBinary });
   const smokeHome = await mkdtemp(join(workDir, "smoke-home-"));
   try {
-    smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, cliVersion, smokeHome });
+    smokeNativeBinary({ ...identity, outBinary, platform, arch, version, daemonVersion, cliVersion, smokeHome });
   } finally {
     await rm(smokeHome, { recursive: true, force: true });
   }

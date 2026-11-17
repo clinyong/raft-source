@@ -73,7 +73,13 @@ import { ComputerServiceError } from "./services/errors";
 import { resolveRaftHome } from "./paths";
 import { resolveTargetServerId } from "./targetServer";
 import { DEFAULT_SLOCK_SERVER_URL } from "./serverUrl";
-import { BUNDLED_CLI_VERSION, BUNDLED_DAEMON_VERSION, COMPUTER_VERSION } from "./version";
+import {
+  BUNDLED_CLI_VERSION,
+  BUNDLED_DAEMON_VERSION,
+  BUILD_COMMIT_SHA,
+  BUILD_SOURCE_DIRTY,
+  COMPUTER_VERSION,
+} from "./version";
 import { listAttachedServerIds, setServerManaged } from "./serverState";
 import { prepareLocalLifecycleOperations, type PreparedLocalLifecycleOperation } from "./localLifecycleIntents";
 import type { RestartServiceParams } from "./lib/types";
@@ -716,6 +722,8 @@ async function runCli(): Promise<void> {
       computerVersion: COMPUTER_VERSION,
       daemonVersion: BUNDLED_DAEMON_VERSION ?? null,
       cliVersion: BUNDLED_CLI_VERSION ?? null,
+      commitSha: BUILD_COMMIT_SHA,
+      sourceDirty: BUILD_SOURCE_DIRTY,
     })}\n`);
     return;
   }
