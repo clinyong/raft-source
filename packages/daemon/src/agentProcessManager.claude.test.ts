@@ -5631,6 +5631,101 @@ test("a replacement that has initialized does not time out during a long first t
   });
 });
 
+// M1: a second reset asked for during the replacement's first turn used to be
+// refused as "reset_in_progress", because the record was only closed when
+// that turn ended. The replacement reported a session of its own by then, so
+// the previous clear is proven and the new request is accepted.
+test("a second self reset is accepted while the replacement's first turn is still running", async () => {
+  await withManager(async ({ driver, manager, sent }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    const queued = makeMessage("queued marker", { message_id: "queued-1", seq: 7 });
+    await manager.deliverMessage("agent-reset", queued);
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    // The replacement reports its own session. Its first turn has not ended.
+    driver.parsedLines.set("new-session", [{ kind: "session_init", sessionId: "session-2" }]);
+    driver.processes[1].stdout.emit("data", Buffer.from("new-session\n"));
+    await flush();
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-2"), "accepted");
+    // The turn ends, so the second reset asks the server to clear again.
+    driver.parsedLines.set("new-turn-end", [{ kind: "turn_end", sessionId: "session-2" }]);
+    driver.processes[1].stdout.emit("data", Buffer.from("new-turn-end\n"));
+    await flush();
+    const ready = sent.filter((m) => m.type === "agent:self_session_reset:ready");
+    assert.deepEqual(ready, [
+      { type: "agent:self_session_reset:ready", agentId: "agent-reset", launchId: "launch-1", sessionId: "session-1" },
+      { type: "agent:self_session_reset:ready", agentId: "agent-reset", launchId: "launch-2", sessionId: "session-2" },
+    ]);
+    assert.equal(sent.some((m) => m.type === "agent:self_session_reset:failed"), false);
+    // The message the first reset held is not lost when the second request
+    // takes the record over: the held copy stays in it.
+    const selfReset = (manager as any).selfReset;
+    assert.equal(selfReset.held("agent-reset").filter((m: AgentMessage) => m.message_id === "queued-1").length, 1);
+    // And the next session is told about it.
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    assert.match(driver.spawnCalls[2]!.prompt, /queued-1/);
+    assert.match(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
+// The takeover must not lose the replacement's inbox. The record is taken
+// over while the replacement is still running, so the state is `requested`
+// again — but the messages the replacement holds when it stops before its
+// turn ends belong to the next session, not to the stop.
+test("a replacement that stops during the takeover keeps its inbox for the next session", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    driver.parsedLines.set("new-session", [{ kind: "session_init", sessionId: "session-2" }]);
+    driver.processes[1].stdout.emit("data", Buffer.from("new-session\n"));
+    await flush();
+    // The replacement asks for a reset of its own: the record is taken over
+    // and the state goes back to `requested`.
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-2"), "accepted");
+    assert.deepEqual((manager as any).selfReset.state("agent-reset"), { kind: "requested", launchId: "launch-2" });
+    // The replacement holds a message and then stops before its turn ends.
+    await manager.deliverMessage("agent-reset", makeMessage("queued marker", { message_id: "queued-1", seq: 7 }));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    // The message is not dropped with the replacement: it stays in the record.
+    const selfReset = (manager as any).selfReset;
+    assert.equal(selfReset.held("agent-reset").filter((m: AgentMessage) => m.message_id === "queued-1").length, 1);
+    // And the next session is told about it.
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-3");
+    assert.match(driver.spawnCalls[2]!.prompt, /queued-1/);
+    assert.match(driver.spawnCalls[2]!.prompt, /1 message pending your read/);
+  });
+});
+
+// The same, but the second reset is asked for before the replacement reported
+// a session of its own: the previous clear is not proven yet, so the request
+// stays refused.
+test("a second self reset stays refused before the replacement reports its session", async () => {
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-1"), "accepted");
+    driver.parsedLines.set("old-turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    driver.processes[0].stdout.emit("data", Buffer.from("old-turn-end\n"));
+    await flush();
+    await manager.stopAgent("agent-reset");
+    await manager.startAgent("agent-reset", makeConfig({ sessionId: null }), undefined, undefined, undefined, "launch-2");
+    // The replacement has no session id yet, so the request is refused before
+    // the coordinator is even asked.
+    assert.notEqual(manager.requestSelfSessionReset("agent-reset", "launch-2"), "accepted");
+    assert.equal(manager.requestSelfSessionReset("agent-reset", "launch-2"), "stale_launch");
+  });
+});
+
 test("confirmed pre-clear timeout resumes the old launch with its queued message", async () => {
   await withManager(async ({ driver, manager, sent }) => {
     await manager.startAgent("agent-reset", makeConfig({ sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");

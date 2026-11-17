@@ -1550,6 +1550,14 @@ export class AgentProcessManager {
       return Boolean(ap && ap.launchId && ap.launchId !== oldLaunchId && ap.sessionId
         && ap.sessionId !== oldSessionId && ap.exit.kind === "live");
     },
+    replacementSessionObserved: (agentId, launchId, retiredSessionIds) => {
+      // The launch that asks for the reset is the replacement of the previous
+      // reset, and it reported a session of its own: the previous clear
+      // happened, even though this replacement has not ended its first turn.
+      const ap = this.agents.get(agentId);
+      return Boolean(ap && ap.launchId === launchId && ap.sessionId
+        && !retiredSessionIds.includes(ap.sessionId) && ap.exit.kind === "live");
+    },
     debug: (event, details) => {
       logger.warn(`[SelfSessionReset] ${event} ${JSON.stringify(details)}`);
     },

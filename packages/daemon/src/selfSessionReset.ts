@@ -81,7 +81,11 @@ export function blocksOldLaunchDelivery(state: SelfSessionResetState, launchId: 
   return true;
 }
 
-/** Whether a reset may have retired the old session and must fail closed. */
+/** Whether the state says a reset may have retired the old session and must
+ * fail closed. This is the state-based hint only: the guards that protect a
+ * retired session ask the record itself (`retiredSessionIds`), because a
+ * takeover puts the state back to `requested` while the sessions the earlier
+ * resets retired stay retired. */
 export function oldSessionRetired(state: SelfSessionResetState | undefined): boolean {
   return Boolean(state && state.kind !== "none" && state.kind !== "requested"
     && !(state.kind === "failed" && state.sessionCleared === false));
@@ -91,6 +95,19 @@ type ResetFailureReason = "restart_timeout" | "launch_exited";
 type ResetRecord<T> = {
   state: SelfSessionResetState;
   oldSessionId: string | null;
+  /** Every session this record retired. A second request may take the
+   * record over while the previous replacement is still running, so the
+   * sessions retired by the earlier resets stay listed: a start that would
+   * resume one of them is still refused.
+   *
+   * A session is retired when the record asks the server to clear it, and the
+   * retirement is undone when the clear is proven not to have happened. The
+   * list is a fact about the record, not about the current state: a takeover
+   * puts the state back to `requested`, but the sessions the earlier resets
+   * retired stay listed. The session the current request is about to clear
+   * joins the list when that clear is asked for, so it is never listed
+   * before its own reset starts clearing. */
+  retiredSessions: string[];
   failureReason: ResetFailureReason | null;
   timer: ReturnType<typeof setTimeout> | null;
   cancelPending: boolean;
@@ -113,10 +130,15 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     error: (agentId: string, launchId: string, step: string) => void;
     resume: (agentId: string, launchId: string) => void;
     replacementActive: (agentId: string, launchId: string, oldSessionId: string) => boolean;
+    /** Whether the launch that asks for a reset is running with a session of
+     * its own: the session it reported is not one of the retired ones. That
+     * is the proof that the previous clear happened, even though the
+     * replacement has not finished its first turn yet. */
+    replacementSessionObserved: (agentId: string, launchId: string, retiredSessionIds: readonly string[]) => boolean;
     /** Why a request was rejected. The record itself is daemon-memory state,
      * so without this the only symptom an operator sees is
      * `Launch is no longer current`. */
-    debug?: (event: "request_rejected", details: Record<string, unknown>) => void;
+    debug?: (event: "request_rejected" | "request_accepted", details: Record<string, unknown>) => void;
   }) {}
 
   request(agentId: string, launchId: string, sessionId: string): "accepted" | "reset_in_progress" | "stale_launch" {
@@ -125,6 +147,22 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
       state = reduceSelfSessionReset(state, { kind: "launch_changed", launchId });
     }
     if (state.kind !== "none" && (state.launchId !== launchId || state.kind === "failed")) {
+      // The only thing that kept an older record open was the wait for the
+      // replacement's first turn to end. Once the replacement has reported a
+      // session id of its own, the previous clear is proven, so a new request
+      // may take the record over instead of being refused. The record is NOT
+      // completed here: the messages the previous reset held stay in it and
+      // it ends with the new replacement's first turn, like any other reset.
+      if (state.launchId !== launchId && this.replacementProven(agentId, launchId)) {
+        this.effects.debug?.("request_accepted", {
+          reason: "replacement_session_observed",
+          requestedLaunchId: launchId,
+          stateKind: state.kind,
+          stateLaunchId: state.launchId,
+        });
+        this.takeOver(agentId, launchId, sessionId);
+        return "accepted";
+      }
       // A record owned by an older launch is always "the previous reset is
       // still finishing" for the current launch: turnEnded() clears it once
       // this replacement ends its first turn, even if the record is `failed`
@@ -141,8 +179,43 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
       return reason;
     }
     this.setOldSession(agentId, sessionId);
+    // The session is not retired yet: the record asks the server to clear it
+    // when the requesting launch's turn ends (beginClear). Until then the
+    // session is still live, so it must not be treated as retired.
     this.setState(agentId, reduceSelfSessionReset(state, { kind: "request", launchId }));
     return "accepted";
+  }
+
+  /**
+   * A second request takes the record over from the reset it supersedes.
+   * The record is not completed: the messages the previous reset held stay in
+   * it (nothing is dropped) and it ends with the new replacement's first
+   * turn, as every other reset does.
+   */
+  private takeOver(agentId: string, launchId: string, sessionId: string): void {
+    // The previous reset's timer waits for the launch it was armed for.
+    this.clearTimer(agentId);
+    const record = this.ensure(agentId);
+    record.state = { kind: "requested", launchId };
+    record.failureReason = null;
+    record.cancelPending = false;
+    // The session this request is about to clear is the replacement's own
+    // session. It joins the retired list when the replacement starts
+    // clearing (beginClear), not now: until then it is still the live
+    // session of the replacement, and the replacement must be able to finish
+    // the turn it is running.
+    this.setOldSession(agentId, sessionId);
+  }
+
+  /**
+   * Whether the launch asking for a reset is a replacement that reported a
+   * session of its own. That proves the previous clear happened, so the
+   * previous reset no longer has to be waited for.
+   */
+  private replacementProven(agentId: string, launchId: string): boolean {
+    const retired = this.retiredSessionIds(agentId);
+    if (!retired.length) return false;
+    return this.effects.replacementSessionObserved(agentId, launchId, retired);
   }
 
   requestingLaunchExited(agentId: string, launchId: string, sessionId: string): void {
@@ -208,7 +281,9 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     this.setCancelPending(agentId, false);
     // The clear never started, so no stop is coming: nothing is handed off.
     this.setHandoffStopExpected(agentId, false);
+    const rejectedSession = this.oldSession(agentId);
     this.setOldSession(agentId, null);
+    this.unretireSession(agentId, rejectedSession);
     this.effects.resume(agentId, launchId);
   }
 
@@ -224,11 +299,16 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     }
   }
 
+  /** Whether input to this launch or session must be refused.
+   *
+   * A session this record retired must not receive input, whatever the state
+   * says now: a takeover puts the state back to `requested`, but the earlier
+   * retirement stands. The replacement's own session is not retired until it
+   * starts clearing, so it can finish the turn it is running. */
   blocksInput(agentId: string, launchId: string | null, sessionId: string | null): boolean {
     const state = this.state(agentId);
-    if (!state || state.kind === "none") return false;
-    if (launchId && blocksOldLaunchDelivery(state, launchId)) return true;
-    return Boolean(this.oldSession(agentId) && sessionId === this.oldSession(agentId) && oldSessionRetired(state));
+    if (launchId && state && blocksOldLaunchDelivery(state, launchId)) return true;
+    return this.isRetiredSession(agentId, sessionId);
   }
 
   blocksOldLaunch(agentId: string, launchId: string | null): boolean {
@@ -239,22 +319,45 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
   holdsTransient(agentId: string, launchId: string | null, sessionId: string | null, deliverable: boolean): boolean {
     const state = this.state(agentId);
     return Boolean(state && state.kind !== "none" && !(state.kind === "failed" && state.sessionCleared === false)
-      && (!launchId || blocksOldLaunchDelivery(state, launchId) || sessionId === this.oldSession(agentId) || !deliverable));
+      && (!launchId || blocksOldLaunchDelivery(state, launchId) || this.isRetiredSession(agentId, sessionId) || !deliverable));
   }
 
-  holdsInbox(agentId: string): boolean { return oldSessionRetired(this.state(agentId)); }
+  /** Whether the record owns the inbox: the messages of the session it is
+   * resetting must survive the session, not be dropped with it.
+   *
+   * This follows the retired sessions, not the state: a takeover puts the
+   * state back to `requested`, but the record still holds the messages of the
+   * sessions the earlier resets retired, and they belong to the next
+   * session. */
+  holdsInbox(agentId: string): boolean { return this.retiredSessionIds(agentId).length > 0; }
 
+  /** Whether a start must be refused.
+   *
+   * A session this record retired must never be resumed, whatever the state
+   * says now: a takeover puts the state back to `requested`, but the earlier
+   * retirement stands. The other half is about the CURRENT reset (the live
+   * process the record owns), not about a retired session, so it still
+   * follows the state. */
   blocksStart(agentId: string, launchId: string | undefined, sessionId: string | null | undefined, currentLaunchId: string | null | undefined): boolean {
     const state = this.state(agentId);
-    if (!state || state.kind === "none" || !oldSessionRetired(state) || launchId === state.launchId) return false;
-    return Boolean((this.oldSession(agentId) && sessionId === this.oldSession(agentId)) || currentLaunchId === state.launchId);
+    const recordLaunchId = state && state.kind !== "none" ? state.launchId : undefined;
+    // A session this record retired must never be resumed, whatever the state
+    // says now: a takeover puts the state back to `requested`, but the earlier
+    // retirement stands. The record's own launch is exempt: it is the launch
+    // the reset belongs to.
+    if (launchId !== recordLaunchId && this.isRetiredSession(agentId, sessionId)) return true;
+    // The other half is about the CURRENT reset (the live process the record
+    // owns), not about a retired session, so it still follows the state.
+    if (!state || state.kind === "none" || launchId === state.launchId) return false;
+    return Boolean(currentLaunchId === state.launchId && oldSessionRetired(state));
   }
 
   turnEnded(agentId: string, launchId: string, sessionId: string | null | undefined, successful: boolean): boolean {
     const state = this.state(agentId);
     if (!state || state.kind === "none") return false;
     const oldSession = this.oldSession(agentId);
-    if (launchId !== state.launchId && oldSession && sessionId && sessionId !== oldSession && successful) {
+    const retired = oldSession ? this.retiredSessionIds(agentId) : [];
+    if (launchId !== state.launchId && retired.length > 0 && sessionId && !retired.includes(sessionId) && successful) {
       this.complete(agentId);
       return false;
     }
@@ -268,6 +371,7 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
     if (state) this.setState(agentId, reduceSelfSessionReset(state, { kind: "clear_started", launchId }));
     if (sessionId) {
       this.setOldSession(agentId, sessionId);
+      this.retireSession(agentId, sessionId);
       this.arm(agentId, launchId, sessionId);
     }
     // The server clears the session by stopping the agent: the stop that
@@ -297,14 +401,51 @@ export class SelfSessionResetCoordinator<T extends { message_id?: string }> {
   private ensure(agentId: string): ResetRecord<T> {
     let record = this.records.get(agentId);
     if (!record) {
-      record = { state: { kind: "none" }, oldSessionId: null, failureReason: null, timer: null, cancelPending: false, transient: [], heldInbox: [], pendingBodies: null, handoffStopExpected: false };
+      record = { state: { kind: "none" }, oldSessionId: null, retiredSessions: [], failureReason: null, timer: null, cancelPending: false, transient: [], heldInbox: [], pendingBodies: null, handoffStopExpected: false };
       this.records.set(agentId, record);
     }
     return record;
   }
 
+  /** Every session this record retired. The session the current request is
+   * about to clear is one of them from the moment the clear is asked for
+   * (beginClear), so it is never listed before its own reset starts
+   * clearing. */
+  private retiredSessionIds(agentId: string): string[] {
+    const record = this.records.get(agentId);
+    if (!record) return [];
+    return [...record.retiredSessions];
+  }
+
+  private isRetiredSession(agentId: string, sessionId: string | null | undefined): boolean {
+    if (!sessionId) return false;
+    return this.retiredSessionIds(agentId).includes(sessionId);
+  }
+
+  private retireSession(agentId: string, sessionId: string | null): void {
+    if (!sessionId) return;
+    const record = this.ensure(agentId);
+    if (!record.retiredSessions.includes(sessionId)) record.retiredSessions.push(sessionId);
+  }
+
+  private unretireSession(agentId: string, sessionId: string | null): void {
+    if (!sessionId) return;
+    const record = this.records.get(agentId);
+    if (!record) return;
+    record.retiredSessions = record.retiredSessions.filter((id) => id !== sessionId);
+  }
+
   state(agentId: string): SelfSessionResetState | undefined { return this.records.get(agentId)?.state; }
-  setState(agentId: string, state: SelfSessionResetState): void { this.ensure(agentId).state = state; }
+  setState(agentId: string, state: SelfSessionResetState): void {
+    const record = this.ensure(agentId);
+    // `clearing` is the record's word that it asked the server to clear the
+    // session it holds: that session is retired from then on. The retirement
+    // is remembered on the record, so it outlives the state — a takeover puts
+    // the state back to `requested`, but the sessions the earlier resets
+    // retired stay retired.
+    if (state.kind === "clearing") this.retireSession(agentId, record.oldSessionId);
+    record.state = state;
+  }
   oldSession(agentId: string): string | null { return this.records.get(agentId)?.oldSessionId ?? null; }
   setOldSession(agentId: string, id: string | null): void { this.ensure(agentId).oldSessionId = id; }
   setFailureReason(agentId: string, reason: ResetFailureReason): void { this.ensure(agentId).failureReason = reason; }
