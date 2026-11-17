@@ -3,6 +3,8 @@ import { createRequire } from "node:module";
 declare const __RAFT_COMPUTER_VERSION__: string | undefined;
 declare const __RAFT_DAEMON_VERSION__: string | undefined;
 declare const __RAFT_CLI_VERSION__: string | undefined;
+declare const __RAFT_COMMIT_SHA__: string | undefined;
+declare const __RAFT_SOURCE_DIRTY__: boolean | undefined;
 
 function readBakedComputerVersion(): string | undefined {
   return typeof __RAFT_COMPUTER_VERSION__ === "string" ? __RAFT_COMPUTER_VERSION__ : undefined;
@@ -60,3 +62,18 @@ export function readBundledCliVersion(
 }
 
 export const BUNDLED_CLI_VERSION = readBundledCliVersion();
+
+export function readBakedCommitSha(
+  bakedCommitSha: unknown = typeof __RAFT_COMMIT_SHA__ === "string" ? __RAFT_COMMIT_SHA__ : undefined,
+): string | undefined {
+  return typeof bakedCommitSha === "string" && bakedCommitSha.length > 0 ? bakedCommitSha : undefined;
+}
+
+export function readBakedSourceDirty(
+  bakedSourceDirty: unknown = typeof __RAFT_SOURCE_DIRTY__ === "boolean" ? __RAFT_SOURCE_DIRTY__ : undefined,
+): boolean | undefined {
+  return typeof bakedSourceDirty === "boolean" ? bakedSourceDirty : undefined;
+}
+
+export const BUILD_COMMIT_SHA = readBakedCommitSha() ?? null;
+export const BUILD_SOURCE_DIRTY = readBakedSourceDirty() ?? null;

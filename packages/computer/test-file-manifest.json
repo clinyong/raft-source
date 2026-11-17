@@ -7,6 +7,7 @@
     "src/apiClient.unreadActivityDiagnostic.test.ts",
     "src/attach.test.ts",
     "src/browserHandoff.test.ts",
+    "src/buildVersions.test.ts",
     "src/bundleConfig.test.ts",
     "src/channel.test.ts",
     "src/cleanup.test.ts",
