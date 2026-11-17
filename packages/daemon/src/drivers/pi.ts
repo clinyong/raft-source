@@ -2066,7 +2066,11 @@ export class PiSdkRuntimeSession implements RuntimeSession {
       return { ok: true, acceptedAs: "steer" };
     }
 
-    this.launchPromptAfterStreaming(input.text);
+    if (session.isStreaming) {
+      this.launchPromptAfterStreaming(input.text);
+      return { ok: true, acceptedAs: "prompt" };
+    }
+    this.launchPrompt(input.text, true);
     return { ok: true, acceptedAs: "prompt" };
   }
 
