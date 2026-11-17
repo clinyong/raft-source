@@ -4702,6 +4702,7 @@ test("Pi context reminder is queued once per session and only prepended to the n
   let usage: unknown = { tokens: 58_000, contextWindow: 100_000 };
   let reserveTokens: unknown = 10_000;
   const fake = createFakeAgentSession("pi-context-reminder-1", calls);
+  Object.defineProperty(fake, "isIdle", { get: () => !fake.isStreaming });
   Object.assign(fake, {
     model: { id: "example", provider: "example" },
     getContextUsage: () => usage,
@@ -4718,6 +4719,13 @@ test("Pi context reminder is queued once per session and only prepended to the n
     await waitForState(() => calls.some((call) => call.startsWith("prompt:initial:")), "initial Pi prompt");
     assert.equal(calls.filter((call) => call.startsWith("prompt:")).length, 1, "turn end alone does not start a follow-up");
 
+    // A pending reminder must not ride a busy delivery into an active turn.
+    fake.__setStreaming(true);
+    runtime.send({ mode: "busy", text: "active-turn message" });
+    await waitForState(() => calls.includes("steer:active-turn message"), "busy message without interruption");
+    assert.equal(calls.some((call) => call.includes("上下文已用到约")), false, "busy steer must not consume the reminder");
+
+    fake.__setStreaming(false);
     runtime.send({ mode: "idle", text: "next message" });
     await waitForState(() => calls.some((call) => call.startsWith(`prompt:${notice}\n\nnext message:`)), "context reminder on next input");
 
@@ -4745,12 +4753,14 @@ test("Pi context reminder fails closed when usage, window, or reserve is missing
     { name: "missing usage", usage: undefined, reserve: 10_000 },
     { name: "null tokens", usage: { tokens: null, contextWindow: 100_000 }, reserve: 10_000 },
     { name: "invalid tokens", usage: { tokens: Number.NaN, contextWindow: 100_000 }, reserve: 10_000 },
+    { name: "negative tokens", usage: { tokens: -1, contextWindow: 100_000 }, reserve: 10_000 },
     { name: "missing window", usage: { tokens: 80_000 }, reserve: 10_000 },
     { name: "null window", usage: { tokens: 80_000, contextWindow: null }, reserve: 10_000 },
     { name: "invalid window", usage: { tokens: 80_000, contextWindow: Number.POSITIVE_INFINITY }, reserve: 10_000 },
     { name: "missing reserve", usage: { tokens: 80_000, contextWindow: 100_000 }, reserve: undefined },
     { name: "null reserve", usage: { tokens: 80_000, contextWindow: 100_000 }, reserve: null },
     { name: "invalid reserve", usage: { tokens: 80_000, contextWindow: 100_000 }, reserve: -1 },
+    { name: "reserve leaves no threshold", usage: { tokens: 1, contextWindow: 40_000 }, reserve: 16_384 },
   ];
 
   for (const item of cases) {

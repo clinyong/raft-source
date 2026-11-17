@@ -2045,9 +2045,9 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     const session = this.session;
     if (!session) return { ok: false, reason: "closed" };
 
-    const text = this.consumePendingContextReminder(input.text);
     if (input.mode === "busy") {
       let requestMethod: "turn/start" | "turn/steer" = "turn/steer";
+      let deliveryText = input.text;
       this.deferSdkCall(
         async () => {
           if (this.promptPreflight) await this.promptPreflight;
@@ -2055,16 +2055,23 @@ export class PiSdkRuntimeSession implements RuntimeSession {
           if (session.isIdle) {
             requestMethod = "turn/start";
             this.toolExecutionObserver?.beginRuntimeTurn();
-            return this.promptWithPreflight(session, text, true);
+            deliveryText = this.consumePendingContextReminder(input.text);
+            return this.promptWithPreflight(session, deliveryText, true);
           }
-          return session.steer(text);
+          return session.steer(input.text);
         },
         "steer_request",
-        { requestMethod: () => requestMethod, text },
+        {
+          requestMethod: () => requestMethod,
+          get text() {
+            return deliveryText;
+          },
+        },
       );
       return { ok: true, acceptedAs: "steer" };
     }
 
+    const text = this.consumePendingContextReminder(input.text);
     if (session.isStreaming) {
       this.launchPromptAfterStreaming(text);
       return { ok: true, acceptedAs: "prompt" };
@@ -2147,7 +2154,7 @@ export class PiSdkRuntimeSession implements RuntimeSession {
 
       // TODO: Calibration is pending for the 32,000-token safety margin; validate it against observed Pi sessions.
       const threshold = Math.min(0.70 * contextWindow, contextWindow - reserveTokens - 32_000);
-      if (tokens < threshold) return;
+      if (threshold <= 0 || tokens < threshold) return;
 
       const percentage = Math.round((tokens / contextWindow) * 100);
       this.pendingContextReminder = `上下文已用到约 ${percentage}%，请先把交接写进 MEMORY，再 raft session reset`;
