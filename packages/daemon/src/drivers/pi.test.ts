@@ -9,8 +9,10 @@ import fc from "fast-check";
 import {
   BuiltInDriver,
   PI_SDK_COMPACTION_ENABLED,
+  PI_TOOL_SEARCH_ENABLED,
   PiDriver,
   PiSdkRuntimeSession,
+  resolvePiManagedMcpExposure,
   buildBuiltInAgentDir,
   buildPiSessionCreateEnvPatch,
   buildBuiltInSessionDir,
@@ -3996,6 +3998,54 @@ test("Built-in loads enabled host directory and package extensions only while op
         assert.equal(session.model?.id, "agent-model");
         assert.equal(session.model?.baseUrl, "http://localhost:9876/v1");
       } finally { session.dispose(); }
+    }
+  } finally {
+    restoreEnv("PI_CODING_AGENT_DIR", previousAgentDir);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// MCP tool declaration mode falls back coherently: deferred when tool_search
+// is on (default), direct with a warning when it is off.
+test("resolvePiManagedMcpExposure defers with tool_search and falls back to direct with a warning", () => {
+  const on = resolvePiManagedMcpExposure(true);
+  assert.equal(on.exposure, "deferred");
+  assert.equal(on.warn, null);
+  const off = resolvePiManagedMcpExposure(false);
+  assert.equal(off.exposure, "direct");
+  assert.match(off.warn ?? "", /direct/u);
+});
+
+// MCP tool declaration is deferred to tool_search (schemas stay out of the
+// fixed prompt until loaded). PIN both sides of the feature to the same flag:
+// the registered tool_search extension and the default active tool set.
+test("tool_search is registered and active by default; managed MCP tools are deferred", { timeout: 30_000 }, async () => {
+  assert.equal(PI_TOOL_SEARCH_ENABLED, true, "this test pins the deferred-by-default behavior");
+  const root = mkdtempSync(path.join(os.tmpdir(), "raft-pi-tool-search-"));
+  const workspace = path.join(root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  try {
+    const session = await createPiAgentSessionForContext(makeSpawnContext({
+      runtime: "builtin",
+      runtimeConfig: {
+        version: RUNTIME_CONFIG_VERSION, runtime: "builtin", hostUserState: "forbidden",
+        provider: { kind: "gateway", providerId: "openai-compatible", baseUrl: "http://localhost:9876/v1", apiKey: "agent-key" },
+        model: { kind: "custom", name: "agent-model" }, mode: { kind: "default" },
+      },
+    }, { workingDirectory: workspace }), "tool-search-session", {
+      agentDir: buildBuiltInAgentDir(workspace), sessionDir: buildBuiltInSessionDir(workspace),
+      isolateHostProviderEnv: true, exposeLaunchEnvToTools: false,
+    });
+    try {
+      const active = session.getActiveToolNames();
+      assert.ok(active.includes("tool_search"), "tool_search must be active by default (via +tool_search defaultTools override)");
+      // tool_search itself is registered model-only (SDK): callable, not declared
+      // to the model until it has to find deferred tools.
+      const declared = session.getAllTools().find((tool) => tool.name === "tool_search");
+      assert.equal(declared?.exposure, "model-only");
+    } finally {
+      session.dispose();
     }
   } finally {
     restoreEnv("PI_CODING_AGENT_DIR", previousAgentDir);

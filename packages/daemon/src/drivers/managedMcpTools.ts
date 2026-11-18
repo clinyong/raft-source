@@ -73,6 +73,7 @@ function buildTool(input: {
   tool: ManagedMcpRuntimeTool;
   serverUrl: string;
   token: string;
+  exposure: ToolDefinition["exposure"];
 }): ToolDefinition {
   const { tool } = input;
   return {
@@ -83,6 +84,14 @@ function buildTool(input: {
     description: tool.description || `Call ${formatManagedMcpPromptName(tool.toolName)} on the managed MCP server ${formatManagedMcpPromptName(tool.serverName)}.`,
     promptSnippet: `${tool.runtimeName}: ${tool.description ? flattenManagedMcpPromptText(tool.description) : `Call ${formatManagedMcpPromptName(tool.toolName)} on ${formatManagedMcpPromptName(tool.serverName)}`}`,
     parameters: tool.inputSchema as TSchema,
+    // Managed MCP tools are deferred by default: their full schemas are not
+    // declared to the model up front; the session's tool_search loads a match
+    // (and its schema) on demand before the next model call. This keeps large
+    // servers (Linear, Yokii) out of the fixed prompt until actually needed.
+    // The daemon still executes the call through agent-api either way. The
+    // caller can opt back to "direct" (full declaration, the pre-tool-search
+    // behavior) when tool_search is not available for the session.
+    exposure: input.exposure ?? "deferred",
     async execute(_toolCallId, params, signal) {
       let result: ManagedMcpCallResult;
       try {
@@ -127,6 +136,8 @@ export async function createManagedMcpPiTools(input: {
   serverUrl: string;
   agentCredentialKey: string | null | undefined;
   onWarning?: (message: string) => void;
+  /** Tool declaration mode: "deferred" (default) keeps schemas out of the fixed prompt until tool_search loads them; "direct" declares them fully up front. */
+  exposure?: ToolDefinition["exposure"];
 }): Promise<ToolDefinition[]> {
   if (!input.agentCredentialKey) return [];
   try {
@@ -139,6 +150,7 @@ export async function createManagedMcpPiTools(input: {
       tool,
       serverUrl: input.serverUrl,
       token: input.agentCredentialKey!,
+      exposure: input.exposure,
     }));
   } catch (error) {
     const detail = error instanceof ManagedMcpHttpError

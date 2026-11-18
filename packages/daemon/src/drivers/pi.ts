@@ -10,6 +10,7 @@ import path from "node:path";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
+  createToolSearchExtension,
   getAgentDir,
   DefaultPackageManager,
   ModelRegistry,
@@ -21,6 +22,31 @@ import {
   type AgentSessionServices,
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
+
+// Turns on deferred declaration for managed MCP tools (schemas loaded by
+// tool_search on demand) plus the daemon-registered tool_search extension.
+// When a future SDK drops the extension, flip this to false and the driver
+// falls back to the old full-direction behavior with a warning.
+export const PI_TOOL_SEARCH_ENABLED = true;
+
+/**
+ * Decide how managed MCP tools are declared for a Pi session.
+ *
+ * With tool_search enabled they are deferred (schemas loaded on demand via
+ * the daemon-registered tool_search extension). Without it we fall back to
+ * the old full declaration (direct) and return a warning line so the driver
+ * can log the fallback instead of silently hiding every managed MCP tool.
+ */
+export function resolvePiManagedMcpExposure(toolSearchEnabled: boolean): {
+  exposure: "deferred" | "direct";
+  warn: string | null;
+} {
+  if (toolSearchEnabled) return { exposure: "deferred", warn: null };
+  return {
+    exposure: "direct",
+    warn: "tool_search unavailable; managed MCP tools declared direct (pre-tool-search behavior)",
+  };
+}
 import {
   isContextOverflow,
   type Model,
@@ -783,6 +809,12 @@ export function detectPiModelsFromRegistry(modelRegistry: PiModelRegistryLike): 
 
 function applyPiDaemonSettingsOverrides(settingsManager: SettingsManager): void {
   settingsManager.applyOverrides({ compaction: { enabled: PI_SDK_COMPACTION_ENABLED } });
+  if (PI_TOOL_SEARCH_ENABLED) {
+    // Make the daemon's tool_search (registered via createToolSearchExtension)
+    // active by default: it is inactive on registration, and `+tool_search` adds
+    // it to the resolved default tool set without replacing it.
+    settingsManager.applyOverrides({ defaultTools: ["+tool_search"] });
+  }
 }
 
 function logPiServiceDiagnostics(context: string, services: AgentSessionServices): void {
@@ -1612,6 +1644,7 @@ export async function createPiAgentSessionForContext(
             extensionFactories: [
               createPiCompactionFitExtension(),
               createPiBashTimeoutExtension(),
+              ...(PI_TOOL_SEARCH_ENABLED ? [createToolSearchExtension()] : []),
               ...createPiContextReminderExtensions(
                 runtimeConfig.runtime,
                 ctx.agentId,
@@ -1752,11 +1785,20 @@ export async function createPiAgentSessionForContext(
       }
     }
 
+    const mcpExposure = resolvePiManagedMcpExposure(PI_TOOL_SEARCH_ENABLED);
     const managedMcpTools = await createManagedMcpPiTools({
       serverUrl: ctx.config.serverUrl,
       agentCredentialKey: ctx.config.agentCredentialKey,
       onWarning: (message) => console.warn("[%s] %s", logPrefix, message),
+      // SDK 1.3.0 exports createToolSearchExtension (registered below) and
+      // resolves `+tool_search` from defaultTools. Keep one decision point: if
+      // tool_search is unavailable, fall back to the old full declaration
+      // (direct) with a warning instead of hiding every managed MCP tool.
+      exposure: mcpExposure.exposure,
     });
+    if (mcpExposure.warn) {
+      console.warn("[%s] %s", logPrefix, mcpExposure.warn);
+    }
 
     const { session } = await withProcessEnvPatch(sessionCreateEnvPatch, () => {
       // task #365: right before the SDK session exists, inside the env-patch

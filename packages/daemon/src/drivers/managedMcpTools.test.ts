@@ -40,6 +40,9 @@ test("managed MCP Pi tools freeze the snapshot and proxy calls through agent-api
   const tools = await createManagedMcpPiTools({ serverUrl: "https://raft.test", agentCredentialKey: "sk_agent_test" });
   assert.equal(tools.length, 1);
   assert.equal(tools[0].name, "mcp_11111111_search_deadbeef");
+  // Managed MCP tools are deferred: schemas stay out of the model's fixed
+  // prompt until tool_search loads a match on demand.
+  assert.equal(tools[0].exposure, "deferred");
   const result = await tools[0].execute("call-1", { query: "MCP" }, undefined, undefined, {} as never);
   assert.deepEqual(result.content, [{ type: "text", text: "found" }]);
   assert.equal(calls.length, 2);
